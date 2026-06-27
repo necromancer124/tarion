@@ -1,0 +1,167 @@
+package main
+
+import (
+	"fmt"
+	"os"
+	"strings"
+
+	tea "github.com/charmbracelet/bubbletea"
+	"github.com/charmbracelet/lipgloss"
+)
+
+// --- Styles ---
+var (
+	styleOnline  = lipgloss.NewStyle().Foreground(lipgloss.Color("2")).Bold(true) // Green
+	styleOffline = lipgloss.NewStyle().Foreground(lipgloss.Color("8"))            // Gray
+	styleSelected = lipgloss.NewStyle().Background(lipgloss.Color("60")).Foreground(lipgloss.Color("0"))
+	styleBorder   = lipgloss.NewStyle().Border(lipgloss.RoundedBorder()).BorderForeground(lipgloss.Color("240"))
+	styleInput    = lipgloss.NewStyle().Foreground(lipgloss.Color("229"))
+)
+
+// --- Types ---
+type AppState int
+
+const (
+	StateListView AppState = iota
+	StateChatView
+)
+
+type Contact struct {
+	Username string
+	Online   bool
+}
+
+type model struct {
+	state         AppState
+	contacts      []Contact
+	cursor        int
+	activeContact string
+	chatHistory   []string
+	inputBuffer   string
+	err           error
+}
+
+// --- Messages ---
+type msgIncomingChat string
+type msgStatusUpdate struct {
+	username string
+	online   bool
+}
+
+// --- Model Methods ---
+
+func initialModel() model {
+	return model{
+		state:    StateListView,
+		contacts: []Contact{
+			{"Alice", true},
+			{"Bob", false},
+			{"Charlie", true},
+		},
+		cursor: 0,
+	}
+}
+
+func (m model) Init() tea.Cmd {
+	return nil
+}
+
+func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
+	switch msg := msg.(type) {
+	case tea.KeyMsg:
+		switch m.state {
+		case StateListView:
+			switch msg.String() {
+			case "ctrl+c", "q":
+				return model{}, tea.Quit
+			case "up", "k":
+				if m.cursor > 0 {
+					m.cursor--
+				}
+			case "down", "j":
+				if m.cursor < len(m.contacts)-1 {
+					m.cursor++
+				}
+			case "enter":
+				m.activeContact = m.contacts[m.cursor].Username
+				m.state = StateChatView
+				// In real impl, we'd load history from storage here
+				m.chatHistory = []string{"--- History Loaded ---", "Hello from the past!"}
+			}
+
+		case StateChatView:
+			switch msg.String() {
+			case "esc":
+				m.state = StateListView
+			case "enter":
+				if m.inputBuffer != "" {
+					line := fmt.Sprintf("Me: %s", m.inputBuffer)
+					m.chatHistory = append(m.chatHistory, line)
+					m.inputBuffer = ""
+					// Here we would call the QUIC sender
+				}
+			case "backspace":
+				if len(m.inputBuffer) > 0 {
+					m.inputBuffer = m.inputBuffer[:len(m.inputBuffer)-1]
+				}
+			default:
+				if len(msg.String()) == 1 {
+					m.inputBuffer += msg.String()
+				}
+			}
+		}
+
+	case msgIncomingChat:
+		if m.state == StateChatView && strings.Contains(string(msg), m.activeContact) {
+			m.chatHistory = append(m.chatHistory, string(msg))
+		}
+	}
+
+	return m, nil
+}
+
+func (m model) View() string {
+	switch m.state {
+	case StateListView:
+		var s strings.Builder
+		s.WriteString("\n  TARION P2P CHAT\n\n")
+		for i, c := range m.contacts {
+			status := styleOffline.Render("[offline]")
+			if c.Online {
+				status = styleOnline.Render("[ONLINE]")
+			}
+
+			line := fmt.Sprintf("%-15s %s", c.Username, status)
+			if i == m.cursor {
+				line = styleSelected.Render(line) + " <--"
+			}
+			s.WriteString(line + "\n")
+		}
+		s.WriteString("\n\n(↑/↓ Navigate, Enter Select, q Quit)")
+		return styleBorder.Render(s.String())
+
+	case StateChatView:
+		var s strings.Builder
+		s.WriteString(fmt.Sprintf(" Chatting with %s\n", m.activeContact))
+		s.WriteString("--------------------------------\n")
+		
+		// Render history
+		for _, line := range m.chatHistory {
+			s.WriteString(line + "\n")
+		}
+		
+		s.WriteString("\n--------------------------------\n")
+		s.WriteString(styleInput.Render("> " + m.inputBuffer + "_"))
+		
+		return styleBorder.Render(s.String())
+	}
+	return ""
+}
+
+func main() {
+	p := tea.NewProgram(tea.WithInputRefreshRate(10), tea.NewProgram(initialModel()))
+	if _, err := p.Run(); err != nil {
+		fmt.Printf("Error running TUI: %v", err)
+		os.Exit(1)
+	}
+}
