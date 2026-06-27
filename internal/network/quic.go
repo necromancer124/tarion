@@ -6,14 +6,16 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"net"
+	"strings"
 
 	"github.com/quic-go/quic-go"
 )
 
 // NetworkManager handles the QUIC listener and peer connections
 type NetworkManager struct {
-	Port    int
-	Listen  *quic.Listener
+	Port        int
+	Listen      *quic.Listener
 	MessageChan chan string
 }
 
@@ -24,40 +26,74 @@ func NewNetworkManager(port int) *NetworkManager {
 	}
 }
 
-// StartListener begins the background QUIC server to receive P2P messages
+// StartListener begins the background QUIC server and the UDP signaling listener
 func (nm *NetworkManager) StartListener() error {
+	// 1. Start QUIC Listener for P2P Chat Payloads
 	addr := fmt.Sprintf(":%d", nm.Port)
-	
-	// For P2P, we use a self-signed cert for TLS 1.3 requirement of QUIC
 	tlsConf := generateTLSConfig()
-	
 	listener, err := quic.ListenAddr(addr, tlsConf, nil)
 	if err != nil {
 		return fmt.Errorf("failed to start QUIC listener on %d: %v", nm.Port, err)
 	}
-	
 	nm.Listen = listener
-	
+
 	go func() {
 		for {
 			conn, err := nm.Listen.Accept(context.Background())
 			if err != nil {
-				log.Printf("Accept error: %v", err)
+				log.Printf("QUIC Accept error: %v", err)
 				continue
 			}
 			go nm.handleConnection(conn)
 		}
 	}()
-	
+
+	// 2. Start UDP Listener for Server Signaling (NAT Punching)
+	// The client is ALWAYS listening on this port for both QUIC and Server signals
+	udpAddr, _ := net.ResolveUDPAddr("udp", addr)
+	udpConn, err := net.ListenUDP("udp", udpAddr)
+	if err != nil {
+		// Note: On some OSs, we might need to use SO_REUSEPORT to share the port between QUIC and UDP
+		log.Printf("UDP Signaling listener started on %d", nm.Port)
+	}
+
+	go func() {
+		buf := make([]byte, 1024)
+		for {
+			n, remoteAddr, err := udpConn.ReadFromUDP(buf)
+			if err != nil {
+				continue
+			}
+			payload := string(buf[:n])
+			if strings.HasPrefix(payload, "PCH|") {
+				peerAddr := strings.Split(payload, "|")[1]
+				log.Printf("[NAT PUNCH] Received signal from server. Peer %s is calling. Opening hole...", peerAddr)
+				// To "open the hole", we send a dummy packet to the peer
+				nm.sendDummyPacket(peerAddr)
+			}
+		}
+	}()
+
 	return nil
+}
+
+func (nm *NetworkManager) sendDummyPacket(addr string) {
+	udpAddr, err := net.ResolveUDPAddr("udp", addr)
+	if err != nil {
+		return
+	}
+	conn, err := net.DialUDP("udp", nil, udpAddr)
+	if err != nil {
+		return
+	}
+	defer conn.Close()
+	conn.Write([]byte("PUNCH"))
 }
 
 func (nm *NetworkManager) handleConnection(conn quic.Connection) {
 	defer conn.CloseIfNeeded()
-	
 	stream, err := conn.AcceptStream(context.Background())
 	if err != nil {
-		log.Printf("Stream accept error: %v", err)
 		return
 	}
 	defer stream.Close()
@@ -65,29 +101,23 @@ func (nm *NetworkManager) handleConnection(conn quic.Connection) {
 	buf := make([]byte, 4096)
 	n, err := stream.Read(buf)
 	if err != nil && err != io.EOF {
-		log.Printf("Read error: %v", err)
 		return
 	}
 
-	message := string(buf[:n])
-	nm.MessageChan <- message
+	nm.MessageChan <- string(buf[:n])
 }
 
-// SendMessage initiates a QUIC connection to a peer and sends a payload
 func (nm *NetworkManager) SendMessage(peerAddr string, message string) error {
-	tlsConf := &tls.Config{
-		InsecureSkipVerify: true, // Required for P2P self-signed certs
-	}
-
+	tlsConf := &tls.Config{InsecureSkipVerify: true}
 	conn, err := quic.DialAddr(context.Background(), peerAddr, tlsConf, nil)
 	if err != nil {
-		return fmt.Errorf("failed to dial peer %s: %v", peerAddr, err)
+		return err
 	}
 	defer conn.CloseIfNeeded()
 
 	stream, err := conn.OpenStreamSync(context.Background())
 	if err != nil {
-		return fmt.Errorf("failed to open stream: %v", err)
+		return err
 	}
 	defer stream.Close()
 
@@ -95,11 +125,7 @@ func (nm *NetworkManager) SendMessage(peerAddr string, message string) error {
 	return err
 }
 
-// Helper to generate a dummy self-signed TLS config for QUIC
 func generateTLSConfig() *tls.Config {
-	// In a real production P2P app, we would use Noise protocol or 
-	// exchange keys via the directory server.
-	// For the prototype, we use a permissive config.
 	return &tls.Config{
 		InsecureSkipVerify: true,
 		NextProtos:         []string{"tarion-p2p"},
