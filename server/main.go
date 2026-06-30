@@ -1,6 +1,7 @@
 package main
 
 import (
+	"flag"
 	"fmt"
 	"log"
 	"net"
@@ -8,101 +9,97 @@ import (
 	"time"
 )
 
-// Protocol Commands
 const (
-	CmdRegister  = "REG" // REG|user|pass
-	CmdHeartbeat = "HBT" // HBT|user|pass
-	CmdQuery     = "QRY" // QRY|user|pass|target
-	CmdPunch     = "PCH" // PCH|target_addr (Sent from server to client)
+	CmdRegister  = "REG" // REG|username|password
+	CmdHeartbeat = "HBT" // HBT|username|password
+	CmdQuery     = "QRY" // QRY|username|password|target
 )
 
 func main() {
-	port := 63425
-	registry := NewRegistry()
+	port := flag.Int("port", 63425, "UDP port for Tarion directory signaling")
+	usersPath := flag.String("users", "users.db", "flat-file user hash database")
+	leaseTTL := flag.Duration("ttl", 60*time.Second, "online lease TTL")
+	sweepEvery := flag.Duration("sweep", 10*time.Second, "stale-entry sweep interval")
+	flag.Parse()
 
-	// Start the Reaper (Table Aging)
+	registry, err := NewRegistry(*usersPath, *leaseTTL)
+	if err != nil {
+		log.Fatalf("load registry: %v", err)
+	}
+
 	go func() {
-		ticker := time.NewTicker(10 * time.Second)
+		ticker := time.NewTicker(*sweepEvery)
+		defer ticker.Stop()
 		for range ticker.C {
 			registry.ReapStaleUsers()
 		}
 	}()
 
-	addr, err := net.ResolveUDPAddr("udp", fmt.Sprintf(":%d", port))
+	addr, err := net.ResolveUDPAddr("udp", fmt.Sprintf(":%d", *port))
 	if err != nil {
 		log.Fatal(err)
 	}
-
 	conn, err := net.ListenUDP("udp", addr)
 	if err != nil {
 		log.Fatal(err)
 	}
 	defer conn.Close()
 
-	fmt.Printf("TarionD started on UDP port %d\n", port)
-	fmt.Println("Signaling active. Monitoring NAT Punching...")
-
-	buf := make([]byte, 1024)
+	log.Printf("tariond listening on UDP/%d", *port)
+	buf := make([]byte, 2048)
 	for {
 		n, remoteAddr, err := conn.ReadFromUDP(buf)
 		if err != nil {
-			log.Printf("Read error: %v", err)
+			log.Printf("read: %v", err)
 			continue
 		}
+		response := handlePacket(registry, strings.TrimSpace(string(buf[:n])), remoteAddr.String())
+		if _, err := conn.WriteToUDP([]byte(response), remoteAddr); err != nil {
+			log.Printf("write to %s: %v", remoteAddr, err)
+		}
+	}
+}
 
-		payload := string(buf[:n])
-		parts := strings.Split(payload, "|")
-		if len(parts) < 2 {
-			continue
+func handlePacket(registry *Registry, payload, remoteAddr string) string {
+	parts := strings.Split(payload, "|")
+	if len(parts) < 3 {
+		return "ERR|BAD_REQUEST"
+	}
+
+	command, username, password := parts[0], strings.TrimSpace(parts[1]), parts[2]
+	if username == "" || password == "" {
+		return "ERR|BAD_REQUEST"
+	}
+
+	switch command {
+	case CmdRegister, CmdHeartbeat:
+		if err := registry.RegisterOrUpdate(username, password, remoteAddr); err != nil {
+			log.Printf("auth failed for %q from %s: %v", username, remoteAddr, err)
+			return "ERR|AUTH_FAILED"
+		}
+		return "OK|REGISTERED"
+
+	case CmdQuery:
+		if len(parts) < 4 || strings.TrimSpace(parts[3]) == "" {
+			return "ERR|BAD_REQUEST"
+		}
+		target := strings.TrimSpace(parts[3])
+
+		if err := registry.RegisterOrUpdate(username, password, remoteAddr); err != nil {
+			log.Printf("auth failed for %q from %s: %v", username, remoteAddr, err)
+			return "ERR|AUTH_FAILED"
 		}
 
-		command := parts[0]
-		username := parts[1]
-
-		switch command {
-		case CmdRegister, CmdHeartbeat:
-			if len(parts) < 3 {
-				continue
-			}
-			password := parts[2]
-			err := registry.RegisterOrUpdate(username, password, remoteAddr.String())
-			if err != nil {
-				conn.WriteToUDP([]byte("ERR|AUTH_FAILED"), remoteAddr)
-				log.Printf("Auth failed for %s", username)
-			} else {
-				conn.WriteToUDP([]byte("OK|REGISTERED"), remoteAddr)
-			}
-
-		case CmdQuery:
-			if len(parts) < 4 {
-				continue
-			}
-			password := parts[2]
-			target := parts[3]
-
-			// 1. Authenticate the requester
-			err := registry.RegisterOrUpdate(username, password, remoteAddr.String())
-			if err != nil {
-				conn.WriteToUDP([]byte("ERR|AUTH_FAILED"), remoteAddr)
-				continue
-			}
-
-			// 2. Find the target
-			targetAddr, err := registry.GetUserAddr(target)
-			if err != nil {
-				conn.WriteToUDP([]byte("ERR|OFFLINE"), remoteAddr)
-				continue
-			}
-
-			// 3. Trigger NAT Hole Punch: Tell Target to open a port for Requester
-			punchMsg := fmt.Sprintf("%s|%s", CmdPunch, remoteAddr.String())
-			targetUDP, _ := net.ResolveUDPAddr("udp", targetAddr)
-			conn.WriteToUDP([]byte(punchMsg), targetUDP)
-			
-			log.Printf("[SIGNAL] Triggered punch: %s -> %s", username, target)
-
-			// 4. Send target address back to requester
-			conn.WriteToUDP([]byte(fmt.Sprintf("OK|ADDR|%s", targetAddr)), remoteAddr)
+		// The server never relays chat data and does not initiate contact with clients.
+		// It only returns the target's currently observed public UDP address.
+		targetAddr, err := registry.GetUserAddr(target)
+		if err != nil {
+			return "ERR|OFFLINE"
 		}
+		log.Printf("query: %s requested %s -> %s", username, target, targetAddr)
+		return "OK|ADDR|" + targetAddr
+
+	default:
+		return "ERR|UNKNOWN_COMMAND"
 	}
 }

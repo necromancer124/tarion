@@ -1,106 +1,146 @@
 package main
 
 import (
+	"bufio"
+	"crypto/rand"
 	"crypto/sha256"
+	"encoding/base64"
 	"encoding/hex"
 	"fmt"
 	"log"
 	"os"
+	"strings"
 	"sync"
 	"time"
 )
 
-// UserEntry holds the network and auth state of a connected client
 type UserEntry struct {
 	Username     string
 	PublicAddr   string
 	PasswordHash string
+	Salt         string
 	LastSeen     time.Time
 }
 
-// Registry is the central CAM-table for Tarion
 type Registry struct {
-	mu    sync.RWMutex
-	users map[string]*UserEntry
+	mu       sync.RWMutex
+	users    map[string]*UserEntry
+	usersDB  string
+	leaseTTL time.Duration
 }
 
-func NewRegistry() *Registry {
-	return &Registry{
-		users: make(map[string]*UserEntry),
+func NewRegistry(usersDB string, leaseTTL time.Duration) (*Registry, error) {
+	r := &Registry{
+		users:    make(map[string]*UserEntry),
+		usersDB:  usersDB,
+		leaseTTL: leaseTTL,
 	}
+	return r, r.loadUsersFromDisk()
 }
 
-// HashPassword creates a simple SHA-256 hash of the password
-func HashPassword(password string) string {
-	hash := sha256.Sum256([]byte(password))
-	return hex.EncodeToString(hash[:])
+func hashPassword(password, salt string) string {
+	sum := sha256.Sum256([]byte(salt + ":" + password))
+	return hex.EncodeToString(sum[:])
 }
 
-// RegisterOrUpdate handles the first-time connection and subsequent heartbeats
+func newSalt() (string, error) {
+	buf := make([]byte, 16)
+	if _, err := rand.Read(buf); err != nil {
+		return "", err
+	}
+	return base64.RawStdEncoding.EncodeToString(buf), nil
+}
+
 func (r *Registry) RegisterOrUpdate(username, password, addr string) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
-	pwdHash := HashPassword(password)
-	existing, exists := r.users[username]
-
-	if !exists {
-		log.Printf("[NEW USER] Registering %s from %s", username, addr)
-		r.users[username] = &UserEntry{
-			Username:     username,
-			PublicAddr:   addr,
-			PasswordHash: pwdHash,
-			LastSeen:     time.Now(),
+	if existing, ok := r.users[username]; ok {
+		if existing.PasswordHash != hashPassword(password, existing.Salt) {
+			return fmt.Errorf("authentication failed")
 		}
-		return r.saveUserToDisk(username, pwdHash)
+		existing.PublicAddr = addr
+		existing.LastSeen = time.Now()
+		return nil
 	}
 
-	// Authenticate existing user
-	if existing.PasswordHash != pwdHash {
-		return fmt.Errorf("authentication failed for user %s", username)
+	salt, err := newSalt()
+	if err != nil {
+		return err
 	}
-
-	// Update address and timestamp
-	existing.PublicAddr = addr
-	existing.LastSeen = time.Now()
-	return nil
+	r.users[username] = &UserEntry{
+		Username:     username,
+		PublicAddr:   addr,
+		Salt:         salt,
+		PasswordHash: hashPassword(password, salt),
+		LastSeen:     time.Now(),
+	}
+	log.Printf("registered new user %q from %s", username, addr)
+	return r.saveUsersToDiskLocked()
 }
 
-// saveUserToDisk persists the username and hash to a flat file for authentication on restart
-func (r *Registry) saveUserToDisk(username, hash string) error {
-	filename := "users.db"
-	f, err := os.OpenFile(filename, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0600)
+func (r *Registry) ReapStaleUsers() {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	cutoff := time.Now().Add(-r.leaseTTL)
+	for name, entry := range r.users {
+		if entry.PublicAddr != "" && entry.LastSeen.Before(cutoff) {
+			log.Printf("lease expired for %q", name)
+			entry.PublicAddr = ""
+		}
+	}
+}
+
+func (r *Registry) GetUserAddr(username string) (string, error) {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+
+	entry, ok := r.users[username]
+	if !ok || entry.PublicAddr == "" {
+		return "", fmt.Errorf("offline")
+	}
+	return entry.PublicAddr, nil
+}
+
+func (r *Registry) loadUsersFromDisk() error {
+	f, err := os.Open(r.usersDB)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
+		return err
+	}
+	defer f.Close()
+
+	scanner := bufio.NewScanner(f)
+	for scanner.Scan() {
+		line := strings.TrimSpace(scanner.Text())
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		parts := strings.Split(line, ":")
+		if len(parts) != 3 {
+			log.Printf("skipping malformed user record")
+			continue
+		}
+		r.users[parts[0]] = &UserEntry{Username: parts[0], Salt: parts[1], PasswordHash: parts[2]}
+	}
+	return scanner.Err()
+}
+
+func (r *Registry) saveUsersToDiskLocked() error {
+	f, err := os.OpenFile(r.usersDB, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0600)
 	if err != nil {
 		return err
 	}
 	defer f.Close()
 
-	_, err = f.WriteString(fmt.Sprintf("%s:%s\n", username, hash))
-	return err
-}
-
-// ReapStaleUsers removes users who haven't sent a heartbeat in 60 seconds
-func (r *Registry) ReapStaleUsers() {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-
-	now := time.Now()
-	for name, entry := range r.users {
-		if now.Sub(entry.LastSeen) > 60*time.Second {
-			log.Printf("[SCAVENGER] Purging stale user: %s", name)
-			delete(r.users, name)
+	w := bufio.NewWriter(f)
+	for _, entry := range r.users {
+		if _, err := fmt.Fprintf(w, "%s:%s:%s\n", entry.Username, entry.Salt, entry.PasswordHash); err != nil {
+			return err
 		}
 	}
-}
-
-// GetUserAddr retrieves the IP:Port for a target user (The Signaling part)
-func (r *Registry) GetUserAddr(username string) (string, error) {
-	r.mu.RLock()
-	defer r.mu.RUnlock()
-
-	entry, exists := r.users[username]
-	if !exists {
-		return "", fmt.Errorf("user %s is currently offline", username)
-	}
-	return entry.PublicAddr, nil
+	return w.Flush()
 }
