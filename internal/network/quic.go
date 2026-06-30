@@ -96,7 +96,10 @@ func (nm *NetworkManager) SendMessage(peerAddr string, message string) error {
 	if err != nil {
 		return fmt.Errorf("dial %s: %w", peerAddr, err)
 	}
-	defer conn.CloseWithError(0, "done")
+	// Do not immediately close the QUIC connection after closing the stream.
+	// A connection-level close can race the peer's stream reader and cancel the
+	// message before it is delivered. For Tarion's single-message prototype,
+	// closing the stream is the delivery boundary; the connection can idle out.
 
 	stream, err := conn.OpenStreamSync(context.Background())
 	if err != nil {
