@@ -2,50 +2,68 @@
 
 Tarion is a secure hybrid peer-to-peer CLI chat client using QUIC over UDP port `63425` by default.
 
-## What the client does
+## Commands
 
-- `tarion.exe start` starts the client, tries to register/heartbeat with the directory server, and begins listening for direct QUIC peer messages.
-- The opening menu is intentionally clean: contacts plus controls only.
-- Detailed setup/network/history information lives in the in-app help menu (`h` or `?`).
-- The menu refreshes periodically and when messages arrive.
-- New incoming messages mark contacts with `[NEW]` in the menu.
-- Known/online users are refreshed from the directory server when it supports `LST`.
-- Chat history is local under your OS config directory in `tarion/history`.
-
-## Build
+Open the interactive menu/TUI:
 
 ```powershell
-go build -o tarion.exe .
+.\tarion.exe menu
 ```
 
-## Start connected to a server
+Start the interactive client and connect/listen:
 
 ```powershell
 .\tarion.exe start -server 127.0.0.1:63425 -user alice -pass secret
 ```
 
-The values are saved to:
-
-```text
-%APPDATA%\tarion\config.json
-```
-
-You can later run:
+Run the listener in a background terminal process, without opening the menu:
 
 ```powershell
-.\tarion.exe start
+.\tarion.exe background -server 127.0.0.1:63425 -user alice -pass secret
 ```
 
-## Direct/self-test chat
+The background command keeps running until you stop it with `Ctrl+C` or close that terminal. While it is running, incoming messages are saved to local history. You can open another terminal and run `tarion.exe menu` to read saved chats.
+
+Direct/self-test chat:
 
 ```powershell
 .\tarion.exe start -p 63426 -u Myself -i 127.0.0.1:63426
 ```
 
-## Delete local history
+Delete local chat history:
 
 ```powershell
 .\tarion.exe start -wipe-history
+```
+
+## Menu behavior
+
+- The menu always includes saved history chats, even when they are offline.
+- Offline saved chats are tagged `[offline]`.
+- Online users are refreshed from the server when configured.
+- New incoming messages mark chats as `[NEW]`.
+- `r` refreshes immediately; the menu also refreshes automatically.
+
+## Config
+
+The config is saved to:
+
+```text
+%APPDATA%\tarion\config.json
+```
+
+It can contain contacts:
+
+```json
+{
+  "server_addr": "127.0.0.1:63425",
+  "username": "alice",
+  "password": "secret",
+  "port": 63425,
+  "contacts": [
+    { "name": "bob", "addr": "127.0.0.1:63426" }
+  ]
+}
 ```
 
 ## Controls
@@ -54,7 +72,7 @@ You can later run:
 - `Enter`: open selected chat / send typed message
 - `Esc`: leave chat view and return to menu
 - `h` or `?`: open/close help
-- `r`: refresh directory now
+- `r`: refresh directory/history now
 - `q` or `Ctrl+C`: quit
 
 ## Privacy

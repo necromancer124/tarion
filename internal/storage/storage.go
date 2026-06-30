@@ -112,6 +112,28 @@ func ReadHistory(username string) ([]string, error) {
 	return lines, scanner.Err()
 }
 
+func ListHistoryContacts() ([]Contact, error) {
+	dir := GetHistoryDir()
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil, nil
+		}
+		return nil, err
+	}
+	contacts := make([]Contact, 0, len(entries))
+	for _, entry := range entries {
+		if entry.IsDir() || !strings.HasSuffix(strings.ToLower(entry.Name()), ".txt") {
+			continue
+		}
+		name := strings.TrimSuffix(entry.Name(), filepath.Ext(entry.Name()))
+		if name != "" {
+			contacts = append(contacts, Contact{Name: name})
+		}
+	}
+	return contacts, nil
+}
+
 func GetLastModified(username string) time.Time {
 	info, err := os.Stat(GetHistoryPath(username))
 	if err != nil {

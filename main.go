@@ -5,7 +5,9 @@ import (
 	"fmt"
 	"net"
 	"os"
+	"os/signal"
 	"strings"
+	"syscall"
 	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
@@ -139,20 +141,47 @@ func initialModel(cfg *storage.Config, forceChatUser, forceChatAddr string, port
 	nm := network.NewNetworkManager(port)
 	status := fmt.Sprintf("listening UDP/%d", port)
 	if err := nm.StartListener(); err != nil {
-		status = "network error: " + err.Error()
+		status = "menu-only: " + err.Error()
 	}
 
-	contacts := make([]Contact, 0, len(cfg.Contacts)+1)
-	for _, c := range cfg.Contacts {
-		contacts = append(contacts, Contact{Username: c.Name, Addr: c.Addr, Online: c.Addr != ""})
-	}
-
+	contacts := collectContacts(cfg)
 	m := model{state: StateListView, contacts: contacts, netMgr: nm, cfg: cfg, statusLine: status}
 	if forceChatUser != "" && forceChatAddr != "" {
 		m.upsertContact(Contact{Username: forceChatUser, Addr: forceChatAddr, Online: true, IsManual: true})
 		m.openChat(forceChatUser)
 	}
 	return m
+}
+
+func collectContacts(cfg *storage.Config) []Contact {
+	contacts := make([]Contact, 0, len(cfg.Contacts)+8)
+	seen := map[string]bool{}
+	for _, c := range cfg.Contacts {
+		if c.Name == "" {
+			continue
+		}
+		contacts = append(contacts, Contact{Username: c.Name, Addr: c.Addr, Online: c.Addr != ""})
+		seen[c.Name] = true
+	}
+	return mergeHistoryContacts(contacts, seen)
+}
+
+func mergeHistoryContacts(contacts []Contact, seen map[string]bool) []Contact {
+	if seen == nil {
+		seen = map[string]bool{}
+		for _, c := range contacts {
+			seen[c.Username] = true
+		}
+	}
+	if histories, err := storage.ListHistoryContacts(); err == nil {
+		for _, h := range histories {
+			if h.Name != "" && !seen[h.Name] {
+				contacts = append(contacts, Contact{Username: h.Name, Online: false})
+				seen[h.Name] = true
+			}
+		}
+	}
+	return contacts
 }
 
 func (m model) Init() tea.Cmd {
@@ -169,7 +198,7 @@ func (m model) listenForMessages() tea.Cmd {
 
 func (m model) refreshDirectory() tea.Cmd {
 	cfg := *m.cfg
-	contacts := append([]Contact(nil), m.contacts...)
+	contacts := mergeHistoryContacts(append([]Contact(nil), m.contacts...), nil)
 	return func() tea.Msg {
 		if cfg.ServerAddr == "" || cfg.Username == "" || cfg.Password == "" {
 			return msgDirectory{status: "offline: configure server_addr, username, password in " + storage.GetConfigPath(), contacts: contacts}
@@ -378,6 +407,12 @@ func helpText(m model) string {
 	return strings.Join([]string{
 		"\nTARION HELP",
 		"",
+		"Open menu:",
+		"  tarion.exe menu",
+		"",
+		"Run listener in background terminal:",
+		"  tarion.exe background -server 127.0.0.1:63425 -user alice -pass secret",
+		"",
 		"Start connected client:",
 		"  tarion.exe start -server 127.0.0.1:63425 -user alice -pass secret",
 		"",
@@ -395,6 +430,75 @@ func helpText(m model) string {
 		"",
 		"Controls: Enter open/send, Esc back, r refresh, h help, q quit.",
 	}, "\n")
+}
+
+func runBackground(args []string) error {
+	fs := flag.NewFlagSet("background", flag.ExitOnError)
+	portFlag := fs.Int("p", 0, "local UDP port to listen on")
+	serverFlag := fs.String("server", "", "directory server IP:port")
+	nameFlag := fs.String("user", "", "directory username")
+	passFlag := fs.String("pass", "", "directory password")
+	_ = fs.Parse(args)
+
+	cfg, err := storage.LoadOrCreateConfig()
+	if err != nil {
+		return err
+	}
+	if *serverFlag != "" {
+		cfg.ServerAddr = *serverFlag
+	}
+	if *nameFlag != "" {
+		cfg.Username = *nameFlag
+	}
+	if *passFlag != "" {
+		cfg.Password = *passFlag
+	}
+	if *portFlag != 0 {
+		cfg.Port = *portFlag
+	}
+	if cfg.Port == 0 {
+		cfg.Port = 63425
+	}
+	if err := storage.SaveConfig(cfg); err != nil {
+		return err
+	}
+
+	nm := network.NewNetworkManager(cfg.Port)
+	if err := nm.StartListener(); err != nil {
+		return err
+	}
+	fmt.Printf("tarion background listening on UDP/%d\n", cfg.Port)
+
+	go func() {
+		for msg := range nm.MessageChan {
+			name := msg.From
+			for _, c := range cfg.Contacts {
+				if c.Addr == msg.From {
+					name = c.Name
+					break
+				}
+			}
+			_ = storage.AppendHistory(name, fmt.Sprintf("%s: %s", name, msg.Body))
+			fmt.Printf("new message from %s\n", name)
+		}
+	}()
+
+	if cfg.ServerAddr != "" && cfg.Username != "" && cfg.Password != "" {
+		d := newDirectoryClient(cfg)
+		go func() {
+			for {
+				if err := d.heartbeat(); err != nil {
+					_ = d.register()
+				}
+				time.Sleep(20 * time.Second)
+			}
+		}()
+	}
+
+	stop := make(chan os.Signal, 1)
+	signal.Notify(stop, os.Interrupt, syscall.SIGTERM)
+	<-stop
+	return nil
 }
 
 func runStart(args []string) error {
@@ -443,10 +547,22 @@ func runStart(args []string) error {
 
 func main() {
 	args := os.Args[1:]
-	if len(args) > 0 && args[0] == "start" {
-		args = args[1:]
+	cmd := "start"
+	if len(args) > 0 {
+		switch args[0] {
+		case "start", "menu", "background":
+			cmd, args = args[0], args[1:]
+		}
 	}
-	if err := runStart(args); err != nil {
+
+	var err error
+	switch cmd {
+	case "background":
+		err = runBackground(args)
+	case "menu", "start":
+		err = runStart(args)
+	}
+	if err != nil {
 		fmt.Fprintln(os.Stderr, styleError.Render("tarion: "+err.Error()))
 		os.Exit(1)
 	}
