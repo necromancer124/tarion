@@ -1,6 +1,7 @@
 package main
 
 import (
+	"encoding/json"
 	"flag"
 	"fmt"
 	"net"
@@ -50,6 +51,7 @@ type model struct {
 	chatHistory   []string
 	inputBuffer   string
 	statusLine    string
+	useBackground bool
 	cfg           *storage.Config
 	netMgr        *network.NetworkManager
 }
@@ -134,18 +136,113 @@ func (d directoryClient) listOnline() []Contact {
 	return contacts
 }
 
+type controlRequest struct {
+	Cmd  string `json:"cmd"`
+	To   string `json:"to,omitempty"`
+	Addr string `json:"addr,omitempty"`
+	Body string `json:"body,omitempty"`
+}
+
+type controlResponse struct {
+	OK    bool   `json:"ok"`
+	Error string `json:"error,omitempty"`
+}
+
+func controlAddr(port int) string {
+	if port == 0 {
+		port = 63425
+	}
+	ctrl := port + 10000
+	if ctrl > 65535 {
+		ctrl = port - 10000
+	}
+	return fmt.Sprintf("127.0.0.1:%d", ctrl)
+}
+
+func backgroundRequest(port int, req controlRequest) error {
+	conn, err := net.DialTimeout("tcp", controlAddr(port), 500*time.Millisecond)
+	if err != nil {
+		return err
+	}
+	defer conn.Close()
+	_ = conn.SetDeadline(time.Now().Add(2 * time.Second))
+	if err := json.NewEncoder(conn).Encode(req); err != nil {
+		return err
+	}
+	var resp controlResponse
+	if err := json.NewDecoder(conn).Decode(&resp); err != nil {
+		return err
+	}
+	if !resp.OK {
+		if resp.Error == "" {
+			resp.Error = "background rejected request"
+		}
+		return fmt.Errorf("%s", resp.Error)
+	}
+	return nil
+}
+
+func backgroundRunning(port int) bool {
+	return backgroundRequest(port, controlRequest{Cmd: "ping"}) == nil
+}
+
+func serveBackgroundControl(port int, nm *network.NetworkManager) error {
+	ln, err := net.Listen("tcp", controlAddr(port))
+	if err != nil {
+		return err
+	}
+	go func() {
+		for {
+			conn, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			go handleControlConn(conn, nm)
+		}
+	}()
+	return nil
+}
+
+func handleControlConn(conn net.Conn, nm *network.NetworkManager) {
+	defer conn.Close()
+	var req controlRequest
+	if err := json.NewDecoder(conn).Decode(&req); err != nil {
+		_ = json.NewEncoder(conn).Encode(controlResponse{Error: err.Error()})
+		return
+	}
+	switch req.Cmd {
+	case "ping":
+		_ = json.NewEncoder(conn).Encode(controlResponse{OK: true})
+	case "send":
+		if err := nm.SendMessage(req.Addr, req.Body); err != nil {
+			_ = json.NewEncoder(conn).Encode(controlResponse{Error: err.Error()})
+			return
+		}
+		_ = json.NewEncoder(conn).Encode(controlResponse{OK: true})
+	default:
+		_ = json.NewEncoder(conn).Encode(controlResponse{Error: "unknown command"})
+	}
+}
+
 func initialModel(cfg *storage.Config, forceChatUser, forceChatAddr string, port int) model {
 	if port == 0 {
 		port = 63425
 	}
-	nm := network.NewNetworkManager(port)
-	status := fmt.Sprintf("listening UDP/%d", port)
-	if err := nm.StartListener(); err != nil {
-		status = "menu-only: " + err.Error()
-	}
 
 	contacts := collectContacts(cfg)
-	m := model{state: StateListView, contacts: contacts, netMgr: nm, cfg: cfg, statusLine: status}
+	m := model{state: StateListView, contacts: contacts, cfg: cfg}
+	if backgroundRunning(port) {
+		m.useBackground = true
+		m.statusLine = "using background listener at " + controlAddr(port)
+	} else {
+		nm := network.NewNetworkManager(port)
+		m.netMgr = nm
+		m.statusLine = fmt.Sprintf("listening UDP/%d", port)
+		if err := nm.StartListener(); err != nil {
+			m.statusLine = "menu-only: " + err.Error()
+			m.netMgr = nil
+		}
+	}
 	if forceChatUser != "" && forceChatAddr != "" {
 		m.upsertContact(Contact{Username: forceChatUser, Addr: forceChatAddr, Online: true, IsManual: true})
 		m.openChat(forceChatUser)
@@ -185,7 +282,11 @@ func mergeHistoryContacts(contacts []Contact, seen map[string]bool) []Contact {
 }
 
 func (m model) Init() tea.Cmd {
-	return tea.Batch(m.listenForMessages(), m.refreshDirectory(), tick())
+	cmds := []tea.Cmd{m.refreshDirectory(), tick()}
+	if !m.useBackground && m.netMgr != nil {
+		cmds = append(cmds, m.listenForMessages())
+	}
+	return tea.Batch(cmds...)
 }
 
 func tick() tea.Cmd {
@@ -301,7 +402,13 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 							break
 						}
 					}
-					go func() { _ = m.netMgr.SendMessage(targetAddr, text) }()
+					if m.useBackground {
+						go func() {
+							_ = backgroundRequest(m.cfg.Port, controlRequest{Cmd: "send", To: m.activeContact, Addr: targetAddr, Body: text})
+						}()
+					} else if m.netMgr != nil {
+						go func() { _ = m.netMgr.SendMessage(targetAddr, text) }()
+					}
 					m.inputBuffer = ""
 				}
 			case "backspace":
@@ -410,8 +517,9 @@ func helpText(m model) string {
 		"Open menu:",
 		"  tarion.exe menu",
 		"",
-		"Run listener in background terminal:",
+		"Run network process in background terminal:",
 		"  tarion.exe background -server 127.0.0.1:63425 -user alice -pass secret",
+		"  Then use tarion.exe menu to read/send through that background process.",
 		"",
 		"Start connected client:",
 		"  tarion.exe start -server 127.0.0.1:63425 -user alice -pass secret",
@@ -467,7 +575,10 @@ func runBackground(args []string) error {
 	if err := nm.StartListener(); err != nil {
 		return err
 	}
-	fmt.Printf("tarion background listening on UDP/%d\n", cfg.Port)
+	if err := serveBackgroundControl(cfg.Port, nm); err != nil {
+		return fmt.Errorf("start background control at %s: %w", controlAddr(cfg.Port), err)
+	}
+	fmt.Printf("tarion background listening on UDP/%d; control %s\n", cfg.Port, controlAddr(cfg.Port))
 
 	go func() {
 		for msg := range nm.MessageChan {
