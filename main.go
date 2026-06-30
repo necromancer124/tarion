@@ -8,6 +8,7 @@ import (
 	"os"
 	"os/signal"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -52,6 +53,7 @@ type model struct {
 	inputBuffer   string
 	statusLine    string
 	useBackground bool
+	seenMod       map[string]time.Time
 	cfg           *storage.Config
 	netMgr        *network.NetworkManager
 }
@@ -186,7 +188,7 @@ func backgroundRunning(port int) bool {
 	return backgroundRequest(port, controlRequest{Cmd: "ping"}) == nil
 }
 
-func serveBackgroundControl(port int, nm *network.NetworkManager) error {
+func serveBackgroundControl(port int, nm *network.NetworkManager, aliases *sync.Map) error {
 	ln, err := net.Listen("tcp", controlAddr(port))
 	if err != nil {
 		return err
@@ -197,13 +199,13 @@ func serveBackgroundControl(port int, nm *network.NetworkManager) error {
 			if err != nil {
 				return
 			}
-			go handleControlConn(conn, nm)
+			go handleControlConn(conn, nm, aliases)
 		}
 	}()
 	return nil
 }
 
-func handleControlConn(conn net.Conn, nm *network.NetworkManager) {
+func handleControlConn(conn net.Conn, nm *network.NetworkManager, aliases *sync.Map) {
 	defer conn.Close()
 	var req controlRequest
 	if err := json.NewDecoder(conn).Decode(&req); err != nil {
@@ -220,6 +222,14 @@ func handleControlConn(conn net.Conn, nm *network.NetworkManager) {
 			os.Exit(0)
 		}()
 	case "send":
+		if req.To != "" {
+			if req.Addr != "" {
+				aliases.Store(req.Addr, req.To)
+			}
+			if req.Body != "" {
+				aliases.Store("body:"+req.Body, req.To)
+			}
+		}
 		if err := nm.SendMessage(req.Addr, req.Body); err != nil {
 			_ = json.NewEncoder(conn).Encode(controlResponse{Error: err.Error()})
 			return
@@ -236,7 +246,11 @@ func initialModel(cfg *storage.Config, forceChatUser, forceChatAddr string, port
 	}
 
 	contacts := collectContacts(cfg)
-	m := model{state: StateListView, contacts: contacts, cfg: cfg}
+	seenMod := make(map[string]time.Time, len(contacts))
+	for _, c := range contacts {
+		seenMod[c.Username] = storage.GetLastModified(c.Username)
+	}
+	m := model{state: StateListView, contacts: contacts, cfg: cfg, seenMod: seenMod}
 	if backgroundRunning(port) {
 		m.useBackground = true
 		m.statusLine = "using background listener at " + controlAddr(port)
@@ -356,6 +370,10 @@ func (m *model) openChat(name string) {
 	m.activeContact = name
 	m.state = StateChatView
 	m.chatHistory, _ = storage.ReadHistory(name)
+	if m.seenMod == nil {
+		m.seenMod = map[string]time.Time{}
+	}
+	m.seenMod[name] = storage.GetLastModified(name)
 	for i := range m.contacts {
 		if m.contacts[i].Username == name {
 			m.contacts[i].Unread = false
@@ -464,11 +482,29 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, m.listenForMessages()
 	case msgDirectory:
 		m.statusLine = msg.status
+		if m.seenMod == nil {
+			m.seenMod = map[string]time.Time{}
+		}
 		for _, c := range msg.contacts {
+			mod := storage.GetLastModified(c.Username)
+			if seen, ok := m.seenMod[c.Username]; !ok {
+				m.seenMod[c.Username] = mod
+			} else if !mod.IsZero() && mod.After(seen) && !(m.state == StateChatView && m.activeContact == c.Username) {
+				c.Unread = true
+			}
 			m.upsertContact(c)
 		}
 		return m, tick()
 	case msgTick:
+		if m.state == StateChatView && m.activeContact != "" {
+			if history, err := storage.ReadHistory(m.activeContact); err == nil {
+				m.chatHistory = history
+			}
+			if m.seenMod == nil {
+				m.seenMod = map[string]time.Time{}
+			}
+			m.seenMod[m.activeContact] = storage.GetLastModified(m.activeContact)
+		}
 		return m, m.refreshDirectory()
 	}
 	return m, nil
@@ -488,7 +524,7 @@ func (m model) View() string {
 					status = styleOnline.Render("[ONLINE]")
 				}
 				newIndicator := ""
-				if lastMod := storage.GetLastModified(c.Username); c.Unread || (!lastMod.IsZero() && time.Since(lastMod) < 5*time.Minute) {
+				if c.Unread {
 					newIndicator = styleNew.Render(" [NEW]")
 				}
 				line := fmt.Sprintf("%-18s %s%s", c.Username, status, newIndicator)
@@ -624,7 +660,13 @@ func runBackground(args []string) error {
 	if err := nm.StartListener(); err != nil {
 		return err
 	}
-	if err := serveBackgroundControl(cfg.Port, nm); err != nil {
+	aliases := &sync.Map{}
+	for _, c := range cfg.Contacts {
+		if c.Addr != "" && c.Name != "" {
+			aliases.Store(c.Addr, c.Name)
+		}
+	}
+	if err := serveBackgroundControl(cfg.Port, nm, aliases); err != nil {
 		return fmt.Errorf("start background control at %s: %w", controlAddr(cfg.Port), err)
 	}
 	fmt.Printf("tarion background listening on UDP/%d; control %s\n", cfg.Port, controlAddr(cfg.Port))
@@ -632,10 +674,20 @@ func runBackground(args []string) error {
 	go func() {
 		for msg := range nm.MessageChan {
 			name := msg.From
-			for _, c := range cfg.Contacts {
-				if c.Addr == msg.From {
-					name = c.Name
-					break
+			if alias, ok := aliases.Load(msg.From); ok {
+				if aliasName, ok := alias.(string); ok && aliasName != "" {
+					name = aliasName
+				}
+			} else if alias, ok := aliases.LoadAndDelete("body:" + msg.Body); ok {
+				if aliasName, ok := alias.(string); ok && aliasName != "" {
+					name = aliasName
+				}
+			} else {
+				for _, c := range cfg.Contacts {
+					if c.Addr == msg.From {
+						name = c.Name
+						break
+					}
 				}
 			}
 			_ = storage.AppendHistory(name, fmt.Sprintf("%s: %s", name, msg.Body))
