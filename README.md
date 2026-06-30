@@ -4,49 +4,57 @@ Tarion is a secure hybrid peer-to-peer CLI chat client using QUIC over UDP port 
 
 ## What the client does
 
-- Runs an always-on QUIC listener for direct peer-to-peer chat messages.
-- Stores chat history locally in your OS config directory under `tarion/history`.
-- Supports manual/direct chats by IP address without needing discovery first.
-- Shows setup/help text directly in the opening menu.
-- Shows a `[NEW]` marker for contacts whose history file changed recently.
+- `tarion.exe start` starts the client, tries to register/heartbeat with the directory server, and begins listening for direct QUIC peer messages.
+- The opening menu is intentionally clean: contacts plus controls only.
+- Detailed setup/network/history information lives in the in-app help menu (`h` or `?`).
+- The menu refreshes periodically and when messages arrive.
+- New incoming messages mark contacts with `[NEW]` in the menu.
+- Known/online users are refreshed from the directory server when it supports `LST`.
+- Chat history is local under your OS config directory in `tarion/history`.
 
 ## Build
 
-```bash
+```powershell
 go build -o tarion.exe .
 ```
 
-## Run
+## Start connected to a server
 
-Open the menu:
-
-```bash
-./tarion.exe
+```powershell
+.\tarion.exe start -server 127.0.0.1:63425 -user alice -pass secret
 ```
 
-Open a direct chat with a peer IP and assign it a display name:
+The values are saved to:
 
-```bash
-./tarion.exe -u Friend -i 203.0.113.10:63425
+```text
+%APPDATA%\tarion\config.json
 ```
 
-Use a different local test port:
+You can later run:
 
-```bash
-./tarion.exe -p 63426 -u LocalPeer -i 127.0.0.1:63425
+```powershell
+.\tarion.exe start
 ```
 
-Delete all local chat history:
+## Direct/self-test chat
 
-```bash
-./tarion.exe -wipe-history
+```powershell
+.\tarion.exe start -p 63426 -u Myself -i 127.0.0.1:63426
+```
+
+## Delete local history
+
+```powershell
+.\tarion.exe start -wipe-history
 ```
 
 ## Controls
 
 - `↑` / `↓` or `k` / `j`: navigate contacts
 - `Enter`: open selected chat / send typed message
-- `Esc`: leave chat view and return to the menu
+- `Esc`: leave chat view and return to menu
+- `h` or `?`: open/close help
+- `r`: refresh directory now
 - `q` or `Ctrl+C`: quit
 
 ## Privacy

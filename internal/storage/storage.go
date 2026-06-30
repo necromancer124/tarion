@@ -9,10 +9,21 @@ import (
 	"time"
 )
 
+type Contact struct {
+	Name string `json:"name"`
+	Addr string `json:"addr,omitempty"`
+}
+
 type Config struct {
-	ServerAddr string `json:"server_addr"`
-	Username   string `json:"username"`
-	Port       int    `json:"port"`
+	ServerAddr string    `json:"server_addr"`
+	Username   string    `json:"username"`
+	Password   string    `json:"password"`
+	Port       int       `json:"port"`
+	Contacts   []Contact `json:"contacts"`
+}
+
+func DefaultConfig() *Config {
+	return &Config{Port: 63425, Contacts: []Contact{}}
 }
 
 func GetBaseConfigDir() string {
@@ -24,17 +35,27 @@ func GetBaseConfigDir() string {
 	return filepath.Join(configDir, "tarion")
 }
 
-func GetConfigPath() string {
-	return filepath.Join(GetBaseConfigDir(), "config.json")
-}
+func GetConfigPath() string { return filepath.Join(GetBaseConfigDir(), "config.json") }
 
 func LoadConfig() (*Config, error) {
 	data, err := os.ReadFile(GetConfigPath())
 	if err != nil {
 		return nil, err
 	}
-	var cfg Config
-	return &cfg, json.Unmarshal(data, &cfg)
+	cfg := DefaultConfig()
+	return cfg, json.Unmarshal(data, cfg)
+}
+
+func LoadOrCreateConfig() (*Config, error) {
+	cfg, err := LoadConfig()
+	if err == nil {
+		return cfg, nil
+	}
+	if !os.IsNotExist(err) {
+		return nil, err
+	}
+	cfg = DefaultConfig()
+	return cfg, SaveConfig(cfg)
 }
 
 func SaveConfig(cfg *Config) error {
@@ -46,16 +67,17 @@ func SaveConfig(cfg *Config) error {
 	if err != nil {
 		return err
 	}
-	return os.WriteFile(path, data, 0644)
+	return os.WriteFile(path, data, 0600)
 }
 
-func GetHistoryDir() string {
-	return filepath.Join(GetBaseConfigDir(), "history")
+func GetHistoryDir() string { return filepath.Join(GetBaseConfigDir(), "history") }
+
+func safeName(name string) string {
+	return strings.NewReplacer("/", "_", "\\", "_", ":", "_", "*", "_", "?", "_", "\"", "_", "<", "_", ">", "_", "|", "_").Replace(name)
 }
 
 func GetHistoryPath(username string) string {
-	safe := strings.NewReplacer("/", "_", "\\", "_", ":", "_", "*", "_", "?", "_", "\"", "_", "<", "_", ">", "_", "|", "_").Replace(username)
-	return filepath.Join(GetHistoryDir(), safe+".txt")
+	return filepath.Join(GetHistoryDir(), safeName(username)+".txt")
 }
 
 func AppendHistory(username, message string) error {
@@ -99,8 +121,7 @@ func GetLastModified(username string) time.Time {
 }
 
 func DeleteAllHistory() error {
-	err := os.RemoveAll(GetHistoryDir())
-	if err != nil {
+	if err := os.RemoveAll(GetHistoryDir()); err != nil {
 		return err
 	}
 	return os.MkdirAll(GetHistoryDir(), 0755)
