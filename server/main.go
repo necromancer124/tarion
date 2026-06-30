@@ -13,6 +13,7 @@ const (
 	CmdRegister  = "REG" // REG|username|password
 	CmdHeartbeat = "HBT" // HBT|username|password
 	CmdQuery     = "QRY" // QRY|username|password|target
+	CmdList      = "LST" // LST|username|password
 )
 
 func main() {
@@ -98,6 +99,13 @@ func handlePacket(registry *Registry, payload, remoteAddr string) string {
 		}
 		log.Printf("query: %s requested %s -> %s", username, target, targetAddr)
 		return "OK|ADDR|" + targetAddr
+
+	case CmdList:
+		if err := registry.RegisterOrUpdate(username, password, remoteAddr); err != nil {
+			log.Printf("auth failed for %q from %s: %v", username, remoteAddr, err)
+			return "ERR|AUTH_FAILED"
+		}
+		return "OK|USERS|" + registry.ListOnline(username)
 
 	default:
 		return "ERR|UNKNOWN_COMMAND"

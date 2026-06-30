@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -101,6 +102,21 @@ func (r *Registry) GetUserAddr(username string) (string, error) {
 		return "", fmt.Errorf("offline")
 	}
 	return entry.PublicAddr, nil
+}
+
+func (r *Registry) ListOnline(exclude string) string {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+
+	items := make([]string, 0, len(r.users))
+	for name, entry := range r.users {
+		if name == exclude || entry.PublicAddr == "" {
+			continue
+		}
+		items = append(items, name+"="+entry.PublicAddr)
+	}
+	sort.Strings(items)
+	return strings.Join(items, ",")
 }
 
 func (r *Registry) loadUsersFromDisk() error {

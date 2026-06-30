@@ -30,4 +30,5 @@ Pipe-delimited text messages:
 - `REG|username|password` → `OK|REGISTERED` or `ERR|AUTH_FAILED`
 - `HBT|username|password` → refreshes the lease
 - `QRY|username|password|target` → `OK|ADDR|ip:port` or `ERR|OFFLINE`
+- `LST|username|password` → `OK|USERS|name=ip:port,name2=ip:port`
 
