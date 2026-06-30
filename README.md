@@ -16,13 +16,25 @@ Start the interactive client and connect/listen:
 .\tarion.exe start -server 127.0.0.1:63425 -user alice -pass secret
 ```
 
-Run the listener in a background terminal process, without opening the menu:
+Run the listener detached, without keeping the terminal open:
 
 ```powershell
-.\tarion.exe background -server 127.0.0.1:63425 -user alice -pass secret
+.\tarion.exe background --detach -server 127.0.0.1:63425 -user alice -pass secret
 ```
 
-The background command keeps running until you stop it with `Ctrl+C` or close that terminal. While it is running, incoming messages are saved to local history. You can open another terminal and run `tarion.exe menu` to read saved chats and send through the background process. The menu talks to the background process over a local control socket, so the background process owns the QUIC listener port.
+This works on Windows and Linux. It starts a detached Tarion background process that keeps running after you close the terminal. Incoming messages are saved to local history. You can open another terminal and run `tarion.exe menu` to read saved chats and send through the background process. The menu talks to the background process over a local control socket, so the background process owns the QUIC listener port.
+
+Stop the detached background process:
+
+```powershell
+.\tarion.exe stop
+```
+
+Logs are written to:
+
+```text
+%APPDATA%\tarion\background.log
+```
 
 Direct/self-test chat:
 

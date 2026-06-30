@@ -213,6 +213,12 @@ func handleControlConn(conn net.Conn, nm *network.NetworkManager) {
 	switch req.Cmd {
 	case "ping":
 		_ = json.NewEncoder(conn).Encode(controlResponse{OK: true})
+	case "stop":
+		_ = json.NewEncoder(conn).Encode(controlResponse{OK: true})
+		go func() {
+			time.Sleep(100 * time.Millisecond)
+			os.Exit(0)
+		}()
 	case "send":
 		if err := nm.SendMessage(req.Addr, req.Body); err != nil {
 			_ = json.NewEncoder(conn).Encode(controlResponse{Error: err.Error()})
@@ -517,9 +523,10 @@ func helpText(m model) string {
 		"Open menu:",
 		"  tarion.exe menu",
 		"",
-		"Run network process in background terminal:",
-		"  tarion.exe background -server 127.0.0.1:63425 -user alice -pass secret",
+		"Run network process detached:",
+		"  tarion.exe background --detach -server 127.0.0.1:63425 -user alice -pass secret",
 		"  Then use tarion.exe menu to read/send through that background process.",
+		"  Stop it with: tarion.exe stop",
 		"",
 		"Start connected client:",
 		"  tarion.exe start -server 127.0.0.1:63425 -user alice -pass secret",
@@ -540,12 +547,33 @@ func helpText(m model) string {
 	}, "\n")
 }
 
+func backgroundLogPath() string {
+	return storage.GetBaseConfigDir() + string(os.PathSeparator) + "background.log"
+}
+
+func runStop(args []string) error {
+	fs := flag.NewFlagSet("stop", flag.ExitOnError)
+	portFlag := fs.Int("p", 0, "local UDP port/background control port base")
+	_ = fs.Parse(args)
+
+	cfg, _ := storage.LoadOrCreateConfig()
+	port := cfg.Port
+	if *portFlag != 0 {
+		port = *portFlag
+	}
+	if port == 0 {
+		port = 63425
+	}
+	return backgroundRequest(port, controlRequest{Cmd: "stop"})
+}
+
 func runBackground(args []string) error {
 	fs := flag.NewFlagSet("background", flag.ExitOnError)
 	portFlag := fs.Int("p", 0, "local UDP port to listen on")
 	serverFlag := fs.String("server", "", "directory server IP:port")
 	nameFlag := fs.String("user", "", "directory username")
 	passFlag := fs.String("pass", "", "directory password")
+	detachFlag := fs.Bool("detach", false, "start detached so it survives terminal close")
 	_ = fs.Parse(args)
 
 	cfg, err := storage.LoadOrCreateConfig()
@@ -569,6 +597,27 @@ func runBackground(args []string) error {
 	}
 	if err := storage.SaveConfig(cfg); err != nil {
 		return err
+	}
+
+	if *detachFlag && os.Getenv("TARION_BACKGROUND_CHILD") != "1" {
+		detachedArgs := append([]string{"background"}, fs.Args()...)
+		if *portFlag != 0 {
+			detachedArgs = append(detachedArgs, "-p", fmt.Sprint(*portFlag))
+		}
+		if *serverFlag != "" {
+			detachedArgs = append(detachedArgs, "-server", *serverFlag)
+		}
+		if *nameFlag != "" {
+			detachedArgs = append(detachedArgs, "-user", *nameFlag)
+		}
+		if *passFlag != "" {
+			detachedArgs = append(detachedArgs, "-pass", *passFlag)
+		}
+		if err := startDetached(detachedArgs, backgroundLogPath()); err != nil {
+			return err
+		}
+		fmt.Printf("tarion background detached; log %s\n", backgroundLogPath())
+		return nil
 	}
 
 	nm := network.NewNetworkManager(cfg.Port)
@@ -661,7 +710,7 @@ func main() {
 	cmd := "start"
 	if len(args) > 0 {
 		switch args[0] {
-		case "start", "menu", "background":
+		case "start", "menu", "background", "stop":
 			cmd, args = args[0], args[1:]
 		}
 	}
@@ -670,6 +719,8 @@ func main() {
 	switch cmd {
 	case "background":
 		err = runBackground(args)
+	case "stop":
+		err = runStop(args)
 	case "menu", "start":
 		err = runStart(args)
 	}
