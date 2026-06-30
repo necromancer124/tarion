@@ -1,36 +1,54 @@
-# Tarion P2P Chat
+# Tarion Client
 
-Tarion is a secure, hybrid peer-to-peer CLI chat protocol designed for high-performance encrypted communication using QUIC.
+Tarion is a secure hybrid peer-to-peer CLI chat client using QUIC over UDP port `63425` by default.
 
-## 🚀 Architecture
-- **Hybrid P2P**: Uses a central directory server (`tariond`) for discovery and signaling, but chat payloads are sent strictly P2P.
-- **Transport**: Operates over QUIC (UDP port 63425) for built-in TLS 1.3 encryption.
-- **NAT Traversal**: Implements UDP Hole Punching mediated by the server to bypass home routers.
-- **TUI**: Built with the Charm ecosystem (Bubble Tea & Lip Gloss).
+## What the client does
 
-## 🛠 Installation & Setup
-1. **Install Go**: Ensure Go 1.22+ is installed on your system.
-2. **Build the Client**:
-   ```bash
-   go build -o tarion.exe main.go
-   ```
-3. **Configuration**:
-   Edit `~/.config/tarion/config.json` to set your server address and username.
+- Runs an always-on QUIC listener for direct peer-to-peer chat messages.
+- Stores chat history locally in your OS config directory under `tarion/history`.
+- Supports manual/direct chats by IP address without needing discovery first.
+- Shows setup/help text directly in the opening menu.
+- Shows a `[NEW]` marker for contacts whose history file changed recently.
 
-## 📖 Usage
-- **Standard Launch**: Run `tarion.exe` to open the contact list.
-- **Manual IP Chat**: Bypass the server and connect directly to a peer:
-  ```bash
-  tarion.exe -u "PeerName" -i "1.2.3.4:63425"
-  ```
+## Build
 
-## ⌨️ Controls
-- `↑/↓` : Navigate contacts.
-- `Enter` : Open chat with selected user.
-- `Esc` : Return to contact list from chat.
-- `q` : Quit application.
-- `?` : Open Help/Setup guide.
+```bash
+go build -o tarion.exe .
+```
 
-## 🔒 Privacy
-- All chat histories are stored locally in `~/.config/tarion/history/`.
-- No chat data ever touches the central server.
+## Run
+
+Open the menu:
+
+```bash
+./tarion.exe
+```
+
+Open a direct chat with a peer IP and assign it a display name:
+
+```bash
+./tarion.exe -u Friend -i 203.0.113.10:63425
+```
+
+Use a different local test port:
+
+```bash
+./tarion.exe -p 63426 -u LocalPeer -i 127.0.0.1:63425
+```
+
+Delete all local chat history:
+
+```bash
+./tarion.exe -wipe-history
+```
+
+## Controls
+
+- `↑` / `↓` or `k` / `j`: navigate contacts
+- `Enter`: open selected chat / send typed message
+- `Esc`: leave chat view and return to the menu
+- `q` or `Ctrl+C`: quit
+
+## Privacy
+
+The server is only for authentication and peer address discovery. Chat payloads are sent directly peer-to-peer and are not relayed through the server.

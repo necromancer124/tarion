@@ -1,10 +1,12 @@
-package main
+package storage
 
 import (
+	"bufio"
 	"encoding/json"
-	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
+	"time"
 )
 
 type Config struct {
@@ -13,9 +15,17 @@ type Config struct {
 	Port       int    `json:"port"`
 }
 
+func GetBaseConfigDir() string {
+	configDir, err := os.UserConfigDir()
+	if err != nil {
+		home, _ := os.UserHomeDir()
+		return filepath.Join(home, ".config", "tarion")
+	}
+	return filepath.Join(configDir, "tarion")
+}
+
 func GetConfigPath() string {
-	home, _ := os.UserHomeDir()
-	return filepath.Join(home, ".config", "tarion", "config.json")
+	return filepath.Join(GetBaseConfigDir(), "config.json")
 }
 
 func LoadConfig() (*Config, error) {
@@ -24,13 +34,14 @@ func LoadConfig() (*Config, error) {
 		return nil, err
 	}
 	var cfg Config
-	err = json.Unmarshal(data, &cfg)
-	return &cfg, err
+	return &cfg, json.Unmarshal(data, &cfg)
 }
 
 func SaveConfig(cfg *Config) error {
 	path := GetConfigPath()
-	os.MkdirAll(filepath.Dir(path), 0755)
+	if err := os.MkdirAll(filepath.Dir(path), 0755); err != nil {
+		return err
+	}
 	data, err := json.MarshalIndent(cfg, "", "  ")
 	if err != nil {
 		return err
@@ -38,14 +49,20 @@ func SaveConfig(cfg *Config) error {
 	return os.WriteFile(path, data, 0644)
 }
 
+func GetHistoryDir() string {
+	return filepath.Join(GetBaseConfigDir(), "history")
+}
+
 func GetHistoryPath(username string) string {
-	home, _ := os.UserHomeDir()
-	return filepath.Join(home, ".config", "tarion", "history", username+".txt")
+	safe := strings.NewReplacer("/", "_", "\\", "_", ":", "_", "*", "_", "?", "_", "\"", "_", "<", "_", ">", "_", "|", "_").Replace(username)
+	return filepath.Join(GetHistoryDir(), safe+".txt")
 }
 
 func AppendHistory(username, message string) error {
 	path := GetHistoryPath(username)
-	os.MkdirAll(filepath.Dir(path), 0755)
+	if err := os.MkdirAll(filepath.Dir(path), 0755); err != nil {
+		return err
+	}
 	f, err := os.OpenFile(path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
 	if err != nil {
 		return err
@@ -56,14 +73,35 @@ func AppendHistory(username, message string) error {
 }
 
 func ReadHistory(username string) ([]string, error) {
-	path := GetHistoryPath(username)
-	data, err := os.ReadFile(path)
+	f, err := os.Open(GetHistoryPath(username))
 	if err != nil {
 		if os.IsNotExist(err) {
 			return []string{}, nil
 		}
 		return nil, err
 	}
-	// Simple split by newline for plain text history
-	return append([]string{}, (string(data))), nil // Simplified for now
+	defer f.Close()
+
+	var lines []string
+	scanner := bufio.NewScanner(f)
+	for scanner.Scan() {
+		lines = append(lines, scanner.Text())
+	}
+	return lines, scanner.Err()
+}
+
+func GetLastModified(username string) time.Time {
+	info, err := os.Stat(GetHistoryPath(username))
+	if err != nil {
+		return time.Time{}
+	}
+	return info.ModTime()
+}
+
+func DeleteAllHistory() error {
+	err := os.RemoveAll(GetHistoryDir())
+	if err != nil {
+		return err
+	}
+	return os.MkdirAll(GetHistoryDir(), 0755)
 }

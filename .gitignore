@@ -1,0 +1,13 @@
+# Build artifacts
+*.exe
+*.dll
+*.so
+*.dylib
+
+# Local runtime data
+users.db
+*.log
+
+# Editor/OS files
+.DS_Store
+Thumbs.db

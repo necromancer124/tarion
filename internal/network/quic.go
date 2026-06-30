@@ -2,132 +2,141 @@ package network
 
 import (
 	"context"
+	"crypto/rand"
+	"crypto/rsa"
 	"crypto/tls"
+	"crypto/x509"
+	"encoding/pem"
 	"fmt"
 	"io"
 	"log"
-	"net"
-	"strings"
+	"math/big"
+	"time"
 
 	"github.com/quic-go/quic-go"
 )
 
-// NetworkManager handles the QUIC listener and peer connections
+const ALPN = "tarion-p2p"
+
+// NetworkManager owns the always-on QUIC listener and outbound peer dials.
 type NetworkManager struct {
 	Port        int
-	Listen      *quic.Listener
-	MessageChan chan string
+	listener    *quic.Listener
+	MessageChan chan IncomingMessage
+}
+
+// IncomingMessage is delivered to the TUI when a peer sends data.
+type IncomingMessage struct {
+	From string
+	Body string
 }
 
 func NewNetworkManager(port int) *NetworkManager {
 	return &NetworkManager{
 		Port:        port,
-		MessageChan: make(chan string, 100),
+		MessageChan: make(chan IncomingMessage, 100),
 	}
 }
 
-// StartListener begins the background QUIC server and the UDP signaling listener
+// StartListener starts the client's always-on QUIC listener.
 func (nm *NetworkManager) StartListener() error {
-	// 1. Start QUIC Listener for P2P Chat Payloads
 	addr := fmt.Sprintf(":%d", nm.Port)
-	tlsConf := generateTLSConfig()
-	listener, err := quic.ListenAddr(addr, tlsConf, nil)
+	listener, err := quic.ListenAddr(addr, generateTLSConfig(), nil)
 	if err != nil {
-		return fmt.Errorf("failed to start QUIC listener on %d: %v", nm.Port, err)
+		return fmt.Errorf("start QUIC listener on UDP %d: %w", nm.Port, err)
 	}
-	nm.Listen = listener
+	nm.listener = listener
 
 	go func() {
 		for {
-			conn, err := nm.Listen.Accept(context.Background())
+			conn, err := listener.Accept(context.Background())
 			if err != nil {
-				log.Printf("QUIC Accept error: %v", err)
-				continue
+				log.Printf("QUIC accept error: %v", err)
+				return
 			}
 			go nm.handleConnection(conn)
 		}
 	}()
-
-	// 2. Start UDP Listener for Server Signaling (NAT Punching)
-	// The client is ALWAYS listening on this port for both QUIC and Server signals
-	udpAddr, _ := net.ResolveUDPAddr("udp", addr)
-	udpConn, err := net.ListenUDP("udp", udpAddr)
-	if err != nil {
-		// Note: On some OSs, we might need to use SO_REUSEPORT to share the port between QUIC and UDP
-		log.Printf("UDP Signaling listener started on %d", nm.Port)
-	}
-
-	go func() {
-		buf := make([]byte, 1024)
-		for {
-			n, remoteAddr, err := udpConn.ReadFromUDP(buf)
-			if err != nil {
-				continue
-			}
-			payload := string(buf[:n])
-			if strings.HasPrefix(payload, "PCH|") {
-				peerAddr := strings.Split(payload, "|")[1]
-				log.Printf("[NAT PUNCH] Received signal from server. Peer %s is calling. Opening hole...", peerAddr)
-				// To "open the hole", we send a dummy packet to the peer
-				nm.sendDummyPacket(peerAddr)
-			}
-		}
-	}()
-
 	return nil
 }
 
-func (nm *NetworkManager) sendDummyPacket(addr string) {
-	udpAddr, err := net.ResolveUDPAddr("udp", addr)
-	if err != nil {
-		return
-	}
-	conn, err := net.DialUDP("udp", nil, udpAddr)
-	if err != nil {
-		return
-	}
-	defer conn.Close()
-	conn.Write([]byte("PUNCH"))
-}
+func (nm *NetworkManager) handleConnection(conn *quic.Conn) {
+	defer conn.CloseWithError(0, "done")
 
-func (nm *NetworkManager) handleConnection(conn quic.Connection) {
-	defer conn.CloseIfNeeded()
 	stream, err := conn.AcceptStream(context.Background())
 	if err != nil {
+		log.Printf("accept stream: %v", err)
 		return
 	}
 	defer stream.Close()
 
-	buf := make([]byte, 4096)
-	n, err := stream.Read(buf)
-	if err != nil && err != io.EOF {
+	data, err := io.ReadAll(stream)
+	if err != nil {
+		log.Printf("read stream: %v", err)
 		return
 	}
 
-	nm.MessageChan <- string(buf[:n])
+	nm.MessageChan <- IncomingMessage{
+		From: conn.RemoteAddr().String(),
+		Body: string(data),
+	}
 }
 
+// SendMessage dials a peer directly over QUIC and writes a single chat payload.
 func (nm *NetworkManager) SendMessage(peerAddr string, message string) error {
-	tlsConf := &tls.Config{InsecureSkipVerify: true}
+	if peerAddr == "" {
+		return fmt.Errorf("empty peer address")
+	}
+
+	tlsConf := &tls.Config{
+		InsecureSkipVerify: true, // prototype: peers use self-signed certs
+		NextProtos:         []string{ALPN},
+	}
 	conn, err := quic.DialAddr(context.Background(), peerAddr, tlsConf, nil)
 	if err != nil {
-		return err
+		return fmt.Errorf("dial %s: %w", peerAddr, err)
 	}
-	defer conn.CloseIfNeeded()
+	defer conn.CloseWithError(0, "done")
 
 	stream, err := conn.OpenStreamSync(context.Background())
 	if err != nil {
-		return err
+		return fmt.Errorf("open stream: %w", err)
 	}
-	defer stream.Close()
 
-	_, err = stream.Write([]byte(message))
-	return err
+	if _, err := stream.Write([]byte(message)); err != nil {
+		_ = stream.Close()
+		return fmt.Errorf("write stream: %w", err)
+	}
+	return stream.Close()
 }
 
 func generateTLSConfig() *tls.Config {
+	key, err := rsa.GenerateKey(rand.Reader, 2048)
+	if err != nil {
+		panic(err)
+	}
+
+	tmpl := x509.Certificate{
+		SerialNumber: big.NewInt(time.Now().UnixNano()),
+		NotBefore:    time.Now().Add(-time.Hour),
+		NotAfter:     time.Now().Add(24 * time.Hour),
+		KeyUsage:     x509.KeyUsageKeyEncipherment | x509.KeyUsageDigitalSignature,
+		ExtKeyUsage:  []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
+	}
+	der, err := x509.CreateCertificate(rand.Reader, &tmpl, &tmpl, &key.PublicKey, key)
+	if err != nil {
+		panic(err)
+	}
+
+	certPEM := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der})
+	keyPEM := pem.EncodeToMemory(&pem.Block{Type: "RSA PRIVATE KEY", Bytes: x509.MarshalPKCS1PrivateKey(key)})
+	cert, err := tls.X509KeyPair(certPEM, keyPEM)
+	if err != nil {
+		panic(err)
+	}
+
 	return &tls.Config{
-		InsecureSkipVerify: true,
-		NextProtos:         []string{"tarion-p2p"},
+		Certificates: []tls.Certificate{cert},
+		NextProtos:   []string{ALPN},
 	}
 }
