@@ -382,6 +382,37 @@ func (m *model) openChat(name string) {
 	}
 }
 
+func (m model) selfAddr() string {
+	port := m.cfg.Port
+	if port == 0 {
+		port = 63425
+	}
+	return fmt.Sprintf("127.0.0.1:%d", port)
+}
+
+func (m model) isSelfChat(name string) bool {
+	name = strings.TrimSpace(strings.ToLower(name))
+	if name == "self" || name == "myself" || name == "me" {
+		return true
+	}
+	return m.cfg != nil && m.cfg.Username != "" && name == strings.ToLower(m.cfg.Username)
+}
+
+func (m model) targetAddrFor(name string) string {
+	for _, c := range m.contacts {
+		if c.Username == name {
+			if c.Addr != "" {
+				return c.Addr
+			}
+			break
+		}
+	}
+	if m.isSelfChat(name) {
+		return m.selfAddr()
+	}
+	return ""
+}
+
 func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := msg.(type) {
 	case tea.KeyMsg:
@@ -416,16 +447,15 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			case "enter":
 				if strings.TrimSpace(m.inputBuffer) != "" {
 					text := m.inputBuffer
+					targetAddr := m.targetAddrFor(m.activeContact)
+					if targetAddr == "" {
+						m.statusLine = "cannot send: no peer address for " + m.activeContact
+						m.inputBuffer = ""
+						break
+					}
 					line := "Me: " + text
 					m.chatHistory = append(m.chatHistory, line)
 					_ = storage.AppendHistory(m.activeContact, line)
-					targetAddr := ""
-					for _, c := range m.contacts {
-						if c.Username == m.activeContact {
-							targetAddr = c.Addr
-							break
-						}
-					}
 					if m.useBackground {
 						go func() {
 							_ = backgroundRequest(m.cfg.Port, controlRequest{Cmd: "send", To: m.activeContact, Addr: targetAddr, Body: text})
@@ -587,8 +617,50 @@ func backgroundLogPath() string {
 	return storage.GetBaseConfigDir() + string(os.PathSeparator) + "background.log"
 }
 
+func setBackgroundUsage(fs *flag.FlagSet) {
+	fs.Usage = func() {
+		out := fs.Output()
+		fmt.Fprintln(out, "Usage: tarion background [options]")
+		fmt.Fprintln(out)
+		fmt.Fprintln(out, "Starts Tarion's always-on network listener.")
+		fmt.Fprintln(out, "Use --detach to keep it running after the terminal closes on Windows/Linux.")
+		fmt.Fprintln(out)
+		fmt.Fprintln(out, "Examples:")
+		fmt.Fprintln(out, "  tarion background --detach")
+		fmt.Fprintln(out, "  tarion background --detach -server 127.0.0.1:63425 -user alice -pass secret")
+		fmt.Fprintln(out, "  tarion menu")
+		fmt.Fprintln(out)
+		fmt.Fprintln(out, "Stop background process:")
+		fmt.Fprintln(out, "  tarion stop")
+		fmt.Fprintln(out, "  tarion stop -p 63425")
+		fmt.Fprintln(out)
+		fmt.Fprintln(out, "Logs:")
+		fmt.Fprintf(out, "  %s\n", backgroundLogPath())
+		fmt.Fprintln(out)
+		fmt.Fprintln(out, "Options:")
+		fs.PrintDefaults()
+	}
+}
+
+func setStopUsage(fs *flag.FlagSet) {
+	fs.Usage = func() {
+		out := fs.Output()
+		fmt.Fprintln(out, "Usage: tarion stop [options]")
+		fmt.Fprintln(out)
+		fmt.Fprintln(out, "Stops the Tarion background process started with:")
+		fmt.Fprintln(out, "  tarion background --detach")
+		fmt.Fprintln(out)
+		fmt.Fprintln(out, "If background was started with a custom port, pass the same port:")
+		fmt.Fprintln(out, "  tarion stop -p 63425")
+		fmt.Fprintln(out)
+		fmt.Fprintln(out, "Options:")
+		fs.PrintDefaults()
+	}
+}
+
 func runStop(args []string) error {
 	fs := flag.NewFlagSet("stop", flag.ExitOnError)
+	setStopUsage(fs)
 	portFlag := fs.Int("p", 0, "local UDP port/background control port base")
 	_ = fs.Parse(args)
 
@@ -605,6 +677,7 @@ func runStop(args []string) error {
 
 func runBackground(args []string) error {
 	fs := flag.NewFlagSet("background", flag.ExitOnError)
+	setBackgroundUsage(fs)
 	portFlag := fs.Int("p", 0, "local UDP port to listen on")
 	serverFlag := fs.String("server", "", "directory server IP:port")
 	nameFlag := fs.String("user", "", "directory username")
@@ -757,8 +830,45 @@ func runStart(args []string) error {
 	return err
 }
 
+func printGeneralHelp() {
+	fmt.Println(strings.Join([]string{
+		"Tarion - secure QUIC P2P terminal chat",
+		"",
+		"Usage:",
+		"  tarion [command] [options]",
+		"",
+		"Commands:",
+		"  start       Open the interactive menu/TUI and listen if no background is running",
+		"  menu        Open the interactive menu/TUI",
+		"  background  Run the always-on listener; use --detach to survive terminal close",
+		"  stop        Stop the detached/background listener",
+		"  help        Show this help",
+		"",
+		"Command help:",
+		"  tarion start -h",
+		"  tarion menu -h",
+		"  tarion background -h",
+		"  tarion stop -h",
+		"",
+		"Common examples:",
+		"  tarion start",
+		"  tarion background --detach",
+		"  tarion menu",
+		"  tarion stop",
+		"  tarion start -server 127.0.0.1:63425 -user alice -pass secret",
+		"  tarion menu -p 63425 -u Myself -i 127.0.0.1:63425",
+	}, "\n"))
+}
+
 func main() {
 	args := os.Args[1:]
+	if len(args) > 0 {
+		switch args[0] {
+		case "-h", "--help", "help":
+			printGeneralHelp()
+			return
+		}
+	}
 	cmd := "start"
 	if len(args) > 0 {
 		switch args[0] {
