@@ -64,6 +64,9 @@ func TestLoopbackMessageWithStableSender(t *testing.T) {
 		if got.From != from {
 			t.Fatalf("from mismatch: got %q want %q", got.From, from)
 		}
+		if got.Addr == "" {
+			t.Fatal("expected stable advertised sender address")
+		}
 		if got.Body != body {
 			t.Fatalf("body mismatch: got %q want %q", got.Body, body)
 		}

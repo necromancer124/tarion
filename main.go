@@ -495,22 +495,16 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 	case msgIncomingChat:
 		incoming := network.IncomingMessage(msg)
-		name := ""
-		if m.state == StateChatView && m.activeContact != "" {
-			name = m.activeContact
-		} else {
-			for _, c := range m.contacts {
-				if c.Addr == incoming.From {
-					name = c.Username
-					break
-				}
-			}
+		addr := incoming.Addr
+		if addr == "" {
+			addr = incoming.From
 		}
-		if name == "" {
+		name, err := storage.ResolvePeerHistoryName(incoming.From, addr)
+		if err != nil || name == "" {
 			name = incoming.From
-			m.upsertContact(Contact{Username: name, Addr: incoming.From, Online: true, Unread: true, IsManual: true})
 		}
-		line := fmt.Sprintf("%s: %s", name, incoming.Body)
+		m.upsertContact(Contact{Username: name, Addr: addr, Online: true, Unread: true, IsManual: true})
+		line := fmt.Sprintf("%s: %s", incoming.From, incoming.Body)
 		_ = storage.AppendHistory(name, line)
 		if m.state == StateChatView && m.activeContact == name {
 			m.chatHistory = append(m.chatHistory, line)
@@ -759,6 +753,10 @@ func runBackground(args []string) error {
 
 	go func() {
 		for msg := range nm.MessageChan {
+			addr := msg.Addr
+			if addr == "" {
+				addr = msg.From
+			}
 			name := msg.From
 			if alias, ok := aliases.Load(msg.From); ok {
 				if aliasName, ok := alias.(string); ok && aliasName != "" {
@@ -770,14 +768,18 @@ func runBackground(args []string) error {
 				}
 			} else {
 				for _, c := range cfg.Contacts {
-					if c.Addr == msg.From {
+					if c.Addr == msg.From || c.Addr == addr {
 						name = c.Name
 						break
 					}
 				}
 			}
-			_ = storage.AppendHistory(name, fmt.Sprintf("%s: %s", name, msg.Body))
-			fmt.Printf("new message from %s\n", name)
+			chatName, err := storage.ResolvePeerHistoryName(name, addr)
+			if err != nil || chatName == "" {
+				chatName = name
+			}
+			_ = storage.AppendHistory(chatName, fmt.Sprintf("%s: %s", name, msg.Body))
+			fmt.Printf("new message from %s (%s)\n", name, addr)
 		}
 	}()
 

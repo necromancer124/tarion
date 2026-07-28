@@ -3,6 +3,7 @@ package storage
 import (
 	"bufio"
 	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -80,6 +81,79 @@ func GetHistoryPath(username string) string {
 	return filepath.Join(GetHistoryDir(), safeName(username)+".txt")
 }
 
+const peerAddrPrefix = "# tarion-peer-addr: "
+
+func peerAddrForFile(path string) string {
+	f, err := os.Open(path)
+	if err != nil {
+		return ""
+	}
+	defer f.Close()
+	scanner := bufio.NewScanner(f)
+	if scanner.Scan() {
+		line := scanner.Text()
+		if strings.HasPrefix(line, peerAddrPrefix) {
+			return strings.TrimSpace(strings.TrimPrefix(line, peerAddrPrefix))
+		}
+	}
+	return ""
+}
+
+func ensurePeerAddrHeader(username, addr string) error {
+	if strings.TrimSpace(addr) == "" {
+		return nil
+	}
+	path := GetHistoryPath(username)
+	if data, err := os.ReadFile(path); err == nil {
+		if strings.HasPrefix(string(data), peerAddrPrefix) {
+			return nil
+		}
+		return os.WriteFile(path, append([]byte(peerAddrPrefix+addr+"\n"), data...), 0644)
+	} else if !os.IsNotExist(err) {
+		return err
+	}
+	if err := os.MkdirAll(filepath.Dir(path), 0755); err != nil {
+		return err
+	}
+	return os.WriteFile(path, []byte(peerAddrPrefix+addr+"\n"), 0644)
+}
+
+func ResolvePeerHistoryName(username, addr string) (string, error) {
+	username = strings.TrimSpace(username)
+	addr = strings.TrimSpace(addr)
+	if username == "" {
+		username = addr
+	}
+	if username == "" {
+		username = "unknown-peer"
+	}
+	if addr == "" {
+		return username, nil
+	}
+
+	basePath := GetHistoryPath(username)
+	if _, err := os.Stat(basePath); os.IsNotExist(err) {
+		return username, ensurePeerAddrHeader(username, addr)
+	} else if err != nil {
+		return "", err
+	}
+	if existing := peerAddrForFile(basePath); existing == "" || existing == addr {
+		if existing == "" {
+			return username, ensurePeerAddrHeader(username, addr)
+		}
+		return username, nil
+	}
+
+	variant := fmt.Sprintf("%s_%s", username, safeName(addr))
+	variantPath := GetHistoryPath(variant)
+	if _, err := os.Stat(variantPath); os.IsNotExist(err) {
+		return variant, ensurePeerAddrHeader(variant, addr)
+	} else if err != nil {
+		return "", err
+	}
+	return variant, nil
+}
+
 func AppendHistory(username, message string) error {
 	path := GetHistoryPath(username)
 	if err := os.MkdirAll(filepath.Dir(path), 0755); err != nil {
@@ -107,7 +181,11 @@ func ReadHistory(username string) ([]string, error) {
 	var lines []string
 	scanner := bufio.NewScanner(f)
 	for scanner.Scan() {
-		lines = append(lines, scanner.Text())
+		line := scanner.Text()
+		if strings.HasPrefix(line, peerAddrPrefix) {
+			continue
+		}
+		lines = append(lines, line)
 	}
 	return lines, scanner.Err()
 }

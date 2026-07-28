@@ -12,6 +12,7 @@ import (
 	"io"
 	"log"
 	"math/big"
+	"net"
 	"strings"
 	"time"
 
@@ -30,11 +31,13 @@ type NetworkManager struct {
 // IncomingMessage is delivered to the TUI when a peer sends data.
 type IncomingMessage struct {
 	From string
+	Addr string
 	Body string
 }
 
 type wireMessage struct {
 	From string `json:"from"`
+	Addr string `json:"addr,omitempty"`
 	Body string `json:"body"`
 }
 
@@ -43,6 +46,19 @@ func NewNetworkManager(port int) *NetworkManager {
 		Port:        port,
 		MessageChan: make(chan IncomingMessage, 100),
 	}
+}
+
+func (nm *NetworkManager) advertisedAddr(peerAddr string) string {
+	conn, err := net.DialTimeout("udp", peerAddr, 500*time.Millisecond)
+	if err != nil {
+		return ""
+	}
+	defer conn.Close()
+	udpAddr, ok := conn.LocalAddr().(*net.UDPAddr)
+	if !ok || udpAddr.IP == nil {
+		return ""
+	}
+	return net.JoinHostPort(udpAddr.IP.String(), fmt.Sprint(nm.Port))
 }
 
 // StartListener starts the client's always-on QUIC listener.
@@ -84,17 +100,22 @@ func (nm *NetworkManager) handleConnection(conn *quic.Conn) {
 	}
 
 	from := conn.RemoteAddr().String()
+	addr := conn.RemoteAddr().String()
 	body := string(data)
 	var msg wireMessage
 	if err := json.Unmarshal(data, &msg); err == nil && msg.Body != "" {
 		if strings.TrimSpace(msg.From) != "" {
 			from = strings.TrimSpace(msg.From)
 		}
+		if strings.TrimSpace(msg.Addr) != "" {
+			addr = strings.TrimSpace(msg.Addr)
+		}
 		body = msg.Body
 	}
 
 	nm.MessageChan <- IncomingMessage{
 		From: from,
+		Addr: addr,
 		Body: body,
 	}
 }
@@ -112,7 +133,7 @@ func (nm *NetworkManager) SendMessageFrom(peerAddr string, from string, message 
 
 	payload := []byte(message)
 	if strings.TrimSpace(from) != "" {
-		encoded, err := json.Marshal(wireMessage{From: strings.TrimSpace(from), Body: message})
+		encoded, err := json.Marshal(wireMessage{From: strings.TrimSpace(from), Addr: nm.advertisedAddr(peerAddr), Body: message})
 		if err != nil {
 			return fmt.Errorf("encode message: %w", err)
 		}
