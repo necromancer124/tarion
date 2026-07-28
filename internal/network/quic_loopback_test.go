@@ -45,3 +45,29 @@ func TestLoopbackSelfMessage(t *testing.T) {
 		t.Fatal("timeout waiting for loopback message")
 	}
 }
+
+func TestLoopbackMessageWithStableSender(t *testing.T) {
+	port := freeUDPPort(t)
+	nm := NewNetworkManager(port)
+	if err := nm.StartListener(); err != nil {
+		t.Fatalf("StartListener: %v", err)
+	}
+
+	const from = "PC178"
+	const body = "hello with identity"
+	if err := nm.SendMessageFrom(fmt.Sprintf("127.0.0.1:%d", port), from, body); err != nil {
+		t.Fatalf("SendMessageFrom loopback: %v", err)
+	}
+
+	select {
+	case got := <-nm.MessageChan:
+		if got.From != from {
+			t.Fatalf("from mismatch: got %q want %q", got.From, from)
+		}
+		if got.Body != body {
+			t.Fatalf("body mismatch: got %q want %q", got.Body, body)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("timeout waiting for identified loopback message")
+	}
+}

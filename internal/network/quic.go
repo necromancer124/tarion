@@ -6,11 +6,13 @@ import (
 	"crypto/rsa"
 	"crypto/tls"
 	"crypto/x509"
+	"encoding/json"
 	"encoding/pem"
 	"fmt"
 	"io"
 	"log"
 	"math/big"
+	"strings"
 	"time"
 
 	"github.com/quic-go/quic-go"
@@ -29,6 +31,11 @@ type NetworkManager struct {
 type IncomingMessage struct {
 	From string
 	Body string
+}
+
+type wireMessage struct {
+	From string `json:"from"`
+	Body string `json:"body"`
 }
 
 func NewNetworkManager(port int) *NetworkManager {
@@ -76,16 +83,40 @@ func (nm *NetworkManager) handleConnection(conn *quic.Conn) {
 		return
 	}
 
+	from := conn.RemoteAddr().String()
+	body := string(data)
+	var msg wireMessage
+	if err := json.Unmarshal(data, &msg); err == nil && msg.Body != "" {
+		if strings.TrimSpace(msg.From) != "" {
+			from = strings.TrimSpace(msg.From)
+		}
+		body = msg.Body
+	}
+
 	nm.MessageChan <- IncomingMessage{
-		From: conn.RemoteAddr().String(),
-		Body: string(data),
+		From: from,
+		Body: body,
 	}
 }
 
 // SendMessage dials a peer directly over QUIC and writes a single chat payload.
 func (nm *NetworkManager) SendMessage(peerAddr string, message string) error {
+	return nm.SendMessageFrom(peerAddr, "", message)
+}
+
+// SendMessageFrom sends a single chat payload with a stable sender identity.
+func (nm *NetworkManager) SendMessageFrom(peerAddr string, from string, message string) error {
 	if peerAddr == "" {
 		return fmt.Errorf("empty peer address")
+	}
+
+	payload := []byte(message)
+	if strings.TrimSpace(from) != "" {
+		encoded, err := json.Marshal(wireMessage{From: strings.TrimSpace(from), Body: message})
+		if err != nil {
+			return fmt.Errorf("encode message: %w", err)
+		}
+		payload = encoded
 	}
 
 	tlsConf := &tls.Config{
@@ -106,7 +137,7 @@ func (nm *NetworkManager) SendMessage(peerAddr string, message string) error {
 		return fmt.Errorf("open stream: %w", err)
 	}
 
-	if _, err := stream.Write([]byte(message)); err != nil {
+	if _, err := stream.Write(payload); err != nil {
 		_ = stream.Close()
 		return fmt.Errorf("write stream: %w", err)
 	}

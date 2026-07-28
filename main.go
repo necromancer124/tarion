@@ -141,6 +141,7 @@ func (d directoryClient) listOnline() []Contact {
 type controlRequest struct {
 	Cmd  string `json:"cmd"`
 	To   string `json:"to,omitempty"`
+	From string `json:"from,omitempty"`
 	Addr string `json:"addr,omitempty"`
 	Body string `json:"body,omitempty"`
 }
@@ -230,7 +231,7 @@ func handleControlConn(conn net.Conn, nm *network.NetworkManager, aliases *sync.
 				aliases.Store("body:"+req.Body, req.To)
 			}
 		}
-		if err := nm.SendMessage(req.Addr, req.Body); err != nil {
+		if err := nm.SendMessageFrom(req.Addr, req.From, req.Body); err != nil {
 			_ = json.NewEncoder(conn).Encode(controlResponse{Error: err.Error()})
 			return
 		}
@@ -390,6 +391,16 @@ func (m model) selfAddr() string {
 	return fmt.Sprintf("127.0.0.1:%d", port)
 }
 
+func senderName(cfg *storage.Config) string {
+	if cfg != nil && strings.TrimSpace(cfg.Username) != "" {
+		return strings.TrimSpace(cfg.Username)
+	}
+	if host, err := os.Hostname(); err == nil && strings.TrimSpace(host) != "" {
+		return strings.TrimSpace(host)
+	}
+	return "tarion-peer"
+}
+
 func (m model) isSelfChat(name string) bool {
 	name = strings.TrimSpace(strings.ToLower(name))
 	if name == "self" || name == "myself" || name == "me" {
@@ -457,11 +468,13 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					m.chatHistory = append(m.chatHistory, line)
 					_ = storage.AppendHistory(m.activeContact, line)
 					if m.useBackground {
+						from := senderName(m.cfg)
 						go func() {
-							_ = backgroundRequest(m.cfg.Port, controlRequest{Cmd: "send", To: m.activeContact, Addr: targetAddr, Body: text})
+							_ = backgroundRequest(m.cfg.Port, controlRequest{Cmd: "send", To: m.activeContact, From: from, Addr: targetAddr, Body: text})
 						}()
 					} else if m.netMgr != nil {
-						go func() { _ = m.netMgr.SendMessage(targetAddr, text) }()
+						from := senderName(m.cfg)
+						go func() { _ = m.netMgr.SendMessageFrom(targetAddr, from, text) }()
 					}
 					m.inputBuffer = ""
 				}
