@@ -54,14 +54,23 @@ func main() {
 			log.Printf("read: %v", err)
 			continue
 		}
-		response := handlePacket(registry, strings.TrimSpace(string(buf[:n])), remoteAddr.String())
+		response := handlePacket(registry, strings.TrimSpace(string(buf[:n])), remoteAddr.String(), func(targetAddr, payload string) error {
+			addr, err := net.ResolveUDPAddr("udp", targetAddr)
+			if err != nil {
+				return err
+			}
+			_, err = conn.WriteToUDP([]byte(payload), addr)
+			return err
+		})
 		if _, err := conn.WriteToUDP([]byte(response), remoteAddr); err != nil {
 			log.Printf("write to %s: %v", remoteAddr, err)
 		}
 	}
 }
 
-func handlePacket(registry *Registry, payload, remoteAddr string) string {
+type punchSender func(targetAddr, payload string) error
+
+func handlePacket(registry *Registry, payload, remoteAddr string, sendPunch punchSender) string {
 	parts := strings.Split(payload, "|")
 	if len(parts) < 3 {
 		return "ERR|BAD_REQUEST"
@@ -91,11 +100,20 @@ func handlePacket(registry *Registry, payload, remoteAddr string) string {
 			return "ERR|AUTH_FAILED"
 		}
 
-		// The server never relays chat data and does not initiate contact with clients.
-		// It only returns the target's currently observed public UDP address.
+		// The server never relays chat data. It only returns the target's currently
+		// observed public UDP address and signals the target to punch back toward
+		// the requester so both NAT tables have a fresh UDP mapping.
 		targetAddr, err := registry.GetUserAddr(target)
 		if err != nil {
 			return "ERR|OFFLINE"
+		}
+		if sendPunch != nil {
+			payload := fmt.Sprintf("PCH|%s|%s", username, remoteAddr)
+			if err := sendPunch(targetAddr, payload); err != nil {
+				log.Printf("punch signal failed: target=%s addr=%s requester=%s requester_addr=%s: %v", target, targetAddr, username, remoteAddr, err)
+			} else {
+				log.Printf("punch signal: target=%s addr=%s requester=%s requester_addr=%s", target, targetAddr, username, remoteAddr)
+			}
 		}
 		log.Printf("query: %s requested %s -> %s", username, target, targetAddr)
 		return "OK|ADDR|" + targetAddr

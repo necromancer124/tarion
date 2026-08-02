@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"path/filepath"
 	"sort"
 	"strings"
 	"sync"
@@ -53,6 +54,12 @@ func newSalt() (string, error) {
 }
 
 func (r *Registry) RegisterOrUpdate(username, password, addr string) error {
+	username = strings.TrimSpace(username)
+	addr = strings.TrimSpace(addr)
+	if username == "" || password == "" || addr == "" {
+		return fmt.Errorf("invalid user lease")
+	}
+
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
@@ -104,6 +111,17 @@ func (r *Registry) GetUserAddr(username string) (string, error) {
 	return entry.PublicAddr, nil
 }
 
+func (r *Registry) GetUser(username string) (UserEntry, error) {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+
+	entry, ok := r.users[username]
+	if !ok || entry.PublicAddr == "" {
+		return UserEntry{}, fmt.Errorf("offline")
+	}
+	return *entry, nil
+}
+
 func (r *Registry) ListOnline(exclude string) string {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
@@ -146,6 +164,9 @@ func (r *Registry) loadUsersFromDisk() error {
 }
 
 func (r *Registry) saveUsersToDiskLocked() error {
+	if err := os.MkdirAll(filepath.Dir(r.usersDB), 0700); err != nil && filepath.Dir(r.usersDB) != "." {
+		return err
+	}
 	f, err := os.OpenFile(r.usersDB, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0600)
 	if err != nil {
 		return err
@@ -153,7 +174,13 @@ func (r *Registry) saveUsersToDiskLocked() error {
 	defer f.Close()
 
 	w := bufio.NewWriter(f)
-	for _, entry := range r.users {
+	names := make([]string, 0, len(r.users))
+	for name := range r.users {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	for _, name := range names {
+		entry := r.users[name]
 		if _, err := fmt.Fprintf(w, "%s:%s:%s\n", entry.Username, entry.Salt, entry.PasswordHash); err != nil {
 			return err
 		}
