@@ -3,7 +3,6 @@ package storage
 import (
 	"bufio"
 	"encoding/json"
-	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -13,6 +12,9 @@ import (
 type Contact struct {
 	Name string `json:"name"`
 	Addr string `json:"addr,omitempty"`
+	// ID optionally pins the contact's peer ID up front (verified out of band),
+	// instead of trusting whatever key answers first.
+	ID string `json:"id,omitempty"`
 }
 
 type Config struct {
@@ -27,7 +29,12 @@ func DefaultConfig() *Config {
 	return &Config{Port: 63425, Contacts: []Contact{}}
 }
 
+// GetBaseConfigDir returns Tarion's data folder. TARION_HOME overrides it,
+// which also lets two instances with separate identities run on one machine.
 func GetBaseConfigDir() string {
+	if dir := os.Getenv("TARION_HOME"); dir != "" {
+		return dir
+	}
 	configDir, err := os.UserConfigDir()
 	if err != nil {
 		home, _ := os.UserHomeDir()
@@ -37,6 +44,10 @@ func GetBaseConfigDir() string {
 }
 
 func GetConfigPath() string { return filepath.Join(GetBaseConfigDir(), "config.json") }
+
+func GetIdentityPath() string { return filepath.Join(GetBaseConfigDir(), "identity.key") }
+
+func GetControlTokenPath() string { return filepath.Join(GetBaseConfigDir(), "control.token") }
 
 func LoadConfig() (*Config, error) {
 	data, err := os.ReadFile(GetConfigPath())
@@ -61,7 +72,7 @@ func LoadOrCreateConfig() (*Config, error) {
 
 func SaveConfig(cfg *Config) error {
 	path := GetConfigPath()
-	if err := os.MkdirAll(filepath.Dir(path), 0755); err != nil {
+	if err := os.MkdirAll(filepath.Dir(path), 0700); err != nil {
 		return err
 	}
 	data, err := json.MarshalIndent(cfg, "", "  ")
@@ -73,93 +84,35 @@ func SaveConfig(cfg *Config) error {
 
 func GetHistoryDir() string { return filepath.Join(GetBaseConfigDir(), "history") }
 
+var windowsReservedNames = map[string]bool{
+	"CON": true, "PRN": true, "AUX": true, "NUL": true,
+	"COM1": true, "COM2": true, "COM3": true, "COM4": true, "COM5": true, "COM6": true, "COM7": true, "COM8": true, "COM9": true,
+	"LPT1": true, "LPT2": true, "LPT3": true, "LPT4": true, "LPT5": true, "LPT6": true, "LPT7": true, "LPT8": true, "LPT9": true,
+}
+
 func safeName(name string) string {
-	return strings.NewReplacer("/", "_", "\\", "_", ":", "_", "*", "_", "?", "_", "\"", "_", "<", "_", ">", "_", "|", "_").Replace(name)
+	name = strings.NewReplacer("/", "_", "\\", "_", ":", "_", "*", "_", "?", "_", "\"", "_", "<", "_", ">", "_", "|", "_").Replace(name)
+	name = strings.TrimRight(name, " .")
+	if name == "" || windowsReservedNames[strings.ToUpper(name)] {
+		name = "_" + name
+	}
+	return name
 }
 
 func GetHistoryPath(username string) string {
 	return filepath.Join(GetHistoryDir(), safeName(username)+".txt")
 }
 
+// Older versions wrote the peer's address as the first line of each history
+// file; it is skipped when reading. Addresses now live in peers.json.
 const peerAddrPrefix = "# tarion-peer-addr: "
-
-func peerAddrForFile(path string) string {
-	f, err := os.Open(path)
-	if err != nil {
-		return ""
-	}
-	defer f.Close()
-	scanner := bufio.NewScanner(f)
-	if scanner.Scan() {
-		line := scanner.Text()
-		if strings.HasPrefix(line, peerAddrPrefix) {
-			return strings.TrimSpace(strings.TrimPrefix(line, peerAddrPrefix))
-		}
-	}
-	return ""
-}
-
-func ensurePeerAddrHeader(username, addr string) error {
-	if strings.TrimSpace(addr) == "" {
-		return nil
-	}
-	path := GetHistoryPath(username)
-	if data, err := os.ReadFile(path); err == nil {
-		if strings.HasPrefix(string(data), peerAddrPrefix) {
-			return nil
-		}
-		return os.WriteFile(path, append([]byte(peerAddrPrefix+addr+"\n"), data...), 0644)
-	} else if !os.IsNotExist(err) {
-		return err
-	}
-	if err := os.MkdirAll(filepath.Dir(path), 0755); err != nil {
-		return err
-	}
-	return os.WriteFile(path, []byte(peerAddrPrefix+addr+"\n"), 0644)
-}
-
-func ResolvePeerHistoryName(username, addr string) (string, error) {
-	username = strings.TrimSpace(username)
-	addr = strings.TrimSpace(addr)
-	if username == "" {
-		username = addr
-	}
-	if username == "" {
-		username = "unknown-peer"
-	}
-	if addr == "" {
-		return username, nil
-	}
-
-	basePath := GetHistoryPath(username)
-	if _, err := os.Stat(basePath); os.IsNotExist(err) {
-		return username, ensurePeerAddrHeader(username, addr)
-	} else if err != nil {
-		return "", err
-	}
-	if existing := peerAddrForFile(basePath); existing == "" || existing == addr {
-		if existing == "" {
-			return username, ensurePeerAddrHeader(username, addr)
-		}
-		return username, nil
-	}
-
-	variant := fmt.Sprintf("%s_%s", username, safeName(addr))
-	variantPath := GetHistoryPath(variant)
-	if _, err := os.Stat(variantPath); os.IsNotExist(err) {
-		return variant, ensurePeerAddrHeader(variant, addr)
-	} else if err != nil {
-		return "", err
-	}
-	return variant, nil
-}
 
 func AppendHistory(username, message string) error {
 	path := GetHistoryPath(username)
-	if err := os.MkdirAll(filepath.Dir(path), 0755); err != nil {
+	if err := os.MkdirAll(filepath.Dir(path), 0700); err != nil {
 		return err
 	}
-	f, err := os.OpenFile(path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+	f, err := os.OpenFile(path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0600)
 	if err != nil {
 		return err
 	}
@@ -224,5 +177,5 @@ func DeleteAllHistory() error {
 	if err := os.RemoveAll(GetHistoryDir()); err != nil {
 		return err
 	}
-	return os.MkdirAll(GetHistoryDir(), 0755)
+	return os.MkdirAll(GetHistoryDir(), 0700)
 }
