@@ -1,28 +1,40 @@
-# Tarion Client
+# Tarion
 
-Tarion is a hybrid peer-to-peer CLI chat client using QUIC over UDP port `63425` by default. Every install has its own Ed25519 identity key, and peers authenticate each other with it (see [Security model](#security-model)).
+Tarion is a hybrid peer-to-peer CLI chat over QUIC. Chats go directly between peers. A small directory server, `tariond` in [`server/`](server/README.md), tells peers where to find each other and helps them through home routers (NAT). Every install has its own Ed25519 identity key, and peers authenticate each other with it (see [Security model](#security-model)).
+
+## Ports
+
+| Who | Port | Default | Change it with |
+|---|---|---|---|
+| Client: chat **and** server traffic | UDP | `63426` | `-p` / `"port"` |
+| Client: background control socket (local only) | TCP | `-p` ± 10000 (`53426`) | `-cp` / `"control_port"` |
+| Server (`tariond`) | UDP | `63425` | `tariond -port`, and in the client's `-server host:port` |
+
+The client uses **one** UDP port for everything. The server only sees the public address of the socket that talks to it, so logging in from the chat socket means the address the server hands out is exactly the one peers can reach, including behind a router.
 
 ## Commands
 
-Open the interactive menu/TUI:
+Start the interactive client, log in, and listen:
 
 ```powershell
-.\tarion.exe menu
+.\tarion.exe start -server SERVER:63425 -user alice -pass secret
 ```
 
-Start the interactive client and connect/listen:
-
-```powershell
-.\tarion.exe start -server 127.0.0.1:63425 -user alice -pass secret
-```
+`-pass` is only needed the first time on each device. That login links the device's key to your account, and the password is then removed from `config.json`. After that, `.\tarion.exe start` is enough. The first login with a new name creates the account.
 
 Run the listener detached, without keeping the terminal open:
 
 ```powershell
-.\tarion.exe background --detach -server 127.0.0.1:63425 -user alice -pass secret
+.\tarion.exe background --detach -server SERVER:63425 -user alice -pass secret
 ```
 
-This works on Windows and Linux. It starts a detached Tarion background process that keeps running after you close the terminal. Incoming messages are saved to local history. You can open another terminal and run `tarion.exe menu` to read saved chats and send through the background process. The menu talks to the background process over a local control socket, so the background process owns the QUIC listener port.
+This works on Windows and Linux. The background process keeps running after you close the terminal and saves incoming messages to local history. Run `tarion.exe menu` in another terminal to read chats and send through it. The menu talks to it over the local control socket, so the background process owns the UDP port.
+
+Send one message through the background process (handy for scripts):
+
+```powershell
+.\tarion.exe send bob "hello"
+```
 
 Stop the detached background process:
 
@@ -36,10 +48,10 @@ Logs are written to:
 %APPDATA%\tarion\background.log
 ```
 
-Direct/self-test chat:
+Direct/self-test chat, without a server:
 
 ```powershell
-.\tarion.exe start -p 63426 -u Myself -i 127.0.0.1:63426
+.\tarion.exe start -u Myself -i 127.0.0.1:63426
 ```
 
 Show your peer ID (read it to contacts so they can verify you):
@@ -58,7 +70,7 @@ List pinned contacts, or forget one whose key legitimately changed (for example 
 Run a second instance with its own identity on the same machine:
 
 ```powershell
-$env:TARION_HOME = "$env:TEMP\tarion-bob"; .\tarion.exe start -p 63426
+$env:TARION_HOME = "$env:TEMP\tarion-bob"; .\tarion.exe start -p 63427
 ```
 
 Delete local chat history:
@@ -71,7 +83,7 @@ Delete local chat history:
 
 - The menu always includes saved history chats, even when they are offline.
 - Offline saved chats are tagged `[offline]`.
-- Online users are refreshed from the server when configured.
+- Online users come from the server's list; the server connection state is shown under the list.
 - New incoming messages mark chats as `[NEW]`.
 - `r` refreshes immediately; the menu also refreshes automatically.
 
@@ -83,22 +95,22 @@ The config is saved to:
 %APPDATA%\tarion\config.json
 ```
 
-It can contain contacts:
-
 ```json
 {
-  "server_addr": "127.0.0.1:63425",
+  "server_addr": "198.51.100.5:63425",
+  "server_id": "obzxpkfgynwsfxwfv4ysohdj2d4euri7",
   "username": "alice",
-  "password": "secret",
-  "port": 63425,
+  "port": 63426,
   "contacts": [
-    { "name": "bob", "addr": "127.0.0.1:63426" },
-    { "name": "carol", "addr": "203.0.113.7:63425", "id": "owft vlcv d5sm kq6u f7hm 7dj5 6geo f2ni" }
+    { "name": "bob", "addr": "192.168.1.20:63426" },
+    { "name": "carol", "addr": "203.0.113.7:63426", "id": "owft vlcv d5sm kq6u f7hm 7dj5 6geo f2ni" }
   ]
 }
 ```
 
-`id` is optional. When set, Tarion only talks to the peer holding that key. Without it, the first key that answers for a name gets pinned (trust on first use).
+- `server_id` is the server's key. It's pinned automatically on the first connection. If the server's key ever changes, the client refuses to log in. Delete the field only if you know the server was reinstalled. Server operators can print it with `tariond -id`.
+- `contacts` are optional. A contact with an `addr` can be reached without the server. Its `id` is also optional: when set, Tarion only talks to the peer holding that key. Without it, the first key that answers gets pinned (trust on first use).
+- `control_port` is optional (see [Ports](#ports)).
 
 The folder also holds `identity.key` (your private key, keep it secret), `peers.json` (pinned contacts) and, while the background process runs, `control.token`.
 
@@ -114,14 +126,23 @@ The folder also holds `identity.key` (your private key, keep it secret), `peers.
 ## Security model
 
 - **Identity.** `identity.key` is an Ed25519 key created on first run. Your peer ID is a hash of its public key. Both sides present their key in the QUIC/TLS 1.3 handshake (mutual TLS), so a peer ID cannot be claimed without owning the private key.
-- **Pinning.** The first time you talk to a name, its peer ID is pinned in `peers.json`. If that name later answers with a different key, sending is refused. A new key that claims a pinned name shows up as a separate chat such as `bob~1a2b3c4d`, so it can't pose as Bob. The name a peer sends is only a display hint and never overrides a pin.
+- **Server login.** The client talks to `tariond` over QUIC/TLS 1.3, so the password is never sent in the clear. The password links your account to your device's key. Later logins use the key alone, and the password isn't stored. The server stores argon2id hashes, rate-limits logins and registrations, and checks usernames (1–32 letters/digits plus `. _ -`, not case-sensitive).
+- **Server pinning.** The client pins the server's key (`server_id`), so an impostor server can't collect passwords.
+- **Pinning.** The first time you talk to a name, its peer ID is pinned in `peers.json`. If that name later answers with a different key, sending is refused. When the server knows a user, it also reports their key, and the key that answers must match it too. A new key that claims a pinned name shows up as a separate chat such as `bob~1a2b3c4d`, so it can't pose as Bob.
 - **Delivery.** Each message carries an ID and waits for the receiver's acknowledgement. The menu shows `delivered` or `not delivered: <reason>`, and failed sends are marked in the history. Duplicate deliveries are dropped.
-- **Limits.** Frames are capped at 64 KiB and message bodies at 16 KiB. Concurrent connections are capped. Control characters are stripped from incoming text so a peer can't inject terminal escape sequences.
+- **Limits.** Frames are capped at 64 KiB and message bodies at 16 KiB. Connections and requests are capped. Control characters are stripped from incoming text so a peer can't inject terminal escape sequences.
 - **Local control.** The background process's control port only accepts requests carrying the random token from `control.token`, which only your OS user can read.
 
-### Wire protocol (v2)
+### How a message finds its way
 
-ALPN `tarion/2`. One bidirectional QUIC stream per message. Each direction sends one frame: a 4-byte big-endian length followed by JSON.
+1. The client keeps a QUIC connection to `tariond` open from its chat port. Its keep-alives are the heartbeat, and they also keep the router's mapping for that port open.
+2. To message bob, the client asks the server for bob. The server answers with bob's public address, his key, and (only if you're behind the same router) his LAN address.
+3. At the same moment, the server tells bob, over his open connection, to send a few tiny packets toward your address. That opens bob's router for your incoming connection (NAT hole punching).
+4. The client connects to bob directly: LAN address first, public address second. The message never passes through the server.
+
+### Wire protocol
+
+Chat uses ALPN `tarion/2`, with one bidirectional QUIC stream per message. Each direction sends one frame: a 4-byte big-endian length followed by JSON.
 
 ```json
 {"v":2,"type":"msg","id":"<128-bit hex>","ts":1767225600,"from":"alice","body":"hi"}
@@ -129,14 +150,14 @@ ALPN `tarion/2`. One bidirectional QUIC stream per message. Each direction sends
 {"v":2,"type":"nack","id":"<same id>","error":"receiver busy"}
 ```
 
-Listening and dialing share one UDP socket, so the receiver sees your real reply address, and connections to a peer are reused. v1 clients (`tarion-p2p`) are not compatible and fail the handshake.
+The directory uses ALPN `tarion-dir/1` with the same framing; see [`internal/directory/proto.go`](internal/directory/proto.go). Punch packets are 7-byte UDP datagrams whose first byte is `0x00`, so QUIC ignores them.
 
 ### Known limitations
 
-- The directory server protocol is still plain-text UDP (`REG|user|pass`), so the directory password is visible on the network. The server needs to change for this to be fixed: key-signed registration instead of a password, and a marker byte so its replies can share the QUIC socket for NAT hole punching. Pinning means a lying directory can't impersonate a contact you already talked to, but it can still pick who you reach on first contact.
-- There is no NAT hole punching or relay yet, so peers behind different NATs may not reach each other.
+- Hole punching works with most home routers. It can still fail when both sides are behind strict ("symmetric") NATs, such as some mobile carriers. A relay fallback would be the next step.
 - Messages to offline peers fail instead of being queued.
+- Trust on first use: on the very first contact you trust the key the server reports. Compare `tarion id` with your contact, or put their `id` in `config.json`, to rule that out.
 
 ## Privacy
 
-The server is only for authentication and peer address discovery. Chat payloads are sent directly peer-to-peer over mutually authenticated TLS 1.3 and are not relayed through the server. Local history is stored as plain text in the config folder with owner-only permissions.
+The server handles login and address lookup only. Chats go directly peer-to-peer over mutually authenticated TLS 1.3 and are never relayed through the server. The server's user list shows names only, not IP addresses. Local history is stored as plain text in the config folder with owner-only permissions.

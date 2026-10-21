@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -18,15 +19,27 @@ type Contact struct {
 }
 
 type Config struct {
-	ServerAddr string    `json:"server_addr"`
-	Username   string    `json:"username"`
-	Password   string    `json:"password"`
-	Port       int       `json:"port"`
-	Contacts   []Contact `json:"contacts"`
+	ServerAddr string `json:"server_addr"`
+	// ServerID pins the directory server's key after the first connection.
+	ServerID string `json:"server_id,omitempty"`
+	Username string `json:"username"`
+	// Password is only needed until this device's key is linked to the
+	// account; the client removes it from the file after that login.
+	Password string `json:"password,omitempty"`
+	// Port is the one UDP port used for chat and for talking to the server.
+	Port int `json:"port"`
+	// ControlPort is the local TCP port of the background process (default:
+	// Port+10000, or Port-10000 when that would exceed 65535).
+	ControlPort int       `json:"control_port,omitempty"`
+	Contacts    []Contact `json:"contacts"`
 }
 
+// DefaultPort is the client's UDP port. It differs from the server's default
+// (63425) so a client and tariond can run on the same machine.
+const DefaultPort = 63426
+
 func DefaultConfig() *Config {
-	return &Config{Port: 63425, Contacts: []Contact{}}
+	return &Config{Port: DefaultPort, Contacts: []Contact{}}
 }
 
 // GetBaseConfigDir returns Tarion's data folder. TARION_HOME overrides it,
@@ -68,6 +81,21 @@ func LoadOrCreateConfig() (*Config, error) {
 	}
 	cfg = DefaultConfig()
 	return cfg, SaveConfig(cfg)
+}
+
+var configMu sync.Mutex
+
+// UpdateConfig re-reads the config file, applies fn, and saves it, so a
+// background goroutine can change one field without clobbering the rest.
+func UpdateConfig(fn func(*Config)) error {
+	configMu.Lock()
+	defer configMu.Unlock()
+	cfg, err := LoadOrCreateConfig()
+	if err != nil {
+		return err
+	}
+	fn(cfg)
+	return SaveConfig(cfg)
 }
 
 func SaveConfig(cfg *Config) error {

@@ -4,13 +4,9 @@ import (
 	"context"
 	"crypto/rand"
 	"crypto/tls"
-	"crypto/x509"
-	"encoding/binary"
 	"encoding/hex"
-	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"log"
 	"net"
 	"strings"
@@ -20,6 +16,7 @@ import (
 	"unicode/utf8"
 
 	"github.com/necromancer124/tarion/internal/identity"
+	"github.com/necromancer124/tarion/internal/wire"
 	"github.com/quic-go/quic-go"
 )
 
@@ -30,7 +27,7 @@ const (
 	ALPN            = "tarion/2"
 	ProtocolVersion = 2
 
-	MaxFrameSize   = 64 * 1024
+	MaxFrameSize   = wire.MaxFrameSize
 	MaxBodyBytes   = 16 * 1024
 	MaxNameBytes   = 64
 	maxIDBytes     = 64
@@ -105,23 +102,11 @@ func quicConfig() *quic.Config {
 	}
 }
 
-func requireTarionIdentity(raw [][]byte, _ [][]*x509.Certificate) error {
-	if len(raw) == 0 {
-		return errors.New("peer presented no certificate")
-	}
-	cert, err := x509.ParseCertificate(raw[0])
-	if err != nil {
-		return err
-	}
-	_, err = identity.PeerIDFromCerts([]*x509.Certificate{cert})
-	return err
-}
-
 func (nm *NetworkManager) serverTLS() *tls.Config {
 	return &tls.Config{
 		Certificates:          []tls.Certificate{nm.id.Cert},
 		ClientAuth:            tls.RequireAnyClientCert,
-		VerifyPeerCertificate: requireTarionIdentity,
+		VerifyPeerCertificate: identity.VerifyPeerCertificate,
 		NextProtos:            []string{ALPN},
 		MinVersion:            tls.VersionTLS13,
 	}
@@ -133,7 +118,7 @@ func (nm *NetworkManager) clientTLS() *tls.Config {
 		// There is no CA: peers are authenticated by their pinned Ed25519 key
 		// (see Send's verify callback), not by a certificate chain.
 		InsecureSkipVerify:    true,
-		VerifyPeerCertificate: requireTarionIdentity,
+		VerifyPeerCertificate: identity.VerifyPeerCertificate,
 		ServerName:            "tarion",
 		NextProtos:            []string{ALPN},
 		MinVersion:            tls.VersionTLS13,
@@ -216,15 +201,15 @@ func (nm *NetworkManager) handleStream(conn *quic.Conn, peerID string, stream *q
 
 	reply := envelope{V: ProtocolVersion, Type: "ack"}
 	var env envelope
-	if err := readFrame(stream, &env); err != nil {
+	if err := wire.ReadFrame(stream, &env); err != nil {
 		reply.Type, reply.Error = "nack", err.Error()
-		_ = writeFrame(stream, reply)
+		_ = wire.WriteFrame(stream, reply)
 		return
 	}
 	reply.ID = env.ID
 	if err := validateIncoming(env); err != nil {
 		reply.Type, reply.Error = "nack", err.Error()
-		_ = writeFrame(stream, reply)
+		_ = wire.WriteFrame(stream, reply)
 		return
 	}
 
@@ -246,7 +231,7 @@ func (nm *NetworkManager) handleStream(conn *quic.Conn, peerID string, stream *q
 			reply.Type, reply.Error = "nack", "receiver busy"
 		}
 	}
-	_ = writeFrame(stream, reply)
+	_ = wire.WriteFrame(stream, reply)
 }
 
 func validateIncoming(env envelope) error {
@@ -301,6 +286,14 @@ func (nm *NetworkManager) unmarkSeen(key string) {
 // before anything is written; returning an error aborts the send. The peer's
 // ID is returned whenever the handshake got that far.
 func (nm *NetworkManager) Send(peerAddr, from, body string, verify func(peerID string) error) (string, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), sendTimeout)
+	defer cancel()
+	return nm.SendContext(ctx, peerAddr, from, body, verify)
+}
+
+// SendContext is Send with a caller-chosen deadline, used to try a peer's
+// LAN address briefly before falling back to its public one.
+func (nm *NetworkManager) SendContext(ctx context.Context, peerAddr, from, body string, verify func(peerID string) error) (string, error) {
 	if nm.tr == nil {
 		return "", errors.New("listener not started")
 	}
@@ -318,9 +311,6 @@ func (nm *NetworkManager) Send(peerAddr, from, body string, verify func(peerID s
 		from = from[:MaxNameBytes]
 	}
 	env := envelope{V: ProtocolVersion, Type: "msg", ID: newMessageID(), TS: time.Now().Unix(), From: from, Body: body}
-
-	ctx, cancel := context.WithTimeout(context.Background(), sendTimeout)
-	defer cancel()
 
 	// The first attempt may use a cached connection that has silently died
 	// (for example the peer restarted); retry once on a fresh one.
@@ -367,7 +357,7 @@ func sendOnStream(ctx context.Context, conn *quic.Conn, env envelope) error {
 	if deadline, ok := ctx.Deadline(); ok {
 		_ = stream.SetDeadline(deadline)
 	}
-	if err := writeFrame(stream, env); err != nil {
+	if err := wire.WriteFrame(stream, env); err != nil {
 		stream.CancelRead(0)
 		_ = stream.Close()
 		return fmt.Errorf("write stream: %w", err)
@@ -376,7 +366,7 @@ func sendOnStream(ctx context.Context, conn *quic.Conn, env envelope) error {
 		return fmt.Errorf("close stream: %w", err)
 	}
 	var reply envelope
-	if err := readFrame(stream, &reply); err != nil {
+	if err := wire.ReadFrame(stream, &reply); err != nil {
 		return fmt.Errorf("waiting for ack: %w", err)
 	}
 	if reply.Type != "ack" || reply.ID != env.ID {
@@ -431,34 +421,71 @@ func newMessageID() string {
 	return hex.EncodeToString(b[:])
 }
 
-// Frames are a 4-byte big-endian length followed by that many bytes of JSON.
-func writeFrame(w io.Writer, env envelope) error {
-	data, err := json.Marshal(env)
+// Identity returns the key this endpoint authenticates with.
+func (nm *NetworkManager) Identity() *identity.Identity { return nm.id }
+
+// Dial opens a QUIC connection from the shared chat socket. The directory
+// client uses it so the server observes this socket's public address, which
+// is exactly the address peers need to reach.
+func (nm *NetworkManager) Dial(ctx context.Context, addr string, tlsConf *tls.Config, conf *quic.Config) (*quic.Conn, error) {
+	if nm.tr == nil {
+		return nil, errors.New("listener not started")
+	}
+	udpAddr, err := net.ResolveUDPAddr("udp", addr)
+	if err != nil {
+		return nil, err
+	}
+	return nm.tr.Dial(ctx, udpAddr, tlsConf, conf)
+}
+
+// PunchPacket is a tiny non-QUIC datagram. Its first byte has the QUIC
+// "fixed bit" (0x40) cleared, so QUIC stacks drop it instead of parsing it.
+var PunchPacket = []byte{0x00, 'T', 'P', 'U', 'N', 'C', 'H'}
+
+// Punch sends a few PunchPackets from the chat socket to addr. That opens
+// this side's NAT mapping toward a peer that is about to dial us, so its
+// QUIC handshake is not dropped by our router.
+func (nm *NetworkManager) Punch(addr string) error {
+	if nm.tr == nil {
+		return errors.New("listener not started")
+	}
+	udpAddr, err := net.ResolveUDPAddr("udp", addr)
 	if err != nil {
 		return err
 	}
-	if len(data) > MaxFrameSize {
-		return errors.New("frame too large")
+	for i := 0; i < 3; i++ {
+		if _, err := nm.tr.WriteTo(PunchPacket, udpAddr); err != nil {
+			return err
+		}
+		time.Sleep(50 * time.Millisecond)
 	}
-	buf := make([]byte, 4+len(data))
-	binary.BigEndian.PutUint32(buf, uint32(len(data)))
-	copy(buf[4:], data)
-	_, err = w.Write(buf)
-	return err
+	return nil
 }
 
-func readFrame(r io.Reader, env *envelope) error {
-	var hdr [4]byte
-	if _, err := io.ReadFull(r, hdr[:]); err != nil {
-		return fmt.Errorf("read frame header: %w", err)
+// LocalAddrs returns this machine's LAN address with the chat port, so a
+// peer behind the same router can connect without NAT hairpinning. Only
+// the interface that carries the default route is used: virtual adapters
+// (VMware, Hyper-V, Docker) often share IPs across machines and would just
+// waste a dial attempt.
+func (nm *NetworkManager) LocalAddrs() []string {
+	ip := primaryIPv4()
+	if ip == nil {
+		return nil
 	}
-	n := binary.BigEndian.Uint32(hdr[:])
-	if n == 0 || n > MaxFrameSize {
-		return fmt.Errorf("frame size %d out of range", n)
+	return []string{net.JoinHostPort(ip.String(), fmt.Sprint(nm.Port))}
+}
+
+// primaryIPv4 asks the OS which local address it would use to reach the
+// internet. Connecting a UDP socket sends no packets.
+func primaryIPv4() net.IP {
+	conn, err := net.Dial("udp4", "192.0.2.1:9") // TEST-NET-1, never contacted
+	if err != nil {
+		return nil
 	}
-	data := make([]byte, n)
-	if _, err := io.ReadFull(r, data); err != nil {
-		return fmt.Errorf("read frame: %w", err)
+	defer conn.Close()
+	addr, ok := conn.LocalAddr().(*net.UDPAddr)
+	if !ok || addr.IP.IsLoopback() || addr.IP.IsUnspecified() {
+		return nil
 	}
-	return json.Unmarshal(data, env)
+	return addr.IP.To4()
 }

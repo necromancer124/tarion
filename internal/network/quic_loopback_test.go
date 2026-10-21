@@ -1,8 +1,6 @@
 package network
 
 import (
-	"bytes"
-	"encoding/binary"
 	"errors"
 	"fmt"
 	"net"
@@ -160,14 +158,6 @@ func TestOversizedMessageRefused(t *testing.T) {
 	}
 }
 
-func TestReadFrameRejectsHugeLength(t *testing.T) {
-	var buf bytes.Buffer
-	_ = binary.Write(&buf, binary.BigEndian, uint32(MaxFrameSize+1))
-	var env envelope
-	if err := readFrame(&buf, &env); err == nil {
-		t.Fatal("expected oversized frame header to be rejected")
-	}
-}
 
 func TestDuplicateMessageDeliveredOnce(t *testing.T) {
 	nm := NewNetworkManager(0, nil)
