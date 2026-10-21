@@ -69,6 +69,20 @@ func PeerIDFromCerts(certs []*x509.Certificate) (string, error) {
 	return PeerID(pub), nil
 }
 
+// VerifyPeerCertificate is a tls.Config hook that only accepts a peer whose
+// leaf certificate carries an Ed25519 Tarion identity key.
+func VerifyPeerCertificate(raw [][]byte, _ [][]*x509.Certificate) error {
+	if len(raw) == 0 {
+		return errors.New("peer presented no certificate")
+	}
+	cert, err := x509.ParseCertificate(raw[0])
+	if err != nil {
+		return err
+	}
+	_, err = PeerIDFromCerts([]*x509.Certificate{cert})
+	return err
+}
+
 // Generate creates a fresh in-memory identity.
 func Generate() (*Identity, error) {
 	_, key, err := ed25519.GenerateKey(rand.Reader)

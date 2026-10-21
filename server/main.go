@@ -1,3 +1,6 @@
+// tariond is Tarion's directory server. Clients log in over QUIC from their
+// chat socket; tariond tells them each other's public address and peer key
+// and signals NAT hole punching. It never sees or relays chat messages.
 package main
 
 import (
@@ -5,127 +8,60 @@ import (
 	"fmt"
 	"log"
 	"net"
-	"strings"
-	"time"
-)
+	"os"
+	"os/signal"
+	"syscall"
 
-const (
-	CmdRegister  = "REG" // REG|username|password
-	CmdHeartbeat = "HBT" // HBT|username|password
-	CmdQuery     = "QRY" // QRY|username|password|target
-	CmdList      = "LST" // LST|username|password
+	"github.com/necromancer124/tarion/internal/directory"
+	"github.com/necromancer124/tarion/internal/identity"
+	"github.com/quic-go/quic-go"
 )
 
 func main() {
-	port := flag.Int("port", 63425, "UDP port for Tarion directory signaling")
-	usersPath := flag.String("users", "users.db", "flat-file user hash database")
-	leaseTTL := flag.Duration("ttl", 60*time.Second, "online lease TTL")
-	sweepEvery := flag.Duration("sweep", 10*time.Second, "stale-entry sweep interval")
+	port := flag.Int("port", directory.DefaultServerPort, "UDP port to listen on")
+	usersPath := flag.String("users", "users.json", "account database (JSON)")
+	legacyPath := flag.String("legacy-users", "users.db", "old users.db to import when -users does not exist yet")
+	keyPath := flag.String("key", "tariond.key", "server identity key (created if missing)")
+	showID := flag.Bool("id", false, "print the server ID and exit")
 	flag.Parse()
 
-	registry, err := NewRegistry(*usersPath, *leaseTTL)
+	id, err := identity.LoadOrCreate(*keyPath)
 	if err != nil {
-		log.Fatalf("load registry: %v", err)
+		log.Fatalf("load server key: %v", err)
+	}
+	if *showID {
+		fmt.Println(identity.Fingerprint(id.ID))
+		return
+	}
+	accounts, err := LoadAccounts(*usersPath, *legacyPath)
+	if err != nil {
+		log.Fatalf("load accounts: %v", err)
 	}
 
-	go func() {
-		ticker := time.NewTicker(*sweepEvery)
-		defer ticker.Stop()
-		for range ticker.C {
-			registry.ReapStaleUsers()
-		}
-	}()
-
-	addr, err := net.ResolveUDPAddr("udp", fmt.Sprintf(":%d", *port))
+	udp, err := net.ListenUDP("udp", &net.UDPAddr{Port: *port})
 	if err != nil {
-		log.Fatal(err)
+		log.Fatalf("listen UDP/%d: %v", *port, err)
 	}
-	conn, err := net.ListenUDP("udp", addr)
+	tr := &quic.Transport{Conn: udp}
+	srv := NewServer(id, accounts)
+	ln, err := tr.Listen(srv.TLSConfig(), QUICConfig())
 	if err != nil {
-		log.Fatal(err)
+		log.Fatalf("listen QUIC: %v", err)
 	}
-	defer conn.Close()
 
 	log.Printf("tariond listening on UDP/%d", *port)
-	buf := make([]byte, 2048)
-	for {
-		n, remoteAddr, err := conn.ReadFromUDP(buf)
-		if err != nil {
-			log.Printf("read: %v", err)
-			continue
-		}
-		response := handlePacket(registry, strings.TrimSpace(string(buf[:n])), remoteAddr.String(), func(targetAddr, payload string) error {
-			addr, err := net.ResolveUDPAddr("udp", targetAddr)
-			if err != nil {
-				return err
-			}
-			_, err = conn.WriteToUDP([]byte(payload), addr)
-			return err
-		})
-		if _, err := conn.WriteToUDP([]byte(response), remoteAddr); err != nil {
-			log.Printf("write to %s: %v", remoteAddr, err)
-		}
+	log.Printf("server ID: %s (clients pin this; give it to users as server_id)", identity.Fingerprint(id.ID))
+
+	stop := make(chan os.Signal, 1)
+	signal.Notify(stop, os.Interrupt, syscall.SIGTERM)
+	go func() {
+		<-stop
+		log.Printf("shutting down")
+		_ = ln.Close()
+	}()
+	if err := srv.Serve(ln); err != nil {
+		log.Printf("stopped: %v", err)
 	}
-}
-
-type punchSender func(targetAddr, payload string) error
-
-func handlePacket(registry *Registry, payload, remoteAddr string, sendPunch punchSender) string {
-	parts := strings.Split(payload, "|")
-	if len(parts) < 3 {
-		return "ERR|BAD_REQUEST"
-	}
-
-	command, username, password := parts[0], strings.TrimSpace(parts[1]), parts[2]
-	if username == "" || password == "" {
-		return "ERR|BAD_REQUEST"
-	}
-
-	switch command {
-	case CmdRegister, CmdHeartbeat:
-		if err := registry.RegisterOrUpdate(username, password, remoteAddr); err != nil {
-			log.Printf("auth failed for %q from %s: %v", username, remoteAddr, err)
-			return "ERR|AUTH_FAILED"
-		}
-		return "OK|REGISTERED"
-
-	case CmdQuery:
-		if len(parts) < 4 || strings.TrimSpace(parts[3]) == "" {
-			return "ERR|BAD_REQUEST"
-		}
-		target := strings.TrimSpace(parts[3])
-
-		if err := registry.RegisterOrUpdate(username, password, remoteAddr); err != nil {
-			log.Printf("auth failed for %q from %s: %v", username, remoteAddr, err)
-			return "ERR|AUTH_FAILED"
-		}
-
-		// The server never relays chat data. It only returns the target's currently
-		// observed public UDP address and signals the target to punch back toward
-		// the requester so both NAT tables have a fresh UDP mapping.
-		targetAddr, err := registry.GetUserAddr(target)
-		if err != nil {
-			return "ERR|OFFLINE"
-		}
-		if sendPunch != nil {
-			payload := fmt.Sprintf("PCH|%s|%s", username, remoteAddr)
-			if err := sendPunch(targetAddr, payload); err != nil {
-				log.Printf("punch signal failed: target=%s addr=%s requester=%s requester_addr=%s: %v", target, targetAddr, username, remoteAddr, err)
-			} else {
-				log.Printf("punch signal: target=%s addr=%s requester=%s requester_addr=%s", target, targetAddr, username, remoteAddr)
-			}
-		}
-		log.Printf("query: %s requested %s -> %s", username, target, targetAddr)
-		return "OK|ADDR|" + targetAddr
-
-	case CmdList:
-		if err := registry.RegisterOrUpdate(username, password, remoteAddr); err != nil {
-			log.Printf("auth failed for %q from %s: %v", username, remoteAddr, err)
-			return "ERR|AUTH_FAILED"
-		}
-		return "OK|USERS|" + registry.ListOnline(username)
-
-	default:
-		return "ERR|UNKNOWN_COMMAND"
-	}
+	_ = tr.Close()
+	_ = udp.Close()
 }

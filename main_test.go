@@ -10,7 +10,6 @@ import (
 
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/necromancer124/tarion/internal/identity"
-	"github.com/necromancer124/tarion/internal/network"
 	"github.com/necromancer124/tarion/internal/storage"
 )
 
@@ -24,19 +23,30 @@ func freePort(t *testing.T) int {
 	return conn.LocalAddr().(*net.UDPAddr).Port
 }
 
-func startNode(t *testing.T) (*network.NetworkManager, string) {
+func freeTCPPort(t *testing.T) int {
+	t.Helper()
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+	return ln.Addr().(*net.TCPAddr).Port
+}
+
+// startTestNode runs a node with no directory server.
+func startTestNode(t *testing.T, cfg *storage.Config) (*node, string) {
 	t.Helper()
 	id, err := identity.Generate()
 	if err != nil {
 		t.Fatal(err)
 	}
-	port := freePort(t)
-	nm := network.NewNetworkManager(port, id)
-	if err := nm.StartListener(); err != nil {
+	cfg.Port = freePort(t)
+	n, err := startNode(cfg, id)
+	if err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { _ = nm.Close() })
-	return nm, fmt.Sprintf("127.0.0.1:%d", port)
+	t.Cleanup(n.close)
+	return n, fmt.Sprintf("127.0.0.1:%d", cfg.Port)
 }
 
 func TestChatInputHandlesUnicode(t *testing.T) {
@@ -52,42 +62,82 @@ func TestChatInputHandlesUnicode(t *testing.T) {
 
 func TestControlSocketRequiresToken(t *testing.T) {
 	t.Setenv("TARION_HOME", t.TempDir())
-	nm, _ := startNode(t)
-	port := nm.Port
+	cfg := &storage.Config{ControlPort: freeTCPPort(t)}
+	n, _ := startTestNode(t, cfg)
 
-	if backgroundRunning(port) {
+	if backgroundRunning(cfg) {
 		t.Fatal("no token file yet, should not count as running")
 	}
 	token, _ := newControlToken()
-	if err := serveBackgroundControl(port, token, nm, storage.DefaultConfig()); err != nil {
+	if err := serveBackgroundControl(token, n); err != nil {
 		t.Fatal(err)
 	}
 	if err := saveControlToken("not-the-token"); err != nil {
 		t.Fatal(err)
 	}
-	if err := backgroundRequest(port, controlRequest{Cmd: "ping"}); err == nil || !strings.Contains(err.Error(), "bad control token") {
+	if err := backgroundRequest(cfg, controlRequest{Cmd: "ping"}); err == nil || !strings.Contains(err.Error(), "bad control token") {
 		t.Fatalf("wrong token accepted: %v", err)
 	}
 	if err := saveControlToken(token); err != nil {
 		t.Fatal(err)
 	}
-	if err := backgroundRequest(port, controlRequest{Cmd: "ping"}); err != nil {
+	if err := backgroundRequest(cfg, controlRequest{Cmd: "ping"}); err != nil {
 		t.Fatalf("right token rejected: %v", err)
+	}
+	resp, err := backgroundCall(cfg, controlRequest{Cmd: "online"})
+	if err != nil || !strings.Contains(resp.Status, "no server configured") {
+		t.Fatalf("online without server: %+v %v", resp, err)
+	}
+}
+
+func TestControlPortDefaultsAndOverride(t *testing.T) {
+	if got := controlPort(&storage.Config{Port: 63426}); got != 53426 {
+		t.Fatalf("63426 -> %d, want 53426 (63426+10000 is out of range)", got)
+	}
+	if got := controlPort(&storage.Config{Port: 40000}); got != 50000 {
+		t.Fatalf("40000 -> %d", got)
+	}
+	if got := controlPort(&storage.Config{Port: 40000, ControlPort: 41000}); got != 41000 {
+		t.Fatalf("override ignored: %d", got)
+	}
+}
+
+func TestClientFlagsValidate(t *testing.T) {
+	for _, tc := range []struct {
+		user, server string
+		ok           bool
+	}{
+		{"alice", "127.0.0.1:63425", true},
+		{"שלום", "example.com:63425", true},
+		{"a|b", "127.0.0.1:63425", false},
+		{"zzz\nbob", "127.0.0.1:63425", false},
+		{"alice", "no-port", false},
+	} {
+		user, server, pass := tc.user, tc.server, ""
+		port, ctrl := 0, 0
+		f := clientFlags{port: &port, ctrl: &ctrl, server: &server, user: &user, pass: &pass}
+		cfg := storage.DefaultConfig()
+		err := f.apply(cfg)
+		if (err == nil) != tc.ok {
+			t.Fatalf("user=%q server=%q: err=%v", tc.user, tc.server, err)
+		}
+		if tc.ok && cfg.Port != storage.DefaultPort {
+			t.Fatalf("default port %d", cfg.Port)
+		}
 	}
 }
 
 func TestDeliverPinsContactAndRefusesImpostor(t *testing.T) {
 	t.Setenv("TARION_HOME", t.TempDir())
-	alice, _ := startNode(t)
-	bob, bobAddr := startNode(t)
-	_, malloryAddr := startNode(t)
-	cfg := &storage.Config{Username: "alice"}
+	alice, _ := startTestNode(t, &storage.Config{Username: "alice"})
+	bob, bobAddr := startTestNode(t, &storage.Config{Username: "bob"})
+	_, malloryAddr := startTestNode(t, &storage.Config{Username: "mallory"})
 
-	if err := deliver(alice, cfg, "bob", bobAddr, "hi bob\x1b[2J"); err != nil {
+	if err := alice.deliver("bob", bobAddr, "hi bob\x1b[2J"); err != nil {
 		t.Fatalf("first delivery: %v", err)
 	}
 	select {
-	case msg := <-bob.MessageChan:
+	case msg := <-bob.nm.MessageChan:
 		chat, line := recordIncoming(msg)
 		if chat != "alice" || line != "alice: hi bob[2J" {
 			t.Fatalf("recorded as %q / %q", chat, line)
@@ -96,10 +146,31 @@ func TestDeliverPinsContactAndRefusesImpostor(t *testing.T) {
 		t.Fatal("bob got nothing")
 	}
 
-	// The directory (or anyone) now points "bob" at a different key.
-	err := deliver(alice, cfg, "bob", malloryAddr, "secret")
+	// Something else now answers for "bob".
+	err := alice.deliver("bob", malloryAddr, "secret")
 	var mismatch *storage.IdentityMismatchError
 	if !errors.As(err, &mismatch) {
 		t.Fatalf("expected identity mismatch, got %v", err)
+	}
+}
+
+func TestDeliverUsesConfigContactAddress(t *testing.T) {
+	t.Setenv("TARION_HOME", t.TempDir())
+	bob, bobAddr := startTestNode(t, &storage.Config{Username: "bob"})
+	alice, _ := startTestNode(t, &storage.Config{Username: "alice", Contacts: []storage.Contact{{Name: "bob", Addr: bobAddr}}})
+
+	if err := alice.deliver("bob", "", "via config"); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case msg := <-bob.nm.MessageChan:
+		if msg.Body != "via config" {
+			t.Fatalf("got %q", msg.Body)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("bob got nothing")
+	}
+	if err := alice.deliver("carol", "", "nobody"); err == nil || !strings.Contains(err.Error(), "no address") {
+		t.Fatalf("unknown contact: %v", err)
 	}
 }

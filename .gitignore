@@ -11,3 +11,9 @@ users.db
 # Editor/OS files
 .DS_Store
 Thumbs.db
+
+# Server runtime data
+users.json
+users.json.tmp
+tariond.key
+test-users.db

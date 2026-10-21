@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"crypto/rand"
 	"crypto/subtle"
 	"encoding/hex"
@@ -18,6 +19,7 @@ import (
 
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
+	"github.com/necromancer124/tarion/internal/directory"
 	"github.com/necromancer124/tarion/internal/identity"
 	"github.com/necromancer124/tarion/internal/network"
 	"github.com/necromancer124/tarion/internal/storage"
@@ -31,6 +33,7 @@ var (
 	styleInput    = lipgloss.NewStyle().Foreground(lipgloss.Color("229"))
 	styleNew      = lipgloss.NewStyle().Foreground(lipgloss.Color("13")).Bold(true)
 	styleError    = lipgloss.NewStyle().Foreground(lipgloss.Color("9"))
+	styleDim      = lipgloss.NewStyle().Foreground(lipgloss.Color("8"))
 )
 
 type AppState int
@@ -46,7 +49,7 @@ type Contact struct {
 	Online   bool
 	Addr     string
 	Unread   bool
-	IsManual bool
+	IsManual bool // fixed address (config contact or -i); not driven by the server list
 }
 
 type model struct {
@@ -56,12 +59,13 @@ type model struct {
 	activeContact string
 	chatHistory   []string
 	inputBuffer   string
-	statusLine    string
+	statusLine    string // result of the last action
+	dirStatus     string // server connection state
 	useBackground bool
 	selfID        string
 	seenMod       map[string]time.Time
 	cfg           *storage.Config
-	netMgr        *network.NetworkManager
+	node          *node
 }
 
 type msgIncomingChat network.IncomingMessage
@@ -75,77 +79,138 @@ type msgDirectory struct {
 }
 type msgTick time.Time
 
-type directoryClient struct {
-	server   string
-	username string
-	password string
+// node is the network side of a running client: the chat endpoint and, when
+// a server is configured, the directory session. Both use the same UDP port,
+// so the address the server sees for us is the one peers can dial.
+type node struct {
+	cfg    *storage.Config
+	nm     *network.NetworkManager
+	dir    *directory.Client
+	cancel context.CancelFunc
 }
 
-func newDirectoryClient(cfg *storage.Config) directoryClient {
-	return directoryClient{server: cfg.ServerAddr, username: cfg.Username, password: cfg.Password}
-}
-
-func (d directoryClient) request(payload string) (string, error) {
-	if d.server == "" {
-		return "", fmt.Errorf("server not configured")
+func startNode(cfg *storage.Config, id *identity.Identity) (*node, error) {
+	nm := network.NewNetworkManager(cfg.Port, id)
+	if err := nm.StartListener(); err != nil {
+		return nil, err
 	}
-	addr, err := net.ResolveUDPAddr("udp", d.server)
+	n := &node{cfg: cfg, nm: nm, cancel: func() {}}
+	if cfg.ServerAddr != "" && cfg.Username != "" {
+		ctx, cancel := context.WithCancel(context.Background())
+		n.cancel = cancel
+		n.dir = directory.NewClient(nm, directory.ClientConfig{
+			Server:   cfg.ServerAddr,
+			User:     cfg.Username,
+			Pass:     cfg.Password,
+			ServerID: cfg.ServerID,
+			OnServerID: func(id string) {
+				_ = storage.UpdateConfig(func(c *storage.Config) { c.ServerID = id })
+			},
+			OnLoggedIn: func(usedPassword bool) {
+				if usedPassword {
+					// The account now trusts this device's key; stop keeping the password.
+					_ = storage.UpdateConfig(func(c *storage.Config) { c.Password = "" })
+				}
+			},
+		})
+		go n.dir.Run(ctx)
+	}
+	return n, nil
+}
+
+func (n *node) close() {
+	n.cancel()
+	_ = n.nm.Close()
+}
+
+// directoryStatus returns the server state and who is online.
+func (n *node) directoryStatus() (string, []string) {
+	if n.dir == nil {
+		return "no server configured (use -server and -user)", nil
+	}
+	if !n.dir.Connected() {
+		return n.dir.Status(), nil
+	}
+	users, err := n.dir.List()
 	if err != nil {
-		return "", err
+		return "server: " + err.Error(), nil
 	}
-	conn, err := net.DialUDP("udp", nil, addr)
-	if err != nil {
-		return "", err
-	}
-	defer conn.Close()
-	_ = conn.SetDeadline(time.Now().Add(2 * time.Second))
-	if _, err := conn.Write([]byte(payload)); err != nil {
-		return "", err
-	}
-	buf := make([]byte, 2048)
-	n, err := conn.Read(buf)
-	if err != nil {
-		return "", err
-	}
-	return string(buf[:n]), nil
+	return n.dir.Status(), users
 }
 
-func (d directoryClient) register() error {
-	_, err := d.request(fmt.Sprintf("REG|%s|%s", d.username, d.password))
-	return err
-}
-
-func (d directoryClient) heartbeat() error {
-	_, err := d.request(fmt.Sprintf("HBT|%s|%s", d.username, d.password))
-	return err
-}
-
-func (d directoryClient) query(target string) (string, bool) {
-	resp, err := d.request(fmt.Sprintf("QRY|%s|%s|%s", d.username, d.password, target))
-	if err != nil || !strings.HasPrefix(resp, "OK|ADDR|") {
-		return "", false
-	}
-	return strings.TrimPrefix(resp, "OK|ADDR|"), true
-}
-
-func (d directoryClient) listOnline() []Contact {
-	resp, err := d.request(fmt.Sprintf("LST|%s|%s", d.username, d.password))
-	if err != nil || !strings.HasPrefix(resp, "OK|USERS|") {
-		return nil
-	}
-	payload := strings.TrimPrefix(resp, "OK|USERS|")
-	if payload == "" {
-		return nil
-	}
-	var contacts []Contact
-	for _, item := range strings.Split(payload, ",") {
-		name, addr, ok := strings.Cut(item, "=")
-		if !ok || name == "" || addr == "" || name == d.username {
-			continue
+func configuredID(cfg *storage.Config, name string) string {
+	for _, c := range cfg.Contacts {
+		if strings.EqualFold(c.Name, name) {
+			// Accept the spaced form "tarion id" prints.
+			return strings.ReplaceAll(strings.TrimSpace(c.ID), " ", "")
 		}
-		contacts = append(contacts, Contact{Username: name, Addr: addr, Online: true})
 	}
-	return contacts
+	return ""
+}
+
+// deliver sends body to the contact named to. If the server knows them it
+// supplies their current address (LAN addresses first when you share a
+// router) and their key, and asks them to punch toward us. Whatever key
+// answers must match the key fixed in config, the server's record, and the
+// key pinned on first contact; otherwise nothing is sent.
+func (n *node) deliver(to, addr, body string) error {
+	var candidates []string
+	dirID := ""
+	offline := false
+	if n.dir != nil && n.dir.Connected() && directory.ValidUsername(to) {
+		resp, err := n.dir.Lookup(to)
+		switch {
+		case err == nil:
+			dirID = resp.PeerID
+			candidates = append(append(candidates, resp.LocalAddrs...), resp.Addr)
+		case errors.Is(err, directory.ErrUserOffline):
+			offline = true
+		}
+	}
+	if len(candidates) == 0 {
+		if addr == "" {
+			addr = knownAddr(n.cfg, to)
+		}
+		if addr == "" {
+			if offline {
+				return fmt.Errorf("%s is offline", to)
+			}
+			return fmt.Errorf("no address for %s", to)
+		}
+		candidates = []string{addr}
+	}
+
+	configured := configuredID(n.cfg, to)
+	var lastErr, identityErr error
+	for i, cand := range candidates {
+		timeout := 10 * time.Second
+		if i < len(candidates)-1 {
+			timeout = 3 * time.Second // a LAN address either answers fast or is wrong
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), timeout)
+		_, err := n.nm.SendContext(ctx, cand, senderName(n.cfg), body, func(peerID string) error {
+			if configured != "" && !strings.EqualFold(configured, peerID) {
+				return &storage.IdentityMismatchError{Name: to, Expected: configured, Got: peerID}
+			}
+			if dirID != "" && !strings.EqualFold(dirID, peerID) {
+				return &storage.IdentityMismatchError{Name: to, Expected: dirID, Got: peerID}
+			}
+			return storage.PinOutgoing(to, peerID, cand)
+		})
+		cancel()
+		if err == nil {
+			return nil
+		}
+		var mismatch *storage.IdentityMismatchError
+		if errors.As(err, &mismatch) {
+			identityErr = err
+		}
+		lastErr = err
+	}
+	if identityErr != nil {
+		return identityErr
+	}
+	return lastErr
 }
 
 type controlRequest struct {
@@ -157,21 +222,30 @@ type controlRequest struct {
 }
 
 type controlResponse struct {
-	OK    bool   `json:"ok"`
-	Error string `json:"error,omitempty"`
+	OK     bool     `json:"ok"`
+	Error  string   `json:"error,omitempty"`
+	Status string   `json:"status,omitempty"`
+	Users  []string `json:"users,omitempty"`
 }
 
 const maxControlRequest = 64 * 1024
 
-func controlAddr(port int) string {
+func controlPort(cfg *storage.Config) int {
+	if cfg.ControlPort != 0 {
+		return cfg.ControlPort
+	}
+	port := cfg.Port
 	if port == 0 {
-		port = 63425
+		port = storage.DefaultPort
 	}
-	ctrl := port + 10000
-	if ctrl > 65535 {
-		ctrl = port - 10000
+	if port+10000 > 65535 {
+		return port - 10000
 	}
-	return fmt.Sprintf("127.0.0.1:%d", ctrl)
+	return port + 10000
+}
+
+func controlAddr(cfg *storage.Config) string {
+	return fmt.Sprintf("127.0.0.1:%d", controlPort(cfg))
 }
 
 // Any local process can reach the control port, but only one that can read
@@ -191,22 +265,6 @@ func saveControlToken(token string) error {
 	return os.WriteFile(storage.GetControlTokenPath(), []byte(token), 0600)
 }
 
-// validateDirectoryField rejects characters that would break the directory
-// server's "CMD|user|pass" text protocol.
-func validateDirectoryField(field, value string) error {
-	if strings.ContainsAny(value, "|,=\r\n") {
-		return fmt.Errorf("%s must not contain | , = or newlines", field)
-	}
-	return nil
-}
-
-func validateDirectoryConfig(cfg *storage.Config) error {
-	if err := validateDirectoryField("username", cfg.Username); err != nil {
-		return err
-	}
-	return validateDirectoryField("password", cfg.Password)
-}
-
 func readControlToken() string {
 	data, err := os.ReadFile(storage.GetControlTokenPath())
 	if err != nil {
@@ -215,40 +273,46 @@ func readControlToken() string {
 	return strings.TrimSpace(string(data))
 }
 
-func backgroundRequest(port int, req controlRequest) error {
+func backgroundCall(cfg *storage.Config, req controlRequest) (controlResponse, error) {
+	var resp controlResponse
 	req.Token = readControlToken()
 	if req.Token == "" {
-		return errors.New("background not running (no control token)")
+		return resp, errors.New("background not running (no control token)")
 	}
-	conn, err := net.DialTimeout("tcp", controlAddr(port), 500*time.Millisecond)
+	conn, err := net.DialTimeout("tcp", controlAddr(cfg), 500*time.Millisecond)
 	if err != nil {
-		return err
+		return resp, err
 	}
 	defer conn.Close()
-	// A send waits for the peer's ack, which can take a full dial + retry.
-	_ = conn.SetDeadline(time.Now().Add(25 * time.Second))
+	// A send may try a LAN address and then the public one, each waiting
+	// for the peer's ack.
+	_ = conn.SetDeadline(time.Now().Add(30 * time.Second))
 	if err := json.NewEncoder(conn).Encode(req); err != nil {
-		return err
+		return resp, err
 	}
-	var resp controlResponse
 	if err := json.NewDecoder(conn).Decode(&resp); err != nil {
-		return err
+		return resp, err
 	}
 	if !resp.OK {
 		if resp.Error == "" {
 			resp.Error = "background rejected request"
 		}
-		return errors.New(resp.Error)
+		return resp, errors.New(resp.Error)
 	}
-	return nil
+	return resp, nil
 }
 
-func backgroundRunning(port int) bool {
-	return backgroundRequest(port, controlRequest{Cmd: "ping"}) == nil
+func backgroundRequest(cfg *storage.Config, req controlRequest) error {
+	_, err := backgroundCall(cfg, req)
+	return err
 }
 
-func serveBackgroundControl(port int, token string, nm *network.NetworkManager, cfg *storage.Config) error {
-	ln, err := net.Listen("tcp", controlAddr(port))
+func backgroundRunning(cfg *storage.Config) bool {
+	return backgroundRequest(cfg, controlRequest{Cmd: "ping"}) == nil
+}
+
+func serveBackgroundControl(token string, n *node) error {
+	ln, err := net.Listen("tcp", controlAddr(n.cfg))
 	if err != nil {
 		return err
 	}
@@ -258,21 +322,22 @@ func serveBackgroundControl(port int, token string, nm *network.NetworkManager, 
 			if err != nil {
 				return
 			}
-			go handleControlConn(conn, token, nm, cfg)
+			go handleControlConn(conn, token, n)
 		}
 	}()
 	return nil
 }
 
-func handleControlConn(conn net.Conn, token string, nm *network.NetworkManager, cfg *storage.Config) {
+func handleControlConn(conn net.Conn, token string, n *node) {
 	defer conn.Close()
-	_ = conn.SetDeadline(time.Now().Add(25 * time.Second))
+	_ = conn.SetDeadline(time.Now().Add(30 * time.Second))
+	send := func(resp controlResponse) { _ = json.NewEncoder(conn).Encode(resp) }
 	reply := func(err error) {
 		resp := controlResponse{OK: err == nil}
 		if err != nil {
 			resp.Error = err.Error()
 		}
-		_ = json.NewEncoder(conn).Encode(resp)
+		send(resp)
 	}
 
 	var req controlRequest
@@ -295,36 +360,13 @@ func handleControlConn(conn net.Conn, token string, nm *network.NetworkManager, 
 			os.Exit(0)
 		}()
 	case "send":
-		reply(deliver(nm, cfg, req.To, req.Addr, req.Body))
+		reply(n.deliver(req.To, req.Addr, req.Body))
+	case "online":
+		status, users := n.directoryStatus()
+		send(controlResponse{OK: true, Status: status, Users: users})
 	default:
 		reply(errors.New("unknown command"))
 	}
-}
-
-// deliver sends body to the contact named to and enforces its identity: a
-// key fixed in config or pinned on first contact must match, otherwise
-// nothing is written to the connection.
-func deliver(nm *network.NetworkManager, cfg *storage.Config, to, addr, body string) error {
-	if addr == "" {
-		addr = pinnedAddr(to)
-	}
-	if addr == "" {
-		return fmt.Errorf("no address for %s", to)
-	}
-	configured := ""
-	for _, c := range cfg.Contacts {
-		if strings.EqualFold(c.Name, to) {
-			// Accept the spaced form "tarion id" prints.
-			configured = strings.ReplaceAll(strings.TrimSpace(c.ID), " ", "")
-		}
-	}
-	_, err := nm.Send(addr, senderName(cfg), body, func(peerID string) error {
-		if configured != "" && !strings.EqualFold(configured, peerID) {
-			return &storage.IdentityMismatchError{Name: to, Expected: configured, Got: peerID}
-		}
-		return storage.PinOutgoing(to, peerID, addr)
-	})
-	return err
 }
 
 // recordIncoming files an authenticated message under its sender's chat.
@@ -342,6 +384,17 @@ func loadIdentity() (*identity.Identity, error) {
 	return identity.LoadOrCreate(storage.GetIdentityPath())
 }
 
+// knownAddr is a contact's fixed address from config, else the address it
+// was last reached at.
+func knownAddr(cfg *storage.Config, name string) string {
+	for _, c := range cfg.Contacts {
+		if strings.EqualFold(c.Name, name) && c.Addr != "" {
+			return c.Addr
+		}
+	}
+	return pinnedAddr(name)
+}
+
 func pinnedAddr(name string) string {
 	if p, ok := storage.PeerByName(name); ok {
 		return p.Addr
@@ -349,11 +402,7 @@ func pinnedAddr(name string) string {
 	return ""
 }
 
-func initialModel(cfg *storage.Config, forceChatUser, forceChatAddr string, port int) model {
-	if port == 0 {
-		port = 63425
-	}
-
+func initialModel(cfg *storage.Config, forceChatUser, forceChatAddr string) model {
 	contacts := collectContacts(cfg)
 	seenMod := make(map[string]time.Time, len(contacts))
 	for _, c := range contacts {
@@ -364,19 +413,16 @@ func initialModel(cfg *storage.Config, forceChatUser, forceChatAddr string, port
 	if idErr == nil {
 		m.selfID = id.ID
 	}
-	if backgroundRunning(port) {
+	if backgroundRunning(cfg) {
 		m.useBackground = true
-		m.statusLine = "using background listener at " + controlAddr(port)
+		m.statusLine = "using background process at " + controlAddr(cfg)
 	} else if idErr != nil {
 		m.statusLine = "menu-only: identity: " + idErr.Error()
+	} else if n, err := startNode(cfg, id); err != nil {
+		m.statusLine = "menu-only: " + err.Error()
 	} else {
-		nm := network.NewNetworkManager(port, id)
-		m.netMgr = nm
-		m.statusLine = fmt.Sprintf("listening UDP/%d as %s", port, identity.Short(id.ID))
-		if err := nm.StartListener(); err != nil {
-			m.statusLine = "menu-only: " + err.Error()
-			m.netMgr = nil
-		}
+		m.node = n
+		m.statusLine = fmt.Sprintf("listening UDP/%d as %s", cfg.Port, identity.Short(id.ID))
 	}
 	if forceChatUser != "" && forceChatAddr != "" {
 		m.upsertContact(Contact{Username: forceChatUser, Addr: forceChatAddr, Online: true, IsManual: true})
@@ -396,7 +442,7 @@ func collectContacts(cfg *storage.Config) []Contact {
 		if addr == "" {
 			addr = pinnedAddr(c.Name)
 		}
-		contacts = append(contacts, Contact{Username: c.Name, Addr: addr, Online: addr != ""})
+		contacts = append(contacts, Contact{Username: c.Name, Addr: addr, Online: c.Addr != "", IsManual: c.Addr != ""})
 		seen[c.Name] = true
 	}
 	return mergeHistoryContacts(contacts, seen)
@@ -422,7 +468,7 @@ func mergeHistoryContacts(contacts []Contact, seen map[string]bool) []Contact {
 
 func (m model) Init() tea.Cmd {
 	cmds := []tea.Cmd{m.refreshDirectory(), tick()}
-	if !m.useBackground && m.netMgr != nil {
+	if m.node != nil {
 		cmds = append(cmds, m.listenForMessages())
 	}
 	return tea.Batch(cmds...)
@@ -433,34 +479,45 @@ func tick() tea.Cmd {
 }
 
 func (m model) listenForMessages() tea.Cmd {
-	return func() tea.Msg { return msgIncomingChat(<-m.netMgr.MessageChan) }
+	return func() tea.Msg { return msgIncomingChat(<-m.node.nm.MessageChan) }
 }
 
+// refreshDirectory asks the server (directly, or through the background
+// process) who is online. It no longer looks up every contact: addresses
+// are fetched only when you send, which is also when punching happens.
 func (m model) refreshDirectory() tea.Cmd {
-	cfg := *m.cfg
+	cfg, n, useBackground := m.cfg, m.node, m.useBackground
 	contacts := mergeHistoryContacts(append([]Contact(nil), m.contacts...), nil)
 	return func() tea.Msg {
-		if cfg.ServerAddr == "" || cfg.Username == "" || cfg.Password == "" {
-			return msgDirectory{status: "offline: configure server_addr, username, password in " + storage.GetConfigPath(), contacts: contacts}
-		}
-		d := newDirectoryClient(&cfg)
-		status := "server connected"
-		if err := d.heartbeat(); err != nil {
-			if err := d.register(); err != nil {
-				status = "server error: " + err.Error()
+		var status string
+		var online []string
+		switch {
+		case useBackground:
+			resp, err := backgroundCall(cfg, controlRequest{Cmd: "online"})
+			if err != nil {
+				status = "background: " + err.Error()
+			} else {
+				status, online = resp.Status, resp.Users
 			}
+		case n != nil:
+			status, online = n.directoryStatus()
+		default:
+			status = "no listener; cannot reach the server"
 		}
-		for _, listed := range d.listOnline() {
-			contacts = append(contacts, listed)
+		isOnline := map[string]bool{}
+		for _, u := range online {
+			isOnline[strings.ToLower(u)] = true
 		}
+		known := map[string]bool{}
 		for i := range contacts {
-			if contacts[i].IsManual {
-				continue
+			known[strings.ToLower(contacts[i].Username)] = true
+			if !contacts[i].IsManual {
+				contacts[i].Online = isOnline[strings.ToLower(contacts[i].Username)]
 			}
-			addr, ok := d.query(contacts[i].Username)
-			contacts[i].Online = ok
-			if ok {
-				contacts[i].Addr = addr
+		}
+		for _, u := range online {
+			if !known[strings.ToLower(u)] {
+				contacts = append(contacts, Contact{Username: u, Online: true})
 			}
 		}
 		return msgDirectory{status: status, contacts: contacts}
@@ -501,7 +558,7 @@ func (m *model) openChat(name string) {
 func (m model) selfAddr() string {
 	port := m.cfg.Port
 	if port == 0 {
-		port = 63425
+		port = storage.DefaultPort
 	}
 	return fmt.Sprintf("127.0.0.1:%d", port)
 }
@@ -540,14 +597,14 @@ func (m model) targetAddrFor(name string) string {
 }
 
 func (m model) sendCmd(to, addr, body string) tea.Cmd {
-	cfg, nm, useBackground := m.cfg, m.netMgr, m.useBackground
+	cfg, n, useBackground := m.cfg, m.node, m.useBackground
 	return func() tea.Msg {
 		var err error
 		switch {
 		case useBackground:
-			err = backgroundRequest(cfg.Port, controlRequest{Cmd: "send", To: to, Addr: addr, Body: body})
-		case nm != nil:
-			err = deliver(nm, cfg, to, addr, body)
+			err = backgroundRequest(cfg, controlRequest{Cmd: "send", To: to, Addr: addr, Body: body})
+		case n != nil:
+			err = n.deliver(to, addr, body)
 		default:
 			err = errors.New("not connected: no listener and no background process")
 		}
@@ -589,17 +646,12 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			case "enter":
 				if strings.TrimSpace(m.inputBuffer) != "" {
 					text := m.inputBuffer
-					targetAddr := m.targetAddrFor(m.activeContact)
-					if targetAddr == "" {
-						m.statusLine = "cannot send: no peer address for " + m.activeContact
-						break
-					}
 					line := "Me: " + storage.CleanText(text)
 					m.chatHistory = append(m.chatHistory, line)
 					_ = storage.AppendHistory(m.activeContact, line)
 					m.inputBuffer = ""
 					m.statusLine = "sending to " + m.activeContact + "..."
-					return m, m.sendCmd(m.activeContact, targetAddr, text)
+					return m, m.sendCmd(m.activeContact, m.targetAddrFor(m.activeContact), text)
 				}
 			case "backspace":
 				if r := []rune(m.inputBuffer); len(r) > 0 {
@@ -626,16 +678,9 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		incoming := network.IncomingMessage(msg)
 		name, line := recordIncoming(incoming)
 		viewing := m.state == StateChatView && m.activeContact == name
-		m.upsertContact(Contact{Username: name, Addr: incoming.Addr, Online: true, Unread: !viewing, IsManual: true})
-		if m.state == StateChatView && m.activeContact == name {
+		m.upsertContact(Contact{Username: name, Addr: incoming.Addr, Online: true, Unread: !viewing})
+		if viewing {
 			m.chatHistory = append(m.chatHistory, line)
-		} else {
-			for i := range m.contacts {
-				if m.contacts[i].Username == name {
-					m.contacts[i].Unread = true
-					m.contacts[i].Online = true
-				}
-			}
 		}
 		return m, m.listenForMessages()
 	case msgSendResult:
@@ -651,7 +696,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		return m, nil
 	case msgDirectory:
-		m.statusLine = msg.status
+		m.dirStatus = msg.status
 		if m.seenMod == nil {
 			m.seenMod = map[string]time.Time{}
 		}
@@ -705,6 +750,12 @@ func (m model) View() string {
 			}
 		}
 		s.WriteString("\n(↑/↓ Enter, h help, r refresh, q quit)\n")
+		if m.dirStatus != "" {
+			s.WriteString(styleDim.Render(m.dirStatus) + "\n")
+		}
+		if m.statusLine != "" {
+			s.WriteString(m.statusLine + "\n")
+		}
 		return styleBorder.Render(s.String())
 	case StateChatView:
 		var s strings.Builder
@@ -733,15 +784,21 @@ func helpText(m model) string {
 		"  tarion.exe menu",
 		"",
 		"Run network process detached:",
-		"  tarion.exe background --detach -server 127.0.0.1:63425 -user alice -pass secret",
+		"  tarion.exe background --detach -server SERVER:63425 -user alice -pass secret",
 		"  Then use tarion.exe menu to read/send through that background process.",
 		"  Stop it with: tarion.exe stop",
 		"",
 		"Start connected client:",
-		"  tarion.exe start -server 127.0.0.1:63425 -user alice -pass secret",
+		"  tarion.exe start -server SERVER:63425 -user alice -pass secret",
+		"  (-pass is only needed the first time on each device)",
+		"",
+		"Ports (all configurable):",
+		fmt.Sprintf("  chat + server traffic: UDP/%d  (-p)", m.cfg.Port),
+		fmt.Sprintf("  background control:    TCP/%d  (-cp)", controlPort(m.cfg)),
+		"  server:                set in -server host:port (tariond default 63425)",
 		"",
 		"Direct/self test chat:",
-		"  tarion.exe start -p 63426 -u Myself -i 127.0.0.1:63426",
+		fmt.Sprintf("  tarion.exe start -u Myself -i 127.0.0.1:%d", m.cfg.Port),
 		"",
 		"Config file:",
 		"  " + storage.GetConfigPath(),
@@ -752,6 +809,8 @@ func helpText(m model) string {
 		"Your peer ID (share it so contacts can verify you):",
 		"  " + identity.Fingerprint(m.selfID),
 		"",
+		"Server:",
+		"  " + m.dirStatus,
 		"Status:",
 		"  " + m.statusLine,
 		"",
@@ -768,17 +827,16 @@ func setBackgroundUsage(fs *flag.FlagSet) {
 		out := fs.Output()
 		fmt.Fprintln(out, "Usage: tarion background [options]")
 		fmt.Fprintln(out)
-		fmt.Fprintln(out, "Starts Tarion's always-on network listener.")
+		fmt.Fprintln(out, "Starts Tarion's always-on network listener and server session.")
 		fmt.Fprintln(out, "Use --detach to keep it running after the terminal closes on Windows/Linux.")
 		fmt.Fprintln(out)
 		fmt.Fprintln(out, "Examples:")
 		fmt.Fprintln(out, "  tarion background --detach")
-		fmt.Fprintln(out, "  tarion background --detach -server 127.0.0.1:63425 -user alice -pass secret")
+		fmt.Fprintln(out, "  tarion background --detach -server SERVER:63425 -user alice -pass secret")
 		fmt.Fprintln(out, "  tarion menu")
 		fmt.Fprintln(out)
 		fmt.Fprintln(out, "Stop background process:")
 		fmt.Fprintln(out, "  tarion stop")
-		fmt.Fprintln(out, "  tarion stop -p 63425")
 		fmt.Fprintln(out)
 		fmt.Fprintln(out, "Logs:")
 		fmt.Fprintf(out, "  %s\n", backgroundLogPath())
@@ -796,38 +854,86 @@ func setStopUsage(fs *flag.FlagSet) {
 		fmt.Fprintln(out, "Stops the Tarion background process started with:")
 		fmt.Fprintln(out, "  tarion background --detach")
 		fmt.Fprintln(out)
-		fmt.Fprintln(out, "If background was started with a custom port, pass the same port:")
-		fmt.Fprintln(out, "  tarion stop -p 63425")
+		fmt.Fprintln(out, "Ports come from config.json; pass -p/-cp only to override them.")
 		fmt.Fprintln(out)
 		fmt.Fprintln(out, "Options:")
 		fs.PrintDefaults()
 	}
 }
 
+// clientFlags are the settings shared by start, menu and background.
+type clientFlags struct {
+	port, ctrl         *int
+	server, user, pass *string
+}
+
+func addClientFlags(fs *flag.FlagSet) clientFlags {
+	return clientFlags{
+		port:   fs.Int("p", 0, fmt.Sprintf("local UDP port for chat and server traffic (default %d)", storage.DefaultPort)),
+		ctrl:   fs.Int("cp", 0, "local TCP port of the background control socket (default: -p plus 10000)"),
+		server: fs.String("server", "", fmt.Sprintf("directory server host:port (tariond default port %d)", directory.DefaultServerPort)),
+		user:   fs.String("user", "", "directory username"),
+		pass:   fs.String("pass", "", "directory password (only needed the first time on this device)"),
+	}
+}
+
+// apply merges flags into the saved config and validates it.
+func (f clientFlags) apply(cfg *storage.Config) error {
+	if *f.server != "" {
+		cfg.ServerAddr = *f.server
+	}
+	if *f.user != "" {
+		cfg.Username = *f.user
+	}
+	if *f.pass != "" {
+		cfg.Password = *f.pass
+	}
+	if *f.port != 0 {
+		cfg.Port = *f.port
+	}
+	if *f.ctrl != 0 {
+		cfg.ControlPort = *f.ctrl
+	}
+	if cfg.Port == 0 {
+		cfg.Port = storage.DefaultPort
+	}
+	for _, p := range []int{cfg.Port, cfg.ControlPort} {
+		if p < 0 || p > 65535 {
+			return fmt.Errorf("port %d out of range", p)
+		}
+	}
+	if cfg.ServerAddr != "" {
+		if _, _, err := net.SplitHostPort(cfg.ServerAddr); err != nil {
+			return fmt.Errorf("server must be host:port: %w", err)
+		}
+	}
+	if cfg.Username != "" && !directory.ValidUsername(cfg.Username) {
+		return errors.New("username must be 1-32 letters or digits and may contain . _ -")
+	}
+	return nil
+}
+
 func runStop(args []string) error {
 	fs := flag.NewFlagSet("stop", flag.ExitOnError)
 	setStopUsage(fs)
-	portFlag := fs.Int("p", 0, "local UDP port/background control port base")
+	portFlag := fs.Int("p", 0, "local UDP port the background uses")
+	ctrlFlag := fs.Int("cp", 0, "background control TCP port")
 	_ = fs.Parse(args)
 
 	cfg, _ := storage.LoadOrCreateConfig()
-	port := cfg.Port
 	if *portFlag != 0 {
-		port = *portFlag
+		cfg.Port = *portFlag
 	}
-	if port == 0 {
-		port = 63425
+	if *ctrlFlag != 0 {
+		cfg.ControlPort = *ctrlFlag
 	}
-	return backgroundRequest(port, controlRequest{Cmd: "stop"})
+	return backgroundRequest(cfg, controlRequest{Cmd: "stop"})
 }
 
 func runBackground(args []string) error {
 	fs := flag.NewFlagSet("background", flag.ExitOnError)
 	setBackgroundUsage(fs)
-	portFlag := fs.Int("p", 0, "local UDP port to listen on")
-	serverFlag := fs.String("server", "", "directory server IP:port")
-	nameFlag := fs.String("user", "", "directory username")
-	passFlag := fs.String("pass", "", "directory password")
+	flags := addClientFlags(fs)
 	detachFlag := fs.Bool("detach", false, "start detached so it survives terminal close")
 	_ = fs.Parse(args)
 
@@ -835,22 +941,7 @@ func runBackground(args []string) error {
 	if err != nil {
 		return err
 	}
-	if *serverFlag != "" {
-		cfg.ServerAddr = *serverFlag
-	}
-	if *nameFlag != "" {
-		cfg.Username = *nameFlag
-	}
-	if *passFlag != "" {
-		cfg.Password = *passFlag
-	}
-	if *portFlag != 0 {
-		cfg.Port = *portFlag
-	}
-	if cfg.Port == 0 {
-		cfg.Port = 63425
-	}
-	if err := validateDirectoryConfig(cfg); err != nil {
+	if err := flags.apply(cfg); err != nil {
 		return err
 	}
 	if err := storage.SaveConfig(cfg); err != nil {
@@ -872,37 +963,37 @@ func runBackground(args []string) error {
 	if err != nil {
 		return fmt.Errorf("load identity: %w", err)
 	}
-	nm := network.NewNetworkManager(cfg.Port, id)
-	if err := nm.StartListener(); err != nil {
+	n, err := startNode(cfg, id)
+	if err != nil {
 		return err
 	}
+	defer n.close()
 	token, err := newControlToken()
 	if err != nil {
 		return err
 	}
-	if err := serveBackgroundControl(cfg.Port, token, nm, cfg); err != nil {
-		return fmt.Errorf("start background control at %s: %w", controlAddr(cfg.Port), err)
+	if err := serveBackgroundControl(token, n); err != nil {
+		return fmt.Errorf("start background control at %s: %w", controlAddr(cfg), err)
 	}
 	if err := saveControlToken(token); err != nil {
 		return fmt.Errorf("save control token: %w", err)
 	}
-	fmt.Printf("tarion background listening on UDP/%d as %s; control %s\n", cfg.Port, identity.Short(id.ID), controlAddr(cfg.Port))
+	fmt.Printf("tarion background listening on UDP/%d as %s; control %s\n", cfg.Port, identity.Short(id.ID), controlAddr(cfg))
 
 	go func() {
-		for msg := range nm.MessageChan {
+		for msg := range n.nm.MessageChan {
 			chat, _ := recordIncoming(msg)
 			fmt.Printf("new message from %s (%s, id %s)\n", chat, msg.Addr, identity.Short(msg.PeerID))
 		}
 	}()
-
-	if cfg.ServerAddr != "" && cfg.Username != "" && cfg.Password != "" {
-		d := newDirectoryClient(cfg)
+	if n.dir != nil {
 		go func() {
-			for {
-				if err := d.heartbeat(); err != nil {
-					_ = d.register()
+			last := ""
+			for range time.Tick(2 * time.Second) {
+				if s := n.dir.Status(); s != last {
+					fmt.Println(s)
+					last = s
 				}
-				time.Sleep(20 * time.Second)
 			}
 		}()
 	}
@@ -910,6 +1001,7 @@ func runBackground(args []string) error {
 	stop := make(chan os.Signal, 1)
 	signal.Notify(stop, os.Interrupt, syscall.SIGTERM)
 	<-stop
+	_ = os.Remove(storage.GetControlTokenPath())
 	return nil
 }
 
@@ -917,10 +1009,7 @@ func runStart(args []string) error {
 	fs := flag.NewFlagSet("start", flag.ExitOnError)
 	userFlag := fs.String("u", "", "display name for a direct-IP chat")
 	ipFlag := fs.String("i", "", "peer IP:port for a direct-IP chat")
-	portFlag := fs.Int("p", 0, "local UDP port to listen on")
-	serverFlag := fs.String("server", "", "directory server IP:port")
-	nameFlag := fs.String("user", "", "directory username")
-	passFlag := fs.String("pass", "", "directory password")
+	flags := addClientFlags(fs)
 	wipeFlag := fs.Bool("wipe-history", false, "delete all local Tarion chat history and exit")
 	_ = fs.Parse(args)
 
@@ -936,28 +1025,52 @@ func runStart(args []string) error {
 	if err != nil {
 		return err
 	}
-	if *serverFlag != "" {
-		cfg.ServerAddr = *serverFlag
-	}
-	if *nameFlag != "" {
-		cfg.Username = *nameFlag
-	}
-	if *passFlag != "" {
-		cfg.Password = *passFlag
-	}
-	if *portFlag != 0 {
-		cfg.Port = *portFlag
-	}
-	if err := validateDirectoryConfig(cfg); err != nil {
+	if err := flags.apply(cfg); err != nil {
 		return err
 	}
 	if err := storage.SaveConfig(cfg); err != nil {
 		return err
 	}
 
-	p := tea.NewProgram(initialModel(cfg, *userFlag, *ipFlag, cfg.Port))
-	_, err = p.Run()
+	m := initialModel(cfg, *userFlag, *ipFlag)
+	if m.node != nil {
+		defer m.node.close()
+	}
+	_, err = tea.NewProgram(m).Run()
 	return err
+}
+
+// runSend sends one message through the running background process, for
+// scripts and quick tests: tarion send bob "hello".
+func runSend(args []string) error {
+	fs := flag.NewFlagSet("send", flag.ExitOnError)
+	portFlag := fs.Int("p", 0, "local UDP port the background uses")
+	ctrlFlag := fs.Int("cp", 0, "background control TCP port")
+	_ = fs.Parse(args)
+	rest := fs.Args()
+	if len(rest) < 2 {
+		return errors.New("usage: tarion send <name> <message>")
+	}
+	cfg, err := storage.LoadOrCreateConfig()
+	if err != nil {
+		return err
+	}
+	if *portFlag != 0 {
+		cfg.Port = *portFlag
+	}
+	if *ctrlFlag != 0 {
+		cfg.ControlPort = *ctrlFlag
+	}
+	to, body := rest[0], strings.Join(rest[1:], " ")
+	if !backgroundRunning(cfg) {
+		return errors.New("no background process running; start one with: tarion background --detach")
+	}
+	if err := backgroundRequest(cfg, controlRequest{Cmd: "send", To: to, Body: body}); err != nil {
+		return fmt.Errorf("not delivered to %s: %w", to, err)
+	}
+	_ = storage.AppendHistory(to, "Me: "+storage.CleanText(body))
+	fmt.Println("delivered to", to)
+	return nil
 }
 
 func runID() error {
@@ -1015,6 +1128,7 @@ func printGeneralHelp() {
 		"  menu        Open the interactive menu/TUI",
 		"  background  Run the always-on listener; use --detach to survive terminal close",
 		"  stop        Stop the detached/background listener",
+		"  send        Send one message through the background process",
 		"  id          Show your peer ID so contacts can verify you",
 		"  peers       List pinned contacts and their peer IDs",
 		"  forget      Remove a contact's pinned key (after they reinstall)",
@@ -1022,17 +1136,19 @@ func printGeneralHelp() {
 		"",
 		"Command help:",
 		"  tarion start -h",
-		"  tarion menu -h",
 		"  tarion background -h",
 		"  tarion stop -h",
 		"",
 		"Common examples:",
-		"  tarion start",
+		"  tarion start -server SERVER:63425 -user alice -pass secret",
 		"  tarion background --detach",
 		"  tarion menu",
+		"  tarion send bob \"hello\"",
 		"  tarion stop",
-		"  tarion start -server 127.0.0.1:63425 -user alice -pass secret",
-		"  tarion menu -p 63425 -u Myself -i 127.0.0.1:63425",
+		fmt.Sprintf("  tarion start -u Myself -i 127.0.0.1:%d", storage.DefaultPort),
+		"",
+		fmt.Sprintf("Ports: the client uses one UDP port (default %d, -p) for chat and for", storage.DefaultPort),
+		fmt.Sprintf("talking to the server; tariond listens on %d by default.", directory.DefaultServerPort),
 	}, "\n"))
 }
 
@@ -1048,7 +1164,7 @@ func main() {
 	cmd := "start"
 	if len(args) > 0 {
 		switch args[0] {
-		case "start", "menu", "background", "stop", "id", "peers", "forget":
+		case "start", "menu", "background", "stop", "send", "id", "peers", "forget":
 			cmd, args = args[0], args[1:]
 		}
 	}
@@ -1059,6 +1175,8 @@ func main() {
 		err = runBackground(args)
 	case "stop":
 		err = runStop(args)
+	case "send":
+		err = runSend(args)
 	case "id":
 		err = runID()
 	case "peers":
