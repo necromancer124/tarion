@@ -204,7 +204,9 @@ func (n *node) watchStatus(log func(string)) {
 		return
 	}
 	last := ""
-	for range time.Tick(2 * time.Second) {
+	ticker := time.NewTicker(time.Second)
+	defer ticker.Stop()
+	for ; ; <-ticker.C {
 		if s := n.dir.Status(); s != last {
 			last = s
 			n.events.publish(controlEvent{Type: "status", Status: s})
@@ -1277,11 +1279,11 @@ func runListen(args []string) error {
 func runHistory(args []string) error {
 	fs := flag.NewFlagSet("history", flag.ExitOnError)
 	n := fs.Int("n", 20, "how many recent lines (0 = all)")
-	_ = fs.Parse(args)
-	if fs.NArg() != 1 {
+	rest := parseInterspersed(fs, args)
+	if len(rest) != 1 {
 		return errors.New("usage: tarion history [-n 20] <name>")
 	}
-	lines, err := storage.ReadHistory(fs.Arg(0))
+	lines, err := storage.ReadHistory(rest[0])
 	if err != nil {
 		return err
 	}
@@ -1292,6 +1294,21 @@ func runHistory(args []string) error {
 		fmt.Println(l)
 	}
 	return nil
+}
+
+// parseInterspersed parses flags that may come before or after positional
+// arguments ("tariond ban bob -data /srv" as well as "-data /srv bob"); the
+// standard flag package stops at the first positional one.
+func parseInterspersed(fs *flag.FlagSet, args []string) []string {
+	var positional []string
+	for {
+		_ = fs.Parse(args)
+		if fs.NArg() == 0 {
+			return positional
+		}
+		positional = append(positional, fs.Arg(0))
+		args = fs.Args()[1:]
+	}
 }
 
 func runID() error {

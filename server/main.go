@@ -211,11 +211,11 @@ func runBan(args []string, ban bool) error {
 	verb := map[bool]string{true: "ban", false: "unban"}[ban]
 	fs := flag.NewFlagSet(verb, flag.ExitOnError)
 	getPaths := addPathFlags(fs)
-	_ = fs.Parse(args)
-	if fs.NArg() != 1 {
-		return fmt.Errorf("usage: tariond %s <username or peer ID>", verb)
+	rest := parseInterspersed(fs, args)
+	if len(rest) != 1 {
+		return fmt.Errorf("usage: tariond %s <username or peer ID>  (quote a spaced peer ID)", verb)
 	}
-	entry := fs.Arg(0)
+	entry := rest[0]
 	if k := normalizeKey(entry); k != "" {
 		entry = k
 	} else if !directory.ValidUsername(entry) {
@@ -236,6 +236,21 @@ func runBan(args []string, ban bool) error {
 		fmt.Println("unbanned", entry)
 	}
 	return nil
+}
+
+// parseInterspersed parses flags that may come before or after positional
+// arguments ("tariond ban bob -data /srv" as well as "-data /srv bob"); the
+// standard flag package stops at the first positional one.
+func parseInterspersed(fs *flag.FlagSet, args []string) []string {
+	var positional []string
+	for {
+		_ = fs.Parse(args)
+		if fs.NArg() == 0 {
+			return positional
+		}
+		positional = append(positional, fs.Arg(0))
+		args = fs.Args()[1:]
+	}
 }
 
 func runID(args []string) error {

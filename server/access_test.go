@@ -1,6 +1,7 @@
 package main
 
 import (
+	"flag"
 	"os"
 	"path/filepath"
 	"strings"
@@ -92,5 +93,19 @@ func TestInviteCodesAreSafe(t *testing.T) {
 	}
 	if !inv.Consume(codes[0]) || inv.Consume(codes[0]) {
 		t.Fatal("a code must work exactly once")
+	}
+}
+
+func TestParseInterspersed(t *testing.T) {
+	for _, args := range [][]string{
+		{"bob", "-data", "/srv"},
+		{"-data", "/srv", "bob"},
+	} {
+		fs := flag.NewFlagSet("ban", flag.ContinueOnError)
+		data := fs.String("data", ".", "")
+		rest := parseInterspersed(fs, args)
+		if len(rest) != 1 || rest[0] != "bob" || *data != "/srv" {
+			t.Fatalf("%v -> rest=%v data=%q", args, rest, *data)
+		}
 	}
 }
