@@ -17,23 +17,31 @@ The client uses **one** UDP port for everything. The server only sees the public
 Start the interactive client, log in, and listen:
 
 ```powershell
-.\tarion.exe start -server SERVER:63425 -user alice -pass secret
+.\tarion.exe start -server SERVER:63425 -user alice -pass "a long passphrase"
 ```
 
-`-pass` is only needed the first time on each device. That login links the device's key to your account, and the password is then removed from `config.json`. After that, `.\tarion.exe start` is enough. The first login with a new name creates the account.
+`-pass` is only needed the first time on each device. That login links the device's key to your account, and the password is then removed from `config.json`. After that, `.\tarion.exe start` is enough. The first login with a new name creates the account (10+ characters, not containing your username). If the server is invite-only, add `-invite CODE` the first time; the operator creates codes with `tariond invite`.
 
 Run the listener detached, without keeping the terminal open:
 
 ```powershell
-.\tarion.exe background --detach -server SERVER:63425 -user alice -pass secret
+.\tarion.exe background --detach -server SERVER:63425 -user alice -pass "a long passphrase"
 ```
 
 This works on Windows and Linux. The background process keeps running after you close the terminal and saves incoming messages to local history. Run `tarion.exe menu` in another terminal to read chats and send through it. The menu talks to it over the local control socket, so the background process owns the UDP port.
 
-Send one message through the background process (handy for scripts):
+Send one message through the background process, print incoming messages as JSON lines, or show a chat (handy for scripts and bots; see the [local API](docs/local-api.md) to build an app):
 
 ```powershell
 .\tarion.exe send bob "hello"
+.\tarion.exe listen
+.\tarion.exe history -n 20 bob
+```
+
+Only accept messages from people you know (contacts in `config.json`, people you messaged, and people who messaged you before):
+
+```powershell
+.\tarion.exe start -accept contacts
 ```
 
 Stop the detached background process:
@@ -108,9 +116,10 @@ The config is saved to:
 }
 ```
 
-- `server_id` is the server's key. It's pinned automatically on the first connection. If the server's key ever changes, the client refuses to log in. Delete the field only if you know the server was reinstalled. Server operators can print it with `tariond -id`.
+- `server_id` is the server's key. It's pinned automatically on the first connection. If the server's key ever changes, the client refuses to log in. Delete the field only if you know the server was reinstalled. Server operators can print it with `tariond id`.
 - `contacts` are optional. A contact with an `addr` can be reached without the server. Its `id` is also optional: when set, Tarion only talks to the peer holding that key. Without it, the first key that answers gets pinned (trust on first use).
 - `control_port` is optional (see [Ports](#ports)).
+- `accept` is `anyone` (default) or `contacts` (see above). Strangers who write to you then get "this user only accepts messages from contacts".
 
 The folder also holds `identity.key` (your private key, keep it secret), `peers.json` (pinned contacts) and, while the background process runs, `control.token`.
 
@@ -126,7 +135,8 @@ The folder also holds `identity.key` (your private key, keep it secret), `peers.
 ## Security model
 
 - **Identity.** `identity.key` is an Ed25519 key created on first run. Your peer ID is a hash of its public key. Both sides present their key in the QUIC/TLS 1.3 handshake (mutual TLS), so a peer ID cannot be claimed without owning the private key.
-- **Server login.** The client talks to `tariond` over QUIC/TLS 1.3, so the password is never sent in the clear. The password links your account to your device's key. Later logins use the key alone, and the password isn't stored. The server stores argon2id hashes, rate-limits logins and registrations, and checks usernames (1–32 letters/digits plus `. _ -`, not case-sensitive).
+- **Encryption.** Every connection is QUIC with TLS 1.3 (AES-GCM) and a post-quantum hybrid key exchange (X25519MLKEM768), so recorded traffic stays private even against a future quantum computer. The Ed25519 identity keys are not post-quantum.
+- **Server login.** The password is only ever sent inside that encrypted connection. It links your account to your device's key; later logins use the key alone, and the password isn't stored on your device. The server stores argon2id hashes (64 MiB, 3 passes), requires 10+ character passwords for new accounts, rate-limits logins and registrations, and checks usernames (1–32 letters/digits plus `. _ -`, not case-sensitive). Operators can make the server invite-only and ban users or keys.
 - **Server pinning.** The client pins the server's key (`server_id`), so an impostor server can't collect passwords.
 - **Pinning.** The first time you talk to a name, its peer ID is pinned in `peers.json`. If that name later answers with a different key, sending is refused. When the server knows a user, it also reports their key, and the key that answers must match it too. A new key that claims a pinned name shows up as a separate chat such as `bob~1a2b3c4d`, so it can't pose as Bob.
 - **Delivery.** Each message carries an ID and waits for the receiver's acknowledgement. The menu shows `delivered` or `not delivered: <reason>`, and failed sends are marked in the history. Duplicate deliveries are dropped.
@@ -152,10 +162,21 @@ Chat uses ALPN `tarion/2`, with one bidirectional QUIC stream per message. Each 
 
 The directory uses ALPN `tarion-dir/1` with the same framing; see [`internal/directory/proto.go`](internal/directory/proto.go). Punch packets are 7-byte UDP datagrams whose first byte is `0x00`, so QUIC ignores them.
 
+### Firewalls
+
+- **What a firewall can see:** UDP packets between your IP and the server or peers, their sizes and timing, and that they are QUIC with the ALPN `tarion/2` or `tarion-dir/1`. Chat connections send no server name (SNI). The certificates, and so the identity keys, are encrypted in TLS 1.3.
+- **What it can't see:** messages, usernames, passwords, or the server's password hashes (those never leave the server). There is nothing in the traffic to "crack".
+- **TLS-inspecting firewalls** (company proxies with their own root certificate) can't read Tarion either. Peers and the server are pinned by key, not trusted through certificate authorities, so an interception attempt makes the connection fail instead of being decrypted.
+- **Blocking:** a firewall can still block Tarion, either by ALPN or by blocking UDP altogether (common on company and school networks). Tarion then can't connect; a TCP/relay fallback is tracked in #13.
+- **Your own PC's firewall** (Windows Defender may ask the first time): allowing it is best. If you decline, connections still work, because Tarion punches outward first, which opens a temporary opening for that peer.
+- **Server:** open UDP 63425 inbound. Clients need no inbound rules or port forwarding.
+
 ### Known limitations
 
-- Hole punching works with most home routers. It can still fail when both sides are behind strict ("symmetric") NATs, such as some mobile carriers. A relay fallback would be the next step.
-- Messages to offline peers fail instead of being queued.
+- Hole punching works with most home routers but can fail when both sides are behind strict ("symmetric") NATs, such as some mobile carriers, or on networks that block UDP. A relay fallback is tracked in #13.
+- Messages to offline peers fail instead of being queued (#14).
+- One device per account (#15).
+- `identity.key` and the history are stored unencrypted, protected by file permissions (#16).
 - Trust on first use: on the very first contact you trust the key the server reports. Compare `tarion id` with your contact, or put their `id` in `config.json`, to rule that out.
 
 ## Privacy

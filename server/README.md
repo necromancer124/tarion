@@ -2,34 +2,64 @@
 
 `tariond` is Tarion's directory server. It tells peers where to find each other and signals NAT hole punching. It **never sees or relays chat messages**.
 
-## Build
+## Quick start
 
 ```bash
-go build -o tariond.exe ./server
+go build -o tariond ./server
+./tariond -data ./tariond-data
 ```
 
-## Run
+On startup it prints the **server ID**. Clients pin it the first time they connect, and you can hand it to users as `server_id` so they can verify it. Open **UDP 63425** inbound in every firewall between the internet and the server.
 
-```bash
-./tariond.exe -port 63425 -users users.json -key tariond.key
-```
+## Files
+
+Everything lives in one data folder: `-data`, or the `TARIOND_DATA` environment variable, default `.`.
+
+| File | What | Back it up? |
+|---|---|---|
+| `tariond.key` | Server identity. If you lose it, every client refuses the "new" server until users delete `server_id` | **Yes** |
+| `users.json` | Accounts: name, argon2id hash, linked device key | **Yes** |
+| `invites/` | One file per unused invite code | |
+| `bans.txt` | Banned usernames and peer IDs, one per line, `#` for comments | |
+| `users.db` | Old v1 database; imported once if `users.json` doesn't exist | |
+
+## Server flags
 
 | Flag | Default | Meaning |
 |---|---|---|
-| `-port` | `63425` | UDP port to listen on |
-| `-users` | `users.json` | Account database |
-| `-legacy-users` | `users.db` | Old v1 database, imported once if `-users` doesn't exist yet |
-| `-key` | `tariond.key` | Server identity key (created on first run; back it up) |
-| `-id` | | Print the server ID and exit |
+| `-port` | `63425` | UDP port |
+| `-data` | `.` | Folder for all files (see above) |
+| `-registration` | `open` | Who can create accounts: `open`, `invite` or `closed` |
+| `-min-password` | `10` | Minimum password length for new accounts (8 or more) |
+| `-argon-memory` | `64` | argon2id memory per hash, in MiB |
+| `-argon-time` | `3` | argon2id passes |
 
-On startup it prints the **server ID**. Clients pin it the first time they connect, and you can hand it to users as `server_id` so they can verify it.
+`-users`, `-key`, `-invites`, `-bans` and `-legacy-users` override single file paths.
+
+## Controlling who has access
+
+```bash
+tariond -registration invite        # run the server invite-only
+tariond invite -n 3                 # create 3 one-time codes (safe while the server runs)
+tariond accounts                    # list accounts, their keys, and bans
+tariond ban bob                     # ban a username...
+tariond ban "x5u5 zbuk qp3a g4dj hpyl ztgg u7z3 siop"   # ...or a device key
+tariond unban bob
+tariond id                          # print the server ID
+```
+
+Operator commands take the same `-data` flag (or `TARIOND_DATA`) as the server.
+
+- **Invites:** a user registers once with `tarion start -server HOST:63425 -user NAME -pass PASSWORD -invite CODE`. Each code works exactly once; a failed registration gives the code back.
+- **Bans:** take effect within about 2 seconds, with no restart. A banned user is disconnected, can't log in or register, and doesn't show up in lookups. Banning a key blocks that device under any name.
+- **Limit:** the server controls *finding* people. Two users who already know each other's address can still chat directly with `-i`. Each user can also refuse strangers with `tarion -accept contacts`.
 
 ## What it does
 
-- **Accounts.** The first login with a new name creates the account and links it to that device's key. Usernames are 1–32 letters/digits plus `. _ -` and aren't case-sensitive. Passwords are 6–256 characters, stored as argon2id hashes. `users.json` is replaced atomically, so a crash can't corrupt it.
-- **Login.** Logins go over QUIC/TLS 1.3 (ALPN `tarion-dir/1`) with mutual TLS. A device whose key is linked to the account logs in with the key alone. A password login from a new device links that device instead. A newer login closes the older session.
+- **Accounts.** The first login with a new name creates the account (if registration allows it) and links it to that device's key. Usernames are 1–32 letters or digits plus `. _ -`, not case-sensitive. New passwords need 10+ characters, can't contain the username, and can't be one repeated character. Passwords are stored as argon2id hashes (64 MiB, 3 passes by default); each hash records its own settings and is redone at the next password login if you change them. `users.json` is replaced atomically, so a crash can't corrupt it.
+- **Login.** Logins go over QUIC/TLS 1.3 (ALPN `tarion-dir/1`) with mutual TLS and a post-quantum hybrid key exchange (X25519MLKEM768). A device whose key is linked to the account logs in with the key alone. A password login from a new device links that device instead. A newer login closes the older session.
 - **Presence.** A user is online while their connection is open. Clients send keep-alives every 15 seconds, and the server drops a connection after 45 seconds of silence.
-- **Lookup.** The server returns the target's public chat address and key, and their LAN address only if both users share a public IP. It also tells the target to punch toward the requester.
+- **Lookup.** The server returns the target's public chat address and key, and their LAN address only if both users share a public IP. It also tells the target to punch toward the requester, including the requester's LAN address in that case.
 - **List.** The server returns the names of online users (not their addresses), capped at 500.
 
 ## Abuse limits
@@ -38,8 +68,48 @@ On startup it prints the **server ID**. Clients pin it the first time they conne
 - Password attempts: a burst of 10 per IP and 10 per account, refilling slowly.
 - Registrations: 3 per IP, then one every 10 minutes.
 - Requests: a burst of 30 per session, then 2 per second. Punch signals are limited per user pair.
-- At most 4 argon2id hashes are computed at once (each uses about 19 MiB).
+- At most 2 argon2id hashes are computed at once.
 - QUIC itself checks the sender's address before replying with much data, so the server can't be used to flood a faked address.
+
+## Running it for real
+
+### Docker (Linux host)
+
+```bash
+docker build -t tariond .
+docker run -d --name tariond --restart unless-stopped \
+  -p 63425:63425/udp -v tariond-data:/data tariond -registration invite
+docker logs tariond                 # shows the server ID
+docker exec tariond /tariond invite # operator commands
+```
+
+- Use a **Linux** host. Docker Desktop on Windows and macOS rewrites client source addresses, which breaks the addresses the server hands out and hole punching. On Linux, `-p ...:63425/udp` keeps the real addresses; `--network host` also works.
+- Keep the `/data` volume. Without it, a recreated container gets a new server key and every client refuses it.
+- The image runs as a non-root user with no shell.
+
+### systemd (Linux)
+
+[`deploy/tariond.service`](../deploy/tariond.service) is a hardened unit. Install steps are at the top of the file. Logs go to `journalctl -u tariond`.
+
+### Windows Server
+
+Run these in an elevated PowerShell. *These steps are documented but weren't run as part of testing.*
+
+```powershell
+New-Item -ItemType Directory -Force C:\tariond\data | Out-Null
+Copy-Item .\tariond.exe C:\tariond\
+New-NetFirewallRule -DisplayName "tariond" -Direction Inbound -Protocol UDP -LocalPort 63425 -Action Allow
+icacls C:\tariond\data /grant "NT AUTHORITY\LOCAL SERVICE:(OI)(CI)M"
+
+$action    = New-ScheduledTaskAction -Execute "cmd.exe" -Argument '/c C:\tariond\tariond.exe -data C:\tariond\data >> C:\tariond\data\tariond.log 2>&1'
+$trigger   = New-ScheduledTaskTrigger -AtStartup
+$principal = New-ScheduledTaskPrincipal -UserId "NT AUTHORITY\LOCAL SERVICE" -LogonType ServiceAccount
+$settings  = New-ScheduledTaskSettingsSet -ExecutionTimeLimit ([TimeSpan]::Zero) -RestartCount 3 -RestartInterval (New-TimeSpan -Minutes 1)
+Register-ScheduledTask -TaskName "tariond" -Action $action -Trigger $trigger -Principal $principal -Settings $settings
+Start-ScheduledTask -TaskName "tariond"
+```
+
+The server ID appears in `C:\tariond\data\tariond.log`. Run operator commands with `-data C:\tariond\data`.
 
 ## Upgrading from v1
 

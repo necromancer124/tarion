@@ -1,0 +1,50 @@
+# systemd unit for tariond. Install:
+#
+#   sudo useradd --system --home-dir /var/lib/tariond --shell /usr/sbin/nologin tariond
+#   sudo install -m 0755 tariond /usr/local/bin/tariond
+#   sudo cp tariond.service /etc/systemd/system/
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now tariond
+#   journalctl -u tariond -f            # logs, including the server ID
+#
+# Operator commands run as the same user so file ownership stays right:
+#   sudo -u tariond tariond invite -data /var/lib/tariond
+
+[Unit]
+Description=Tarion directory server
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=tariond
+Group=tariond
+ExecStart=/usr/local/bin/tariond -data /var/lib/tariond
+StateDirectory=tariond
+StateDirectoryMode=0700
+Restart=on-failure
+RestartSec=5
+
+# Hardening: tariond only needs UDP and its state directory.
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+SystemCallArchitectures=native
+CapabilityBoundingSet=
+AmbientCapabilities=
+
+[Install]
+WantedBy=multi-user.target

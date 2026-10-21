@@ -158,7 +158,6 @@ func TestOversizedMessageRefused(t *testing.T) {
 	}
 }
 
-
 func TestDuplicateMessageDeliveredOnce(t *testing.T) {
 	nm := NewNetworkManager(0, nil)
 	if !nm.markSeen("peer/1") {
