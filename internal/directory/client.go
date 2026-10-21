@@ -25,6 +25,7 @@ type ClientConfig struct {
 	User     string
 	Pass     string // optional once this device's key is bound to the account
 	ServerID string // pinned server key; empty means trust on first use
+	Invite   string // one-time code, needed only to register on an invite-only server
 
 	// OnServerID is called once when an unpinned server key is first seen,
 	// so the caller can persist the pin.
@@ -153,18 +154,19 @@ func (c *Client) session(ctx context.Context) (bool, error) {
 		stream, err := conn.AcceptStream(ctx)
 		if err != nil {
 			var appErr *quic.ApplicationError
-			if errors.As(err, &appErr) && appErr.Remote && appErr.ErrorCode == CodeReplaced {
-				return true, &FatalError{Msg: "logged in from another device; this session was closed"}
+			if errors.As(err, &appErr) && appErr.Remote {
+				switch appErr.ErrorCode {
+				case CodeReplaced:
+					return true, &FatalError{Msg: "logged in from another device; this session was closed"}
+				case CodeBanned:
+					return true, &FatalError{Msg: "banned from this server"}
+				}
 			}
 			return true, err
 		}
 		go c.handlePush(stream)
 	}
 }
-
-// CodeReplaced is the QUIC application error code tariond uses when a newer
-// login for the same account takes over.
-const CodeReplaced quic.ApplicationErrorCode = 3
 
 func (c *Client) dial(ctx context.Context) (*quic.Conn, error) {
 	host, _, err := net.SplitHostPort(c.cfg.Server)
@@ -238,23 +240,26 @@ func (c *Client) login(ctx context.Context, conn *quic.Conn) (Response, bool, er
 		if c.cfg.Pass == "" {
 			return resp, false, &FatalError{Msg: fmt.Sprintf("account %s does not exist; run once with -pass to create it", c.cfg.User)}
 		}
-		resp, err = roundTrip(ctx, conn, Request{Op: OpRegister, User: c.cfg.User, Pass: c.cfg.Pass, LocalAddrs: local})
+		resp, err = roundTrip(ctx, conn, Request{Op: OpRegister, User: c.cfg.User, Pass: c.cfg.Pass, Invite: c.cfg.Invite, LocalAddrs: local})
 		if err != nil {
 			return resp, false, err
 		}
 		if resp.OK {
 			return resp, true, nil
 		}
-		return resp, false, loginError(resp.Error)
+		if resp.Error == ErrRateLimited {
+			return resp, false, errors.New("rate limited by server")
+		}
+		return resp, false, loginError(resp)
 	case ErrRateLimited:
 		return resp, false, errors.New("rate limited by server")
 	default:
-		return resp, false, loginError(resp.Error)
+		return resp, false, loginError(resp)
 	}
 }
 
-func loginError(code string) error {
-	switch code {
+func loginError(resp Response) error {
+	switch resp.Error {
 	case ErrAuthFailed:
 		return &FatalError{Msg: "wrong password"}
 	case ErrPasswordRequired:
@@ -262,11 +267,23 @@ func loginError(code string) error {
 	case ErrInvalidName:
 		return &FatalError{Msg: "invalid username (1-32 letters/digits, may contain . _ -)"}
 	case ErrWeakPassword:
-		return &FatalError{Msg: fmt.Sprintf("password must be %d-%d characters", MinPasswordLen, MaxPasswordLen)}
+		msg := "password rejected"
+		if resp.Detail != "" {
+			msg += ": " + resp.Detail
+		}
+		return &FatalError{Msg: msg}
 	case ErrNameTaken:
 		return &FatalError{Msg: "username already taken"}
+	case ErrBanned:
+		return &FatalError{Msg: "banned from this server"}
+	case ErrInviteRequired:
+		return &FatalError{Msg: "this server is invite-only; run once with -invite CODE (ask the operator for a code)"}
+	case ErrBadInvite:
+		return &FatalError{Msg: "invite code is wrong or already used"}
+	case ErrRegistrationOff:
+		return &FatalError{Msg: "this server is not accepting new accounts"}
 	}
-	return &FatalError{Msg: "login refused: " + code}
+	return &FatalError{Msg: "login refused: " + resp.Error}
 }
 
 // List returns the names of online users (not including you).

@@ -102,14 +102,16 @@ func startNode(cfg *storage.Config, id *identity.Identity) (*node, error) {
 			Server:   cfg.ServerAddr,
 			User:     cfg.Username,
 			Pass:     cfg.Password,
+			Invite:   cfg.Invite,
 			ServerID: cfg.ServerID,
 			OnServerID: func(id string) {
 				_ = storage.UpdateConfig(func(c *storage.Config) { c.ServerID = id })
 			},
 			OnLoggedIn: func(usedPassword bool) {
 				if usedPassword {
-					// The account now trusts this device's key; stop keeping the password.
-					_ = storage.UpdateConfig(func(c *storage.Config) { c.Password = "" })
+					// The account now trusts this device's key; stop keeping the
+					// password, and the invite code is spent.
+					_ = storage.UpdateConfig(func(c *storage.Config) { c.Password, c.Invite = "", "" })
 				}
 			},
 		})
@@ -863,8 +865,8 @@ func setStopUsage(fs *flag.FlagSet) {
 
 // clientFlags are the settings shared by start, menu and background.
 type clientFlags struct {
-	port, ctrl         *int
-	server, user, pass *string
+	port, ctrl                 *int
+	server, user, pass, invite *string
 }
 
 func addClientFlags(fs *flag.FlagSet) clientFlags {
@@ -874,6 +876,7 @@ func addClientFlags(fs *flag.FlagSet) clientFlags {
 		server: fs.String("server", "", fmt.Sprintf("directory server host:port (tariond default port %d)", directory.DefaultServerPort)),
 		user:   fs.String("user", "", "directory username"),
 		pass:   fs.String("pass", "", "directory password (only needed the first time on this device)"),
+		invite: fs.String("invite", "", "one-time invite code, if the server is invite-only"),
 	}
 }
 
@@ -887,6 +890,9 @@ func (f clientFlags) apply(cfg *storage.Config) error {
 	}
 	if *f.pass != "" {
 		cfg.Password = *f.pass
+	}
+	if f.invite != nil && *f.invite != "" {
+		cfg.Invite = *f.invite
 	}
 	if *f.port != 0 {
 		cfg.Port = *f.port

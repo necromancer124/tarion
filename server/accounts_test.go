@@ -22,6 +22,7 @@ func TestCreateLoginAndKeyLogin(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	a.SetArgon(testArgon)
 	if _, err := a.Create("Alice", "secret1", "key1"); err != nil {
 		t.Fatal(err)
 	}
@@ -77,6 +78,7 @@ func TestLegacyImportDropsInjectedDuplicatesAndUpgrades(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	a.SetArgon(testArgon)
 	if _, _, err := a.LoginWithPassword("bob", "evilpw", "k"); !errors.Is(err, errNoSuchUser) {
 		t.Fatalf("injected bob must be dropped, got %v", err)
 	}
@@ -94,7 +96,7 @@ func TestLegacyImportDropsInjectedDuplicatesAndUpgrades(t *testing.T) {
 
 func TestVerifyPasswordRejectsGarbage(t *testing.T) {
 	for _, stored := range []string{"", "argon2id$x", "sha256$a", "md5$a$b"} {
-		if ok, _ := verifyPassword(stored, "pw"); ok {
+		if ok, _ := verifyPassword(stored, "pw", DefaultArgon); ok {
 			t.Fatalf("garbage hash %q accepted", stored)
 		}
 	}
@@ -120,5 +122,47 @@ func TestLimiter(t *testing.T) {
 	fast.sweep()
 	if len(fast.buckets) != 0 && fast.buckets["x"].tokens >= 1 {
 		t.Fatal("sweep should drop full buckets")
+	}
+}
+
+func TestHashUpgradesWhenCostChanges(t *testing.T) {
+	a, err := LoadAccounts(filepath.Join(t.TempDir(), "users.json"), "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	a.SetArgon(testArgon)
+	if _, err := a.Create("alice", "correct-horse-1", "k"); err != nil {
+		t.Fatal(err)
+	}
+	stronger := argonParams{MemoryKiB: 2048, Time: 2, Threads: 1}
+	a.SetArgon(stronger)
+	if _, _, err := a.LoginWithPassword("alice", "correct-horse-1", "k"); err != nil {
+		t.Fatal(err)
+	}
+	u, _ := a.get("alice")
+	if !strings.HasPrefix(u.Hash, "argon2id$2048$2$1$") {
+		t.Fatalf("hash not upgraded to new cost: %s", u.Hash)
+	}
+	if ok, upgrade := verifyPassword(u.Hash, "correct-horse-1", stronger); !ok || upgrade {
+		t.Fatalf("upgraded hash: ok=%v upgrade=%v", ok, upgrade)
+	}
+}
+
+func TestPasswordProblem(t *testing.T) {
+	for _, tc := range []struct {
+		user, pass string
+		bad        bool
+	}{
+		{"alice", "correct-horse-1", false},
+		{"alice", "short", true},
+		{"alice", "ALICE-rocks-99", true},
+		{"alice", "aaaaaaaaaaaa", true},
+		{"alice", "שששששששששששש", true},
+		{"alice", "", true},
+		{"al", "al-is-fine-123", false},
+	} {
+		if got := passwordProblem(tc.user, tc.pass, 10); (got != "") != tc.bad {
+			t.Errorf("%q/%q: %q", tc.user, tc.pass, got)
+		}
 	}
 }

@@ -46,15 +46,54 @@ type accountsFile struct {
 // Accounts is the user database, saved as JSON with atomic replace so a
 // crash mid-write cannot lose it, and so no field can inject a record.
 type Accounts struct {
-	mu    sync.Mutex
-	path  string
-	byKey map[string]*account
+	mu     sync.Mutex
+	path   string
+	byKey  map[string]*account
+	params argonParams
+}
+
+// argonParams is the argon2id cost for new hashes. Each hash records its
+// own parameters, so changing these never breaks existing passwords; a
+// hash made with different ones is redone at the next password login.
+type argonParams struct {
+	MemoryKiB uint32
+	Time      uint32
+	Threads   uint8
+}
+
+// DefaultArgon is stronger than OWASP's 19 MiB/2-pass minimum. Hashing only
+// happens on registration and password logins (key logins skip it).
+var DefaultArgon = argonParams{MemoryKiB: 64 * 1024, Time: 3, Threads: 1}
+
+// SetArgon changes the cost used for new hashes.
+func (a *Accounts) SetArgon(p argonParams) {
+	a.mu.Lock()
+	a.params = p
+	a.mu.Unlock()
+}
+
+func (a *Accounts) argon() argonParams {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return a.params
+}
+
+// Accounts lists all accounts, sorted by name.
+func (a *Accounts) List() []account {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	out := make([]account, 0, len(a.byKey))
+	for _, u := range a.byKey {
+		out = append(out, *u)
+	}
+	sort.Slice(out, func(i, j int) bool { return directory.NameKey(out[i].Name) < directory.NameKey(out[j].Name) })
+	return out
 }
 
 // LoadAccounts reads path. If it does not exist yet and legacyPath (the old
 // "name:salt:sha256" users.db) does, those accounts are imported.
 func LoadAccounts(path, legacyPath string) (*Accounts, error) {
-	a := &Accounts{path: path, byKey: map[string]*account{}}
+	a := &Accounts{path: path, byKey: map[string]*account{}, params: DefaultArgon}
 	data, err := os.ReadFile(path)
 	switch {
 	case err == nil:
@@ -182,7 +221,7 @@ func (a *Accounts) Create(name, pass, peerID string) (string, error) {
 	if _, ok := a.get(name); ok {
 		return "", errNameTaken
 	}
-	hash, err := hashPassword(pass) // slow on purpose; done outside the lock
+	hash, err := hashPassword(pass, a.argon()) // slow on purpose; done outside the lock
 	if err != nil {
 		return "", err
 	}
@@ -204,13 +243,14 @@ func (a *Accounts) LoginWithPassword(name, pass, peerID string) (string, bool, e
 	if !ok {
 		return "", false, errNoSuchUser
 	}
-	match, legacy := verifyPassword(u.Hash, pass)
+	params := a.argon()
+	match, upgrade := verifyPassword(u.Hash, pass, params)
 	if !match {
 		return "", false, errAuthFailed
 	}
 	var newHash string
-	if legacy {
-		h, err := hashPassword(pass)
+	if upgrade {
+		h, err := hashPassword(pass, params)
 		if err != nil {
 			return "", false, err
 		}
@@ -247,28 +287,22 @@ func (a *Accounts) LoginWithKey(name, peerID string) (string, error) {
 	return u.Name, nil
 }
 
-// argon2id parameters (OWASP minimum: 19 MiB, 2 passes, 1 lane).
-const (
-	argonTime    = 2
-	argonMemory  = 19 * 1024
-	argonThreads = 1
-	argonKeyLen  = 32
-)
+const argonKeyLen = 32
 
 var b64 = base64.RawStdEncoding
 
-func hashPassword(pass string) (string, error) {
+func hashPassword(pass string, p argonParams) (string, error) {
 	salt := make([]byte, 16)
 	if _, err := rand.Read(salt); err != nil {
 		return "", err
 	}
-	sum := argon2.IDKey([]byte(pass), salt, argonTime, argonMemory, argonThreads, argonKeyLen)
-	return fmt.Sprintf("argon2id$%d$%d$%d$%s$%s", argonMemory, argonTime, argonThreads, b64.EncodeToString(salt), b64.EncodeToString(sum)), nil
+	sum := argon2.IDKey([]byte(pass), salt, p.Time, p.MemoryKiB, p.Threads, argonKeyLen)
+	return fmt.Sprintf("argon2id$%d$%d$%d$%s$%s", p.MemoryKiB, p.Time, p.Threads, b64.EncodeToString(salt), b64.EncodeToString(sum)), nil
 }
 
-// verifyPassword compares in constant time. legacy is true for an old
-// SHA-256 hash that should be upgraded.
-func verifyPassword(stored, pass string) (match, legacy bool) {
+// verifyPassword compares in constant time. upgrade is true when the hash
+// should be redone: an old SHA-256 hash, or argon2id with other parameters.
+func verifyPassword(stored, pass string, want argonParams) (match, upgrade bool) {
 	parts := strings.Split(stored, "$")
 	switch {
 	case len(parts) == 6 && parts[0] == "argon2id":
@@ -278,12 +312,13 @@ func verifyPassword(stored, pass string) (match, legacy bool) {
 			return false, false
 		}
 		salt, err1 := b64.DecodeString(parts[4])
-		want, err2 := b64.DecodeString(parts[5])
+		sum, err2 := b64.DecodeString(parts[5])
 		if err1 != nil || err2 != nil {
 			return false, false
 		}
-		got := argon2.IDKey([]byte(pass), salt, t, mem, threads, uint32(len(want)))
-		return subtle.ConstantTimeCompare(got, want) == 1, false
+		got := argon2.IDKey([]byte(pass), salt, t, mem, threads, uint32(len(sum)))
+		ok := subtle.ConstantTimeCompare(got, sum) == 1
+		return ok, ok && (mem != want.MemoryKiB || t != want.Time || threads != want.Threads)
 	case len(parts) == 3 && parts[0] == "sha256":
 		sum := sha256.Sum256([]byte(parts[1] + ":" + pass))
 		got := hex.EncodeToString(sum[:])

@@ -26,7 +26,15 @@ func freePort(t *testing.T) int {
 	return c.LocalAddr().(*net.UDPAddr).Port
 }
 
+// testArgon keeps tests fast; production defaults are much heavier.
+var testArgon = argonParams{MemoryKiB: 1024, Time: 1, Threads: 1}
+
 func startServer(t *testing.T) (string, *identity.Identity) {
+	t.Helper()
+	return startServerWith(t, DefaultOptions())
+}
+
+func startServerWith(t *testing.T, opts Options) (string, *identity.Identity) {
 	t.Helper()
 	id, _ := identity.Generate()
 	accounts, err := LoadAccounts(filepath.Join(t.TempDir(), "users.json"), "")
@@ -39,7 +47,8 @@ func startServer(t *testing.T) (string, *identity.Identity) {
 		t.Fatal(err)
 	}
 	tr := &quic.Transport{Conn: udp}
-	srv := NewServer(id, accounts)
+	accounts.SetArgon(testArgon)
+	srv := NewServer(id, accounts, opts)
 	ln, err := tr.Listen(srv.TLSConfig(), QUICConfig())
 	if err != nil {
 		t.Fatal(err)
@@ -62,6 +71,11 @@ type testClient struct {
 
 func startClient(t *testing.T, server, user, pass, serverID string, id *identity.Identity) *testClient {
 	t.Helper()
+	return startClientInvite(t, server, user, pass, serverID, "", id)
+}
+
+func startClientInvite(t *testing.T, server, user, pass, serverID, invite string, id *identity.Identity) *testClient {
+	t.Helper()
 	if id == nil {
 		id, _ = identity.Generate()
 	}
@@ -71,7 +85,7 @@ func startClient(t *testing.T, server, user, pass, serverID string, id *identity
 	}
 	tc := &testClient{nm: nm}
 	tc.dir = directory.NewClient(nm, directory.ClientConfig{
-		Server: server, User: user, Pass: pass, ServerID: serverID,
+		Server: server, User: user, Pass: pass, ServerID: serverID, Invite: invite,
 		OnServerID: func(id string) { tc.mu.Lock(); tc.serverID = id; tc.mu.Unlock() },
 		OnLoggedIn: func(used bool) { tc.mu.Lock(); tc.loggedIn = append(tc.loggedIn, used); tc.mu.Unlock() },
 		OnPunch:    func(p directory.Push) { tc.mu.Lock(); tc.punches = append(tc.punches, p); tc.mu.Unlock() },
@@ -97,8 +111,8 @@ func waitFor(t *testing.T, what string, cond func() bool) {
 
 func TestDirectoryEndToEnd(t *testing.T) {
 	server, serverID := startServer(t)
-	alice := startClient(t, server, "alice", "alicepw", "", nil)
-	bob := startClient(t, server, "bob", "bobpw1", "", nil)
+	alice := startClient(t, server, "alice", "correct-horse-1", "", nil)
+	bob := startClient(t, server, "bob", "battery-staple-2", "", nil)
 	waitFor(t, "alice online", alice.dir.Connected)
 	waitFor(t, "bob online", bob.dir.Connected)
 
@@ -166,7 +180,7 @@ func TestDirectoryEndToEnd(t *testing.T) {
 func TestKeyLoginWithoutPassword(t *testing.T) {
 	server, _ := startServer(t)
 	id, _ := identity.Generate()
-	first := startClient(t, server, "alice", "alicepw", "", id)
+	first := startClient(t, server, "alice", "correct-horse-1", "", id)
 	waitFor(t, "first login", first.dir.Connected)
 	first.cancel()
 	first.nm.Close()
@@ -182,7 +196,7 @@ func TestKeyLoginWithoutPassword(t *testing.T) {
 
 func TestWrongPasswordAndBadNames(t *testing.T) {
 	server, _ := startServer(t)
-	owner := startClient(t, server, "alice", "alicepw", "", nil)
+	owner := startClient(t, server, "alice", "correct-horse-1", "", nil)
 	waitFor(t, "owner", owner.dir.Connected)
 
 	thief := startClient(t, server, "alice", "guess123", "", nil)
@@ -192,13 +206,16 @@ func TestWrongPasswordAndBadNames(t *testing.T) {
 	waitFor(t, "invalid name", func() bool { return strings.Contains(injected.dir.Status(), "invalid username") })
 
 	short := startClient(t, server, "carol", "123", "", nil)
-	waitFor(t, "weak password", func() bool { return strings.Contains(short.dir.Status(), "password must be") })
+	waitFor(t, "weak password", func() bool { return strings.Contains(short.dir.Status(), "at least 10 characters") })
+
+	named := startClient(t, server, "dave", "dave-is-great", "", nil)
+	waitFor(t, "password with username", func() bool { return strings.Contains(named.dir.Status(), "must not contain your username") })
 }
 
 func TestServerKeyPinMismatch(t *testing.T) {
 	server, _ := startServer(t)
 	other, _ := identity.Generate()
-	c := startClient(t, server, "alice", "alicepw", other.ID, nil)
+	c := startClient(t, server, "alice", "correct-horse-1", other.ID, nil)
 	waitFor(t, "pin mismatch", func() bool { return strings.Contains(c.dir.Status(), "server key changed") })
 	if c.dir.Connected() {
 		t.Fatal("must not connect to a server with the wrong key")
@@ -208,7 +225,7 @@ func TestServerKeyPinMismatch(t *testing.T) {
 func TestSecondLoginReplacesFirst(t *testing.T) {
 	server, _ := startServer(t)
 	id, _ := identity.Generate()
-	a := startClient(t, server, "alice", "alicepw", "", id)
+	a := startClient(t, server, "alice", "correct-horse-1", "", id)
 	waitFor(t, "first", a.dir.Connected)
 	b := startClient(t, server, "alice", "", "", id)
 	waitFor(t, "second", b.dir.Connected)

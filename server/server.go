@@ -24,14 +24,29 @@ const (
 
 	maxConns         = 10000
 	maxConnsPerIP    = 16
-	maxHashingAtOnce = 4 // argon2id uses ~19 MiB per hash
+	maxHashingAtOnce = 2 // argon2id uses ~64 MiB per hash by default
 )
+
+// Options are the operator's access rules.
+type Options struct {
+	Registration string // RegOpen, RegInvite or RegClosed
+	InvitesDir   string // one file per unused invite code
+	BansPath     string // usernames / peer IDs, re-read when changed
+	MinPassword  int
+}
+
+func DefaultOptions() Options {
+	return Options{Registration: RegOpen, MinPassword: directory.DefaultMinPassword}
+}
 
 // Server is tariond: it tracks who is online and where, and tells peers to
 // punch toward each other. It never relays chat messages.
 type Server struct {
 	id       *identity.Identity
 	accounts *Accounts
+	opts     Options
+	bans     *banList
+	invites  invites
 
 	mu         sync.Mutex
 	sessions   map[string]*session // account key -> live session
@@ -66,10 +81,19 @@ func (s *session) loggedIn() (string, []string) {
 	return s.user, s.localAddrs
 }
 
-func NewServer(id *identity.Identity, accounts *Accounts) *Server {
+func NewServer(id *identity.Identity, accounts *Accounts, opts Options) *Server {
+	if opts.Registration == "" {
+		opts.Registration = RegOpen
+	}
+	if opts.MinPassword < 1 {
+		opts.MinPassword = directory.DefaultMinPassword
+	}
 	return &Server{
 		id:         id,
 		accounts:   accounts,
+		opts:       opts,
+		bans:       newBanList(opts.BansPath),
+		invites:    invites{dir: opts.InvitesDir},
 		sessions:   map[string]*session{},
 		connsPerIP: map[string]int{},
 		connLimit:  newLimiter(2*time.Second, 20),
@@ -106,6 +130,13 @@ func (s *Server) Serve(ln *quic.Listener) error {
 		for range time.Tick(time.Minute) {
 			for _, l := range []*limiter{s.connLimit, s.authLimit, s.userLimit, s.regLimit, s.reqLimit, s.punchLimit} {
 				l.sweep()
+			}
+		}
+	}()
+	go func() {
+		for range time.Tick(2 * time.Second) {
+			if s.bans.refresh() {
+				s.kickBanned()
 			}
 		}
 	}()
@@ -229,18 +260,38 @@ func (s *Server) register(sess *session, req directory.Request) directory.Respon
 	if user, _ := sess.loggedIn(); user != "" {
 		return fail(directory.ErrBadRequest)
 	}
+	if s.opts.Registration == RegClosed {
+		return fail(directory.ErrRegistrationOff)
+	}
 	if !directory.ValidUsername(req.User) {
 		return fail(directory.ErrInvalidName)
 	}
-	if len(req.Pass) < directory.MinPasswordLen || len(req.Pass) > directory.MaxPasswordLen {
-		return fail(directory.ErrWeakPassword)
+	if s.bans.Banned(req.User, sess.peerID) {
+		return fail(directory.ErrBanned)
+	}
+	if problem := passwordProblem(req.User, req.Pass, s.opts.MinPassword); problem != "" {
+		return directory.Response{Error: directory.ErrWeakPassword, Detail: problem}
+	}
+	if s.opts.Registration == RegInvite && req.Invite == "" {
+		return fail(directory.ErrInviteRequired)
 	}
 	if !s.regLimit.Allow(sess.ip) {
 		return fail(directory.ErrRateLimited)
 	}
+	if _, taken := s.accounts.get(req.User); taken {
+		return fail(directory.ErrNameTaken)
+	}
+	if s.opts.Registration == RegInvite {
+		if !s.invites.Consume(req.Invite) {
+			return fail(directory.ErrBadInvite)
+		}
+	}
 	s.hashing <- struct{}{}
 	name, err := s.accounts.Create(req.User, req.Pass, sess.peerID)
 	<-s.hashing
+	if err != nil && s.opts.Registration == RegInvite {
+		s.invites.Restore(req.Invite)
+	}
 	switch {
 	case errors.Is(err, errNameTaken):
 		return fail(directory.ErrNameTaken)
@@ -258,6 +309,9 @@ func (s *Server) login(sess *session, req directory.Request) directory.Response 
 	}
 	if !directory.ValidUsername(req.User) {
 		return fail(directory.ErrNoSuchUser)
+	}
+	if s.bans.Banned(req.User, sess.peerID) {
+		return fail(directory.ErrBanned)
 	}
 	var name string
 	var err error
@@ -358,6 +412,9 @@ func (s *Server) lookup(sess *session, req directory.Request) directory.Response
 		return fail(directory.ErrOffline)
 	}
 	targetName, targetLocal := target.loggedIn()
+	if s.bans.Banned(targetName, target.peerID) {
+		return fail(directory.ErrOffline)
+	}
 	resp := directory.Response{OK: true, User: targetName, Addr: target.addr, PeerID: target.peerID}
 	// LAN addresses only help (and are only shared) when both are behind the
 	// same public IP, where dialing the public address needs NAT hairpinning.
@@ -384,4 +441,21 @@ func (s *Server) pushPunch(target *session, push directory.Push) {
 	_ = stream.SetDeadline(time.Now().Add(5 * time.Second))
 	_ = wire.WriteFrame(stream, push)
 	_ = stream.Close()
+}
+
+// kickBanned closes the sessions of users or keys that were just banned.
+func (s *Server) kickBanned() {
+	s.mu.Lock()
+	var kick []*session
+	for _, sess := range s.sessions {
+		if name, _ := sess.loggedIn(); s.bans.Banned(name, sess.peerID) {
+			kick = append(kick, sess)
+		}
+	}
+	s.mu.Unlock()
+	for _, sess := range kick {
+		name, _ := sess.loggedIn()
+		log.Printf("banned: disconnecting %s", name)
+		_ = sess.conn.CloseWithError(directory.CodeBanned, "banned")
+	}
 }
