@@ -140,8 +140,17 @@ func TestConnectionIsReused(t *testing.T) {
 
 func TestBusyReceiverRejects(t *testing.T) {
 	alice, _ := startPeer(t)
-	bob, bobAddr := startPeer(t)
+	// The receive queue must be swapped before the listener starts: its
+	// goroutines read the field, and nothing would order this write with them.
+	bobID, _ := identity.Generate()
+	port := freeUDPPort(t)
+	bob := NewNetworkManager(port, bobID)
 	bob.MessageChan = make(chan IncomingMessage) // nobody reads it
+	if err := bob.StartListener(); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = bob.Close() })
+	bobAddr := fmt.Sprintf("127.0.0.1:%d", port)
 
 	_, err := alice.Send(bobAddr, "alice", "dropped?", nil)
 	var rejected *RejectedError
