@@ -33,8 +33,12 @@ const (
 	maxIDBytes     = 64
 	maxActiveConns = 256
 	sendTimeout    = 10 * time.Second
-	seenTTL        = 10 * time.Minute
-	maxSeen        = 4096
+	// A cached connection may have died silently (a router forgot its UDP
+	// mapping, or the peer restarted). Give it only this long before
+	// redialing, so the fresh attempt still has most of the deadline.
+	cachedAttemptTimeout = 3 * time.Second
+	seenTTL              = 10 * time.Minute
+	maxSeen              = 4096
 )
 
 const (
@@ -49,6 +53,9 @@ const (
 type NetworkManager struct {
 	Port        int
 	MessageChan chan IncomingMessage
+	// Accept, if set before StartListener, is asked about every incoming
+	// message's sender key; an error refuses the message (the sender sees it).
+	Accept func(peerID string) error
 
 	id       *identity.Identity
 	udp      *net.UDPConn
@@ -97,7 +104,9 @@ func (nm *NetworkManager) ID() string { return nm.id.ID }
 
 func quicConfig() *quic.Config {
 	return &quic.Config{
-		MaxIdleTimeout:     3 * time.Minute,
+		// Home routers typically forget an idle UDP mapping after ~30s; close
+		// idle chat connections before that so we never reuse a dead one.
+		MaxIdleTimeout:     25 * time.Second,
 		MaxIncomingStreams: 32,
 	}
 }
@@ -119,9 +128,11 @@ func (nm *NetworkManager) clientTLS() *tls.Config {
 		// (see Send's verify callback), not by a certificate chain.
 		InsecureSkipVerify:    true,
 		VerifyPeerCertificate: identity.VerifyPeerCertificate,
-		ServerName:            "tarion",
-		NextProtos:            []string{ALPN},
-		MinVersion:            tls.VersionTLS13,
+		// No ServerName: QUIC handshakes are readable on the wire, and a fixed
+		// SNI would let any firewall fingerprint Tarion. quic-go falls back to
+		// the IP literal, for which no SNI is sent.
+		NextProtos: []string{ALPN},
+		MinVersion: tls.VersionTLS13,
 	}
 }
 
@@ -211,6 +222,14 @@ func (nm *NetworkManager) handleStream(conn *quic.Conn, peerID string, stream *q
 		reply.Type, reply.Error = "nack", err.Error()
 		_ = wire.WriteFrame(stream, reply)
 		return
+	}
+
+	if nm.Accept != nil {
+		if err := nm.Accept(peerID); err != nil {
+			reply.Type, reply.Error = "nack", err.Error()
+			_ = wire.WriteFrame(stream, reply)
+			return
+		}
 	}
 
 	// A sender may retry after a lost ack; deliver each message ID only once.
@@ -312,8 +331,8 @@ func (nm *NetworkManager) SendContext(ctx context.Context, peerAddr, from, body 
 	}
 	env := envelope{V: ProtocolVersion, Type: "msg", ID: newMessageID(), TS: time.Now().Unix(), From: from, Body: body}
 
-	// The first attempt may use a cached connection that has silently died
-	// (for example the peer restarted); retry once on a fresh one.
+	// The first attempt may use a cached connection that has silently died;
+	// retry once on a fresh one.
 	var lastErr error
 	for attempt := 0; attempt < 2; attempt++ {
 		conn, cached, err := nm.conn(ctx, peerAddr, attempt > 0)
@@ -331,7 +350,14 @@ func (nm *NetworkManager) SendContext(ctx context.Context, peerAddr, from, body 
 				return peerID, err
 			}
 		}
-		lastErr = sendOnStream(ctx, conn, env)
+		attemptCtx, cancelAttempt := ctx, context.CancelFunc(func() {})
+		if cached {
+			attemptCtx, cancelAttempt = context.WithTimeout(ctx, cachedAttemptTimeout)
+		}
+		// Retrying reuses env.ID, so the receiver drops a duplicate if the
+		// first attempt did arrive and only its ack was lost.
+		lastErr = sendOnStream(attemptCtx, conn, env)
+		cancelAttempt()
 		if lastErr == nil {
 			return peerID, nil
 		}

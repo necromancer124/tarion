@@ -73,6 +73,10 @@ type Push struct {
 	From   string `json:"from,omitempty"`
 	PeerID string `json:"peer_id,omitempty"`
 	Addr   string `json:"addr,omitempty"`
+	// LocalAddrs is the requester's LAN address, sent only when both are
+	// behind the same public IP: the requester dials that first, so the
+	// target must open its firewall toward it too.
+	LocalAddrs []string `json:"local_addrs,omitempty"`
 }
 
 const PushPunch = "punch"

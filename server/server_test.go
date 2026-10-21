@@ -133,6 +133,11 @@ func TestDirectoryEndToEnd(t *testing.T) {
 	if p.From != "alice" || p.PeerID != alice.nm.ID() || p.Addr != fmt.Sprintf("127.0.0.1:%d", alice.nm.Port) {
 		t.Fatalf("punch: %+v", p)
 	}
+	// Same public IP (both on 127.0.0.1): bob is also told alice's LAN
+	// address, which is the one alice dials first.
+	if fmt.Sprint(p.LocalAddrs) != fmt.Sprint(alice.nm.LocalAddrs()) {
+		t.Fatalf("punch LAN addrs %v, want %v", p.LocalAddrs, alice.nm.LocalAddrs())
+	}
 
 	// The address really is bob's chat listener: a message gets through,
 	// verified against the key the directory reported.

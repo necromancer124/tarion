@@ -355,6 +355,14 @@ func (c *Client) handlePush(stream *quic.Stream) {
 	if recent {
 		return
 	}
+	// LAN addresses first: on a shared router that is the path the
+	// requester tries first, and punching it opens our host firewall.
+	for i, a := range push.LocalAddrs {
+		if i == MaxLocalAddrs {
+			break
+		}
+		_ = c.nm.Punch(a)
+	}
 	_ = c.nm.Punch(push.Addr)
 	if c.cfg.OnPunch != nil {
 		c.cfg.OnPunch(push)

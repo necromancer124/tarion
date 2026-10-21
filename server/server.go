@@ -361,11 +361,13 @@ func (s *Server) lookup(sess *session, req directory.Request) directory.Response
 	resp := directory.Response{OK: true, User: targetName, Addr: target.addr, PeerID: target.peerID}
 	// LAN addresses only help (and are only shared) when both are behind the
 	// same public IP, where dialing the public address needs NAT hairpinning.
+	push := directory.Push{Type: directory.PushPunch, From: user, PeerID: sess.peerID, Addr: sess.addr}
 	if target.ip == sess.ip {
 		resp.LocalAddrs = targetLocal
+		_, push.LocalAddrs = sess.loggedIn()
 	}
 	if s.punchLimit.Allow(sess.id + ">" + target.id) {
-		go s.pushPunch(target, directory.Push{Type: directory.PushPunch, From: user, PeerID: sess.peerID, Addr: sess.addr})
+		go s.pushPunch(target, push)
 	}
 	return resp
 }
