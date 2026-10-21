@@ -32,8 +32,11 @@ type Config struct {
 	Port int `json:"port"`
 	// ControlPort is the local TCP port of the background process (default:
 	// Port+10000, or Port-10000 when that would exceed 65535).
-	ControlPort int       `json:"control_port,omitempty"`
-	Contacts    []Contact `json:"contacts"`
+	ControlPort int `json:"control_port,omitempty"`
+	// Accept is "anyone" (default) or "contacts": only keys in contacts or
+	// already pinned (people you messaged or who messaged you before).
+	Accept   string    `json:"accept,omitempty"`
+	Contacts []Contact `json:"contacts"`
 }
 
 // DefaultPort is the client's UDP port. It differs from the server's default

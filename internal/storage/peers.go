@@ -98,6 +98,20 @@ func PeerByName(name string) (Peer, bool) {
 	return Peer{}, false
 }
 
+// PeerByID returns the pinned peer for a key.
+func PeerByID(id string) (Peer, bool) {
+	peers, err := ListPeers()
+	if err != nil {
+		return Peer{}, false
+	}
+	for _, p := range peers {
+		if strings.EqualFold(p.ID, id) {
+			return p, true
+		}
+	}
+	return Peer{}, false
+}
+
 // ResolveIncoming picks the chat name for a message whose sender key was
 // proven by TLS. A known key keeps its pinned name whatever it claims now; a
 // new key that claims a name already pinned to someone else gets a visibly

@@ -14,6 +14,7 @@ import (
 	"os"
 	"os/signal"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -87,14 +88,79 @@ type node struct {
 	nm     *network.NetworkManager
 	dir    *directory.Client
 	cancel context.CancelFunc
+	events *hub
+}
+
+// controlEvent is one line of a `subscribe` stream.
+type controlEvent struct {
+	Type   string `json:"type"` // "message" or "status"
+	Chat   string `json:"chat,omitempty"`
+	PeerID string `json:"peer_id,omitempty"`
+	Body   string `json:"body,omitempty"`
+	Time   string `json:"time,omitempty"` // when it arrived, RFC 3339
+	Status string `json:"status,omitempty"`
+}
+
+// hub fans events out to local API subscribers. A subscriber that falls
+// behind loses events rather than slowing down the node.
+type hub struct {
+	mu   sync.Mutex
+	subs map[chan controlEvent]struct{}
+}
+
+const maxSubscribers = 16
+
+func (h *hub) subscribe() (chan controlEvent, func(), error) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if len(h.subs) >= maxSubscribers {
+		return nil, nil, errors.New("too many subscribers")
+	}
+	ch := make(chan controlEvent, 64)
+	h.subs[ch] = struct{}{}
+	return ch, func() {
+		h.mu.Lock()
+		delete(h.subs, ch)
+		h.mu.Unlock()
+	}, nil
+}
+
+func (h *hub) publish(ev controlEvent) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	for ch := range h.subs {
+		select {
+		case ch <- ev:
+		default:
+		}
+	}
+}
+
+// acceptFor returns the incoming-message filter for cfg.Accept.
+func acceptFor(cfg *storage.Config) func(peerID string) error {
+	if cfg.Accept != "contacts" {
+		return nil
+	}
+	return func(peerID string) error {
+		for _, c := range cfg.Contacts {
+			if strings.EqualFold(strings.ReplaceAll(c.ID, " ", ""), peerID) {
+				return nil
+			}
+		}
+		if _, ok := storage.PeerByID(peerID); ok {
+			return nil
+		}
+		return errors.New("this user only accepts messages from contacts")
+	}
 }
 
 func startNode(cfg *storage.Config, id *identity.Identity) (*node, error) {
 	nm := network.NewNetworkManager(cfg.Port, id)
+	nm.Accept = acceptFor(cfg)
 	if err := nm.StartListener(); err != nil {
 		return nil, err
 	}
-	n := &node{cfg: cfg, nm: nm, cancel: func() {}}
+	n := &node{cfg: cfg, nm: nm, cancel: func() {}, events: &hub{subs: map[chan controlEvent]struct{}{}}}
 	if cfg.ServerAddr != "" && cfg.Username != "" {
 		ctx, cancel := context.WithCancel(context.Background())
 		n.cancel = cancel
@@ -118,6 +184,35 @@ func startNode(cfg *storage.Config, id *identity.Identity) (*node, error) {
 		go n.dir.Run(ctx)
 	}
 	return n, nil
+}
+
+// serveIncoming records each incoming message and tells subscribers. The
+// TUI reads MessageChan itself; the background process uses this.
+func (n *node) serveIncoming(log func(chat string, msg network.IncomingMessage)) {
+	for msg := range n.nm.MessageChan {
+		chat, _ := recordIncoming(msg)
+		n.events.publish(controlEvent{Type: "message", Chat: chat, PeerID: msg.PeerID, Body: msg.Body, Time: time.Now().Format(time.RFC3339)})
+		if log != nil {
+			log(chat, msg)
+		}
+	}
+}
+
+// watchStatus publishes server status changes.
+func (n *node) watchStatus(log func(string)) {
+	if n.dir == nil {
+		return
+	}
+	last := ""
+	for range time.Tick(2 * time.Second) {
+		if s := n.dir.Status(); s != last {
+			last = s
+			n.events.publish(controlEvent{Type: "status", Status: s})
+			if log != nil {
+				log(s)
+			}
+		}
+	}
 }
 
 func (n *node) close() {
@@ -215,12 +310,15 @@ func (n *node) deliver(to, addr, body string) error {
 	return lastErr
 }
 
+// The local API: one JSON object per line over TCP on 127.0.0.1, each
+// request carrying the token from control.token. See docs/local-api.md.
 type controlRequest struct {
 	Token string `json:"token"`
 	Cmd   string `json:"cmd"`
 	To    string `json:"to,omitempty"`
 	Addr  string `json:"addr,omitempty"`
 	Body  string `json:"body,omitempty"`
+	Limit int    `json:"limit,omitempty"`
 }
 
 type controlResponse struct {
@@ -228,6 +326,7 @@ type controlResponse struct {
 	Error  string   `json:"error,omitempty"`
 	Status string   `json:"status,omitempty"`
 	Users  []string `json:"users,omitempty"`
+	Lines  []string `json:"lines,omitempty"`
 }
 
 const maxControlRequest = 64 * 1024
@@ -309,6 +408,43 @@ func backgroundRequest(cfg *storage.Config, req controlRequest) error {
 	return err
 }
 
+// subscribeControl streams events from the background process until
+// onEvent returns false or the connection ends.
+func subscribeControl(cfg *storage.Config, onEvent func(controlEvent) bool) error {
+	token := readControlToken()
+	if token == "" {
+		return errors.New("background not running (no control token)")
+	}
+	conn, err := net.DialTimeout("tcp", controlAddr(cfg), time.Second)
+	if err != nil {
+		return err
+	}
+	defer conn.Close()
+	if err := json.NewEncoder(conn).Encode(controlRequest{Token: token, Cmd: "subscribe"}); err != nil {
+		return err
+	}
+	dec := json.NewDecoder(conn)
+	var first controlResponse
+	if err := dec.Decode(&first); err != nil {
+		return err
+	}
+	if !first.OK {
+		return errors.New(first.Error)
+	}
+	if first.Status != "" && !onEvent(controlEvent{Type: "status", Status: first.Status}) {
+		return nil
+	}
+	for {
+		var ev controlEvent
+		if err := dec.Decode(&ev); err != nil {
+			return err
+		}
+		if !onEvent(ev) {
+			return nil
+		}
+	}
+}
+
 func backgroundRunning(cfg *storage.Config) bool {
 	return backgroundRequest(cfg, controlRequest{Cmd: "ping"}) == nil
 }
@@ -366,6 +502,37 @@ func handleControlConn(conn net.Conn, token string, n *node) {
 	case "online":
 		status, users := n.directoryStatus()
 		send(controlResponse{OK: true, Status: status, Users: users})
+	case "history":
+		if req.To == "" {
+			reply(errors.New(`history needs "to"`))
+			return
+		}
+		lines, err := storage.ReadHistory(req.To)
+		if err != nil {
+			reply(err)
+			return
+		}
+		if req.Limit > 0 && len(lines) > req.Limit {
+			lines = lines[len(lines)-req.Limit:]
+		}
+		send(controlResponse{OK: true, Lines: lines})
+	case "subscribe":
+		events, unsubscribe, err := n.events.subscribe()
+		if err != nil {
+			reply(err)
+			return
+		}
+		defer unsubscribe()
+		_ = conn.SetDeadline(time.Time{}) // the stream stays open
+		status, _ := n.directoryStatus()
+		send(controlResponse{OK: true, Status: status})
+		enc := json.NewEncoder(conn)
+		for ev := range events {
+			_ = conn.SetWriteDeadline(time.Now().Add(10 * time.Second))
+			if enc.Encode(ev) != nil {
+				return // subscriber went away
+			}
+		}
 	default:
 		reply(errors.New("unknown command"))
 	}
@@ -865,8 +1032,8 @@ func setStopUsage(fs *flag.FlagSet) {
 
 // clientFlags are the settings shared by start, menu and background.
 type clientFlags struct {
-	port, ctrl                 *int
-	server, user, pass, invite *string
+	port, ctrl                         *int
+	server, user, pass, invite, accept *string
 }
 
 func addClientFlags(fs *flag.FlagSet) clientFlags {
@@ -877,6 +1044,7 @@ func addClientFlags(fs *flag.FlagSet) clientFlags {
 		user:   fs.String("user", "", "directory username"),
 		pass:   fs.String("pass", "", "directory password (only needed the first time on this device)"),
 		invite: fs.String("invite", "", "one-time invite code, if the server is invite-only"),
+		accept: fs.String("accept", "", "who may message you: anyone or contacts (saved)"),
 	}
 }
 
@@ -893,6 +1061,14 @@ func (f clientFlags) apply(cfg *storage.Config) error {
 	}
 	if f.invite != nil && *f.invite != "" {
 		cfg.Invite = *f.invite
+	}
+	if f.accept != nil && *f.accept != "" {
+		cfg.Accept = *f.accept
+	}
+	switch cfg.Accept {
+	case "", "anyone", "contacts":
+	default:
+		return errors.New(`-accept must be "anyone" or "contacts"`)
 	}
 	if *f.port != 0 {
 		cfg.Port = *f.port
@@ -986,23 +1162,10 @@ func runBackground(args []string) error {
 	}
 	fmt.Printf("tarion background listening on UDP/%d as %s; control %s\n", cfg.Port, identity.Short(id.ID), controlAddr(cfg))
 
-	go func() {
-		for msg := range n.nm.MessageChan {
-			chat, _ := recordIncoming(msg)
-			fmt.Printf("new message from %s (%s, id %s)\n", chat, msg.Addr, identity.Short(msg.PeerID))
-		}
-	}()
-	if n.dir != nil {
-		go func() {
-			last := ""
-			for range time.Tick(2 * time.Second) {
-				if s := n.dir.Status(); s != last {
-					fmt.Println(s)
-					last = s
-				}
-			}
-		}()
-	}
+	go n.serveIncoming(func(chat string, msg network.IncomingMessage) {
+		fmt.Printf("new message from %s (%s, id %s)\n", chat, msg.Addr, identity.Short(msg.PeerID))
+	})
+	go n.watchStatus(func(s string) { fmt.Println(s) })
 
 	stop := make(chan os.Signal, 1)
 	signal.Notify(stop, os.Interrupt, syscall.SIGTERM)
@@ -1079,6 +1242,58 @@ func runSend(args []string) error {
 	return nil
 }
 
+// portFlags adds -p/-cp for commands that only talk to the background.
+func portFlags(fs *flag.FlagSet) func(*storage.Config) {
+	port := fs.Int("p", 0, "local UDP port the background uses")
+	ctrl := fs.Int("cp", 0, "background control TCP port")
+	return func(cfg *storage.Config) {
+		if *port != 0 {
+			cfg.Port = *port
+		}
+		if *ctrl != 0 {
+			cfg.ControlPort = *ctrl
+		}
+	}
+}
+
+// runListen prints every incoming message (and server status change) from
+// the background process as one JSON object per line, for scripts and bots.
+func runListen(args []string) error {
+	fs := flag.NewFlagSet("listen", flag.ExitOnError)
+	apply := portFlags(fs)
+	_ = fs.Parse(args)
+	cfg, err := storage.LoadOrCreateConfig()
+	if err != nil {
+		return err
+	}
+	apply(cfg)
+	out := json.NewEncoder(os.Stdout)
+	return subscribeControl(cfg, func(ev controlEvent) bool {
+		return out.Encode(ev) == nil
+	})
+}
+
+// runHistory prints a chat's saved history.
+func runHistory(args []string) error {
+	fs := flag.NewFlagSet("history", flag.ExitOnError)
+	n := fs.Int("n", 20, "how many recent lines (0 = all)")
+	_ = fs.Parse(args)
+	if fs.NArg() != 1 {
+		return errors.New("usage: tarion history [-n 20] <name>")
+	}
+	lines, err := storage.ReadHistory(fs.Arg(0))
+	if err != nil {
+		return err
+	}
+	if *n > 0 && len(lines) > *n {
+		lines = lines[len(lines)-*n:]
+	}
+	for _, l := range lines {
+		fmt.Println(l)
+	}
+	return nil
+}
+
 func runID() error {
 	id, err := loadIdentity()
 	if err != nil {
@@ -1135,6 +1350,8 @@ func printGeneralHelp() {
 		"  background  Run the always-on listener; use --detach to survive terminal close",
 		"  stop        Stop the detached/background listener",
 		"  send        Send one message through the background process",
+		"  listen      Print incoming messages as JSON lines (for scripts and apps)",
+		"  history     Print a chat's recent history",
 		"  id          Show your peer ID so contacts can verify you",
 		"  peers       List pinned contacts and their peer IDs",
 		"  forget      Remove a contact's pinned key (after they reinstall)",
@@ -1170,7 +1387,7 @@ func main() {
 	cmd := "start"
 	if len(args) > 0 {
 		switch args[0] {
-		case "start", "menu", "background", "stop", "send", "id", "peers", "forget":
+		case "start", "menu", "background", "stop", "send", "listen", "history", "id", "peers", "forget":
 			cmd, args = args[0], args[1:]
 		}
 	}
@@ -1183,6 +1400,10 @@ func main() {
 		err = runStop(args)
 	case "send":
 		err = runSend(args)
+	case "listen":
+		err = runListen(args)
+	case "history":
+		err = runHistory(args)
 	case "id":
 		err = runID()
 	case "peers":
