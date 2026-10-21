@@ -8,6 +8,8 @@ import (
 	"strings"
 	"unicode"
 	"unicode/utf8"
+
+	"github.com/quic-go/quic-go"
 )
 
 const (
@@ -18,10 +20,11 @@ const (
 	DefaultServerPort = 63425
 
 	MaxUsernameRunes = 32
-	MinPasswordLen   = 6
-	MaxPasswordLen   = 256
-	MaxListedUsers   = 500
-	MaxLocalAddrs    = 4
+	// DefaultMinPassword is tariond's default; operators can change it.
+	DefaultMinPassword = 10
+	MaxPasswordLen     = 256
+	MaxListedUsers     = 500
+	MaxLocalAddrs      = 4
 )
 
 // Request operations.
@@ -45,6 +48,16 @@ const (
 	ErrOffline          = "offline"
 	ErrRateLimited      = "rate_limited"
 	ErrServer           = "server_error"
+	ErrBanned           = "banned"
+	ErrInviteRequired   = "invite_required"
+	ErrBadInvite        = "bad_invite"
+	ErrRegistrationOff  = "registration_closed"
+)
+
+// QUIC application error codes tariond closes a session with.
+const (
+	CodeReplaced quic.ApplicationErrorCode = 3 // a newer login took over
+	CodeBanned   quic.ApplicationErrorCode = 4 // the operator banned the account or key
 )
 
 type Request struct {
@@ -52,12 +65,14 @@ type Request struct {
 	User       string   `json:"user,omitempty"`
 	Pass       string   `json:"pass,omitempty"`
 	Target     string   `json:"target,omitempty"`
+	Invite     string   `json:"invite,omitempty"` // one-time code, for servers in invite mode
 	LocalAddrs []string `json:"local_addrs,omitempty"`
 }
 
 type Response struct {
 	OK         bool     `json:"ok"`
 	Error      string   `json:"error,omitempty"`
+	Detail     string   `json:"detail,omitempty"`    // human-readable reason, e.g. the password rules
 	User       string   `json:"user,omitempty"`      // canonical account name
 	YourAddr   string   `json:"your_addr,omitempty"` // public address the server sees
 	Users      []string `json:"users,omitempty"`
@@ -73,6 +88,10 @@ type Push struct {
 	From   string `json:"from,omitempty"`
 	PeerID string `json:"peer_id,omitempty"`
 	Addr   string `json:"addr,omitempty"`
+	// LocalAddrs is the requester's LAN address, sent only when both are
+	// behind the same public IP: the requester dials that first, so the
+	// target must open its firewall toward it too.
+	LocalAddrs []string `json:"local_addrs,omitempty"`
 }
 
 const PushPunch = "punch"

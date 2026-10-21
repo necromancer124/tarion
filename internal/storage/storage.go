@@ -26,12 +26,17 @@ type Config struct {
 	// Password is only needed until this device's key is linked to the
 	// account; the client removes it from the file after that login.
 	Password string `json:"password,omitempty"`
+	// Invite is a one-time code for invite-only servers; removed after use.
+	Invite string `json:"invite,omitempty"`
 	// Port is the one UDP port used for chat and for talking to the server.
 	Port int `json:"port"`
 	// ControlPort is the local TCP port of the background process (default:
 	// Port+10000, or Port-10000 when that would exceed 65535).
-	ControlPort int       `json:"control_port,omitempty"`
-	Contacts    []Contact `json:"contacts"`
+	ControlPort int `json:"control_port,omitempty"`
+	// Accept is "anyone" (default) or "contacts": only keys in contacts or
+	// already pinned (people you messaged or who messaged you before).
+	Accept   string    `json:"accept,omitempty"`
+	Contacts []Contact `json:"contacts"`
 }
 
 // DefaultPort is the client's UDP port. It differs from the server's default

@@ -174,3 +174,72 @@ func TestDeliverUsesConfigContactAddress(t *testing.T) {
 		t.Fatalf("unknown contact: %v", err)
 	}
 }
+
+func TestSubscribeAndHistory(t *testing.T) {
+	t.Setenv("TARION_HOME", t.TempDir())
+	bobCfg := &storage.Config{Username: "bob", ControlPort: freeTCPPort(t)}
+	bob, bobAddr := startTestNode(t, bobCfg)
+	alice, _ := startTestNode(t, &storage.Config{Username: "alice"})
+	go bob.serveIncoming(nil)
+
+	token, _ := newControlToken()
+	if err := serveBackgroundControl(token, bob); err != nil {
+		t.Fatal(err)
+	}
+	if err := saveControlToken(token); err != nil {
+		t.Fatal(err)
+	}
+
+	events := make(chan controlEvent, 8)
+	go func() {
+		_ = subscribeControl(bobCfg, func(ev controlEvent) bool {
+			events <- ev
+			return ev.Type != "message"
+		})
+	}()
+	select {
+	case ev := <-events:
+		if ev.Type != "status" {
+			t.Fatalf("first event should be the status, got %+v", ev)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("subscribe never answered")
+	}
+
+	if err := alice.deliver("bob", bobAddr, "hello app"); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case ev := <-events:
+		if ev.Type != "message" || ev.Chat != "alice" || ev.Body != "hello app" || ev.PeerID != alice.nm.ID() {
+			t.Fatalf("event: %+v", ev)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("no message event")
+	}
+
+	resp, err := backgroundCall(bobCfg, controlRequest{Cmd: "history", To: "alice", Limit: 1})
+	if err != nil || len(resp.Lines) != 1 || resp.Lines[0] != "alice: hello app" {
+		t.Fatalf("history: %+v %v", resp, err)
+	}
+}
+
+func TestAcceptContactsOnly(t *testing.T) {
+	t.Setenv("TARION_HOME", t.TempDir())
+	bob, bobAddr := startTestNode(t, &storage.Config{Username: "bob", Accept: "contacts"})
+	alice, aliceAddr := startTestNode(t, &storage.Config{Username: "alice"})
+
+	err := alice.deliver("bob", bobAddr, "hi stranger")
+	if err == nil || !strings.Contains(err.Error(), "only accepts messages from contacts") {
+		t.Fatalf("stranger should be refused, got %v", err)
+	}
+
+	// Once bob writes to alice, she is his contact and may answer.
+	if err := bob.deliver("alice", aliceAddr, "hi alice"); err != nil {
+		t.Fatal(err)
+	}
+	<-alice.nm.MessageChan
+	if err := alice.deliver("bob", bobAddr, "hi back"); err != nil {
+		t.Fatalf("contact refused: %v", err)
+	}
+}

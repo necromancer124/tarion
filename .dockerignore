@@ -1,0 +1,9 @@
+.git
+*.exe
+*.log
+users.json
+users.db
+*.key
+invites
+bans.txt
+data

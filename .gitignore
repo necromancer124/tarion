@@ -17,3 +17,6 @@ users.json
 users.json.tmp
 tariond.key
 test-users.db
+
+# Server data folder used in examples
+tariond-data/
