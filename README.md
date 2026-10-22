@@ -1,6 +1,20 @@
 # Tarion
 
+**No middleman. No doorman. You open your own doors.**
+
 Tarion is a hybrid peer-to-peer CLI chat over QUIC. Chats go directly between peers. A small directory server, `tariond` in [`server/`](server/README.md), tells peers where to find each other and helps them through home routers (NAT). Every install has its own Ed25519 identity key, and peers authenticate each other with it (see [Security model](#security-model)).
+
+## Why I built Tarion
+
+I got tired of hearing about data. Data, data and more data: who collects it, who sells it, who reads it, which company is training on it this week. Every app wants to sit between me and the people I talk to, and every one of them promises it's safe there. I find that obnoxious.
+
+So this is my answer: **no middleman, no doorman. You open your own doors.**
+
+- **No middleman.** Your messages go straight from your device to the other person's. Nobody stores them, nobody forwards them, and nobody can read them on the way, because they're end-to-end encrypted with keys that never leave your device. There's a relay for networks that make a direct connection impossible, but it's off unless you, the other person and the server operator all turn it on, and even then it only passes along encrypted packets it can't read.
+- **No doorman.** Your identity is a key on your own computer. The server keeps just enough to help people find you (a username linked to that key, and a password hash) and nothing about your conversations. You can run your own (`tariond`), or skip it and connect by address.
+- **You open your own doors.** Tarion asks *your* router to open *your* port, tells you plainly when it can't and why, and lets you do it by hand instead. You decide who may message you (`-accept contacts`), whose bans you respect (`-server-bans`), and whether anything may ever pass through a server (`-relay`).
+
+Being honest about the one helper that remains: the directory server knows your username, your key, your IP address while you're online, and which usernames you look up. It never sees what you say. If even that is too much, host the server yourself.
 
 ## Ports
 
