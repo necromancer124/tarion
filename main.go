@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bufio"
 	"context"
 	"crypto/rand"
 	"crypto/subtle"
@@ -24,6 +25,7 @@ import (
 	"github.com/necromancer124/tarion/internal/identity"
 	"github.com/necromancer124/tarion/internal/network"
 	"github.com/necromancer124/tarion/internal/storage"
+	"golang.org/x/term"
 )
 
 var (
@@ -361,6 +363,9 @@ type controlRequest struct {
 	Addr  string `json:"addr,omitempty"`
 	Body  string `json:"body,omitempty"`
 	Limit int    `json:"limit,omitempty"`
+	// Pass and NewPass are only used by change_password / delete_account.
+	Pass    string `json:"pass,omitempty"`
+	NewPass string `json:"new_pass,omitempty"`
 }
 
 type controlResponse struct {
@@ -544,6 +549,16 @@ func handleControlConn(conn net.Conn, token string, n *node) {
 	case "online":
 		status, users := n.directoryStatus()
 		send(controlResponse{OK: true, Status: status, Users: users})
+	case "change_password", "delete_account":
+		if n.dir == nil || !n.dir.Connected() {
+			reply(errors.New("not connected to a server"))
+			return
+		}
+		if req.Cmd == "change_password" {
+			reply(n.dir.ChangePassword(req.Pass, req.NewPass))
+		} else {
+			reply(n.dir.DeleteAccount(req.Pass))
+		}
 	case "history":
 		if req.To == "" {
 			reply(errors.New(`history needs "to"`))
@@ -1351,6 +1366,125 @@ func parseInterspersed(fs *flag.FlagSet, args []string) []string {
 	}
 }
 
+var stdinLines = bufio.NewReader(os.Stdin)
+
+// readSecret prompts on stderr and reads without echo from a terminal, or a
+// plain line when input is piped (for scripts).
+func readSecret(prompt string) (string, error) {
+	fmt.Fprint(os.Stderr, prompt)
+	if fd := int(os.Stdin.Fd()); term.IsTerminal(fd) {
+		b, err := term.ReadPassword(fd)
+		fmt.Fprintln(os.Stderr)
+		return string(b), err
+	}
+	return readLine("")
+}
+
+func readLine(prompt string) (string, error) {
+	fmt.Fprint(os.Stderr, prompt)
+	line, err := stdinLines.ReadString('\n')
+	if err != nil && line == "" {
+		return "", err
+	}
+	return strings.TrimRight(line, "\r\n"), nil
+}
+
+// runAccountOp performs an account operation through the background
+// process if one is running (it owns the server session), or else logs in
+// briefly with this device's key.
+func runAccountOp(cfg *storage.Config, ctl controlRequest, op func(*directory.Client) error) error {
+	if backgroundRunning(cfg) {
+		return backgroundRequest(cfg, ctl)
+	}
+	if cfg.ServerAddr == "" || cfg.Username == "" {
+		return errors.New("no server account configured (log in once with -server and -user)")
+	}
+	id, err := loadIdentity()
+	if err != nil {
+		return err
+	}
+	n, err := startNode(cfg, id)
+	if err != nil {
+		return err
+	}
+	defer n.close()
+	for deadline := time.Now().Add(15 * time.Second); !n.dir.Connected(); time.Sleep(100 * time.Millisecond) {
+		if time.Now().After(deadline) {
+			return fmt.Errorf("could not log in: %s", n.dir.Status())
+		}
+	}
+	return op(n.dir)
+}
+
+func runPasswd(args []string) error {
+	fs := flag.NewFlagSet("passwd", flag.ExitOnError)
+	apply := portFlags(fs)
+	_ = fs.Parse(args)
+	cfg, err := storage.LoadOrCreateConfig()
+	if err != nil {
+		return err
+	}
+	apply(cfg)
+	oldPass, err := readSecret("Current password: ")
+	if err != nil {
+		return err
+	}
+	newPass, err := readSecret("New password: ")
+	if err != nil {
+		return err
+	}
+	again, err := readSecret("Repeat new password: ")
+	if err != nil {
+		return err
+	}
+	if newPass != again {
+		return errors.New("the new passwords don't match")
+	}
+	err = runAccountOp(cfg, controlRequest{Cmd: "change_password", Pass: oldPass, NewPass: newPass},
+		func(d *directory.Client) error { return d.ChangePassword(oldPass, newPass) })
+	if err != nil {
+		return err
+	}
+	fmt.Println("Password changed.")
+	return nil
+}
+
+func runDeleteAccount(args []string) error {
+	fs := flag.NewFlagSet("delete-account", flag.ExitOnError)
+	apply := portFlags(fs)
+	_ = fs.Parse(args)
+	cfg, err := storage.LoadOrCreateConfig()
+	if err != nil {
+		return err
+	}
+	apply(cfg)
+	if cfg.Username == "" {
+		return errors.New("no account configured")
+	}
+	confirm, err := readLine(fmt.Sprintf("This deletes the account %q on %s. Type the username to confirm: ", cfg.Username, cfg.ServerAddr))
+	if err != nil {
+		return err
+	}
+	if confirm != cfg.Username {
+		return errors.New("username did not match; nothing deleted")
+	}
+	pass, err := readSecret("Password: ")
+	if err != nil {
+		return err
+	}
+	err = runAccountOp(cfg, controlRequest{Cmd: "delete_account", Pass: pass},
+		func(d *directory.Client) error { return d.DeleteAccount(pass) })
+	if err != nil {
+		return err
+	}
+	_ = storage.UpdateConfig(func(c *storage.Config) { c.Username, c.Password, c.Invite = "", "", "" })
+	fmt.Println("Account deleted. Your history and identity key on this device were kept.")
+	if backgroundRunning(cfg) {
+		fmt.Println("The background process is still running without an account; stop it with: tarion stop")
+	}
+	return nil
+}
+
 func runID() error {
 	id, err := loadIdentity()
 	if err != nil {
@@ -1409,6 +1543,8 @@ func printGeneralHelp() {
 		"  send        Send one message through the background process",
 		"  listen      Print incoming messages as JSON lines (for scripts and apps)",
 		"  history     Print a chat's recent history",
+		"  passwd      Change your account password",
+		"  delete-account  Delete your account on the server",
 		"  id          Show your peer ID so contacts can verify you",
 		"  peers       List pinned contacts and their peer IDs",
 		"  forget      Remove a contact's pinned key (after they reinstall)",
@@ -1444,7 +1580,7 @@ func main() {
 	cmd := "start"
 	if len(args) > 0 {
 		switch args[0] {
-		case "start", "menu", "background", "stop", "send", "listen", "history", "id", "peers", "forget":
+		case "start", "menu", "background", "stop", "send", "listen", "history", "passwd", "delete-account", "id", "peers", "forget":
 			cmd, args = args[0], args[1:]
 		}
 	}
@@ -1461,6 +1597,10 @@ func main() {
 		err = runListen(args)
 	case "history":
 		err = runHistory(args)
+	case "passwd":
+		err = runPasswd(args)
+	case "delete-account":
+		err = runDeleteAccount(args)
 	case "id":
 		err = runID()
 	case "peers":

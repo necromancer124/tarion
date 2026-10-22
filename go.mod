@@ -7,6 +7,7 @@ require (
 	github.com/charmbracelet/lipgloss v1.1.0
 	github.com/quic-go/quic-go v0.60.0
 	golang.org/x/crypto v0.51.0
+	golang.org/x/term v0.43.0
 )
 
 require (

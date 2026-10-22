@@ -32,6 +32,7 @@ const (
 type Options struct {
 	Registration string // RegOpen, RegInvite or RegClosed
 	InvitesDir   string // one file per unused invite code
+	DeletionsDir string // operator requests to delete accounts
 	BansPath     string // usernames / peer IDs, re-read when changed
 	MinPassword  int
 }
@@ -43,11 +44,12 @@ func DefaultOptions() Options {
 // Server is tariond: it tracks who is online and where, and tells peers to
 // punch toward each other. It never relays chat messages.
 type Server struct {
-	id       *identity.Identity
-	accounts *Accounts
-	opts     Options
-	bans     *banList
-	invites  invites
+	id        *identity.Identity
+	accounts  *Accounts
+	opts      Options
+	bans      *banList
+	invites   invites
+	deletions deletions
 
 	mu         sync.Mutex
 	sessions   map[string]*session // account key -> live session
@@ -95,6 +97,7 @@ func NewServer(id *identity.Identity, accounts *Accounts, opts Options) *Server 
 		opts:       opts,
 		bans:       newBanList(opts.BansPath),
 		invites:    invites{dir: opts.InvitesDir},
+		deletions:  deletions{dir: opts.DeletionsDir},
 		sessions:   map[string]*session{},
 		connsPerIP: map[string]int{},
 		connLimit:  newLimiter(2*time.Second, 20),
@@ -135,11 +138,12 @@ func (s *Server) Serve(ln *quic.Listener) error {
 		}
 	}()
 	go func() {
-		for range time.Tick(2 * time.Second) {
+		for ; ; time.Sleep(2 * time.Second) {
 			if s.bans.refresh() {
 				s.kickBanned()
 				s.broadcastRevoked()
 			}
+			s.processDeletions()
 		}
 	}()
 	for {
@@ -254,6 +258,10 @@ func (s *Server) handle(sess *session, req directory.Request) directory.Response
 		return s.list(sess)
 	case directory.OpLookup:
 		return s.lookup(sess, req)
+	case directory.OpChangePassword:
+		return s.changePassword(sess, req)
+	case directory.OpDeleteAccount:
+		return s.deleteAccount(sess, req)
 	}
 	return fail(directory.ErrBadRequest)
 }
@@ -482,6 +490,89 @@ func (s *Server) pushPunch(target *session, push directory.Push) {
 	_ = stream.SetDeadline(time.Now().Add(5 * time.Second))
 	_ = wire.WriteFrame(stream, push)
 	_ = stream.Close()
+}
+
+// passwordCheck rate-limits and runs a password-verifying account operation.
+func (s *Server) passwordCheck(sess *session, user string, op func() error) directory.Response {
+	if !s.authLimit.Allow(sess.ip) || !s.userLimit.Allow(directory.NameKey(user)) {
+		return fail(directory.ErrRateLimited)
+	}
+	s.hashing <- struct{}{}
+	err := op()
+	<-s.hashing
+	switch {
+	case errors.Is(err, errAuthFailed):
+		log.Printf("failed password check for %q", user)
+		return fail(directory.ErrAuthFailed)
+	case errors.Is(err, errNoSuchUser):
+		return fail(directory.ErrNoSuchUser)
+	case err != nil:
+		log.Printf("account change for %q: %v", user, err)
+		return fail(directory.ErrServer)
+	}
+	return directory.Response{OK: true, User: user}
+}
+
+func (s *Server) changePassword(sess *session, req directory.Request) directory.Response {
+	user, _ := sess.loggedIn()
+	if user == "" {
+		return fail(directory.ErrNotLoggedIn)
+	}
+	if problem := passwordProblem(user, req.NewPass, s.opts.MinPassword); problem != "" {
+		return directory.Response{Error: directory.ErrWeakPassword, Detail: problem}
+	}
+	resp := s.passwordCheck(sess, user, func() error { return s.accounts.ChangePassword(user, req.Pass, req.NewPass) })
+	if resp.OK {
+		log.Printf("password changed: %s", user)
+	}
+	return resp
+}
+
+func (s *Server) deleteAccount(sess *session, req directory.Request) directory.Response {
+	user, _ := sess.loggedIn()
+	if user == "" {
+		return fail(directory.ErrNotLoggedIn)
+	}
+	resp := s.passwordCheck(sess, user, func() error {
+		if err := s.accounts.CheckPassword(user, req.Pass); err != nil {
+			return err
+		}
+		_, err := s.accounts.Delete(user)
+		return err
+	})
+	if resp.OK {
+		log.Printf("account deleted by its owner: %s", user)
+		s.endAccount(user, 300*time.Millisecond) // let the reply go out first
+	}
+	return resp
+}
+
+// processDeletions carries out operator requests from `tariond delete`.
+func (s *Server) processDeletions() {
+	for _, name := range s.deletions.Pending() {
+		if existed, err := s.accounts.Delete(name); err != nil {
+			log.Printf("delete %q: %v", name, err)
+			continue
+		} else if existed {
+			log.Printf("account deleted by the operator: %s", name)
+			s.endAccount(name, 0)
+		}
+		s.deletions.Done(name)
+	}
+}
+
+// endAccount closes the live session of a deleted account.
+func (s *Server) endAccount(name string, delay time.Duration) {
+	s.mu.Lock()
+	sess := s.sessions[directory.NameKey(name)]
+	delete(s.sessions, directory.NameKey(name))
+	s.mu.Unlock()
+	if sess != nil {
+		go func() {
+			time.Sleep(delay)
+			_ = sess.conn.CloseWithError(directory.CodeDeleted, "account deleted")
+		}()
+	}
 }
 
 // kickBanned closes the sessions of users or keys that were just banned.

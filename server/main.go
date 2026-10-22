@@ -7,6 +7,7 @@
 //	tariond accounts               list accounts
 //	tariond ban <name|peer-id>     ban (takes effect within seconds)
 //	tariond unban <name|peer-id>
+//	tariond delete <name>          delete an account (frees the name)
 //	tariond id                     print the server ID
 package main
 
@@ -29,7 +30,7 @@ import (
 // TARIOND_DATA environment variable) so Docker needs a single volume and
 // operator commands find the same files as the running server.
 type paths struct {
-	data, users, legacy, key, invites, bans string
+	data, users, legacy, key, invites, bans, deletions string
 }
 
 func addPathFlags(fs *flag.FlagSet) func() paths {
@@ -51,12 +52,13 @@ func addPathFlags(fs *flag.FlagSet) func() paths {
 			return filepath.Join(*data, name)
 		}
 		return paths{
-			data:    *data,
-			users:   or(*users, "users.json"),
-			legacy:  or(*legacy, "users.db"),
-			key:     or(*key, "tariond.key"),
-			invites: or(*inv, "invites"),
-			bans:    or(*bans, "bans.txt"),
+			data:      *data,
+			users:     or(*users, "users.json"),
+			legacy:    or(*legacy, "users.db"),
+			key:       or(*key, "tariond.key"),
+			invites:   or(*inv, "invites"),
+			bans:      or(*bans, "bans.txt"),
+			deletions: filepath.Join(*data, "deletions"),
 		}
 	}
 }
@@ -67,7 +69,7 @@ func main() {
 	cmd := "serve"
 	if len(args) > 0 {
 		switch args[0] {
-		case "serve", "invite", "accounts", "ban", "unban", "id":
+		case "serve", "invite", "accounts", "ban", "unban", "delete", "id":
 			cmd, args = args[0], args[1:]
 		}
 	}
@@ -81,6 +83,8 @@ func main() {
 		err = runAccounts(args)
 	case "ban", "unban":
 		err = runBan(args, cmd == "ban")
+	case "delete":
+		err = runDelete(args)
 	case "id":
 		err = runID(args)
 	}
@@ -135,6 +139,7 @@ func serve(args []string) error {
 	srv := NewServer(id, accounts, Options{
 		Registration: *reg,
 		InvitesDir:   p.invites,
+		DeletionsDir: p.deletions,
 		BansPath:     p.bans,
 		MinPassword:  *minPass,
 	})
@@ -251,6 +256,20 @@ func parseInterspersed(fs *flag.FlagSet, args []string) []string {
 		positional = append(positional, fs.Arg(0))
 		args = fs.Args()[1:]
 	}
+}
+
+func runDelete(args []string) error {
+	fs := flag.NewFlagSet("delete", flag.ExitOnError)
+	getPaths := addPathFlags(fs)
+	rest := parseInterspersed(fs, args)
+	if len(rest) != 1 || !directory.ValidUsername(rest[0]) {
+		return fmt.Errorf("usage: tariond delete <username>")
+	}
+	if err := (deletions{dir: getPaths().deletions}).Request(rest[0]); err != nil {
+		return err
+	}
+	fmt.Printf("deletion of %s requested; a running server applies it within a few seconds (otherwise at its next start)\n", rest[0])
+	return nil
 }
 
 func runID(args []string) error {

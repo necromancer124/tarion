@@ -166,6 +166,8 @@ func (c *Client) session(ctx context.Context) (bool, error) {
 					return true, &FatalError{Msg: "logged in from another device; this session was closed"}
 				case CodeBanned:
 					return true, &FatalError{Msg: "banned from this server"}
+				case CodeDeleted:
+					return true, &FatalError{Msg: "this account was deleted"}
 				}
 			}
 			return true, err
@@ -299,6 +301,42 @@ func (c *Client) List() ([]string, error) {
 		return nil, err
 	}
 	return resp.Users, nil
+}
+
+// ChangePassword changes the account password. The new password must meet
+// the server's rules; the error says why when it does not.
+func (c *Client) ChangePassword(oldPass, newPass string) error {
+	return c.accountOp(Request{Op: OpChangePassword, Pass: oldPass, NewPass: newPass})
+}
+
+// DeleteAccount deletes the account (the name becomes free) and ends the
+// session. Local history and keys stay on this device.
+func (c *Client) DeleteAccount(pass string) error {
+	return c.accountOp(Request{Op: OpDeleteAccount, Pass: pass})
+}
+
+func (c *Client) accountOp(req Request) error {
+	conn := c.current()
+	if conn == nil {
+		return errors.New("not connected to server")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), requestTimeout)
+	defer cancel()
+	resp, err := roundTrip(ctx, conn, req)
+	if err != nil {
+		return err
+	}
+	switch {
+	case resp.OK:
+		return nil
+	case resp.Error == ErrAuthFailed:
+		return errors.New("wrong password")
+	case resp.Error == ErrWeakPassword && resp.Detail != "":
+		return errors.New("new password rejected: " + resp.Detail)
+	case resp.Error == ErrRateLimited:
+		return errors.New("too many attempts; try again later")
+	}
+	return fmt.Errorf("server: %s", resp.Error)
 }
 
 // ErrUserOffline means the server has no online session for the target.

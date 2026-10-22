@@ -34,6 +34,9 @@ const (
 	OpLogin    = "login"    // with a password, or with the bound key alone
 	OpList     = "list"     // names of online users
 	OpLookup   = "lookup"   // a user's address and key; also signals a punch
+
+	OpChangePassword = "change_password" // Pass = current, NewPass = new
+	OpDeleteAccount  = "delete_account"  // Pass = current; the session then closes
 )
 
 // Error codes in Response.Error.
@@ -59,12 +62,14 @@ const (
 const (
 	CodeReplaced quic.ApplicationErrorCode = 3 // a newer login took over
 	CodeBanned   quic.ApplicationErrorCode = 4 // the operator banned the account or key
+	CodeDeleted  quic.ApplicationErrorCode = 5 // the account was deleted
 )
 
 type Request struct {
 	Op         string   `json:"op"`
 	User       string   `json:"user,omitempty"`
 	Pass       string   `json:"pass,omitempty"`
+	NewPass    string   `json:"new_pass,omitempty"`
 	Target     string   `json:"target,omitempty"`
 	Invite     string   `json:"invite,omitempty"` // one-time code, for servers in invite mode
 	LocalAddrs []string `json:"local_addrs,omitempty"`

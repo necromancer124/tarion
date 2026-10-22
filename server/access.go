@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"crypto/rand"
 	"encoding/base32"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"os"
@@ -233,6 +234,41 @@ func (i invites) Restore(code string) {
 	if c := normalizeInvite(code); c != "" {
 		_ = os.WriteFile(filepath.Join(i.dir, c), []byte("restored\n"), 0600)
 	}
+}
+
+// deletions holds operator requests to delete accounts, one file per name
+// (hex-encoded, so no name can be an unsafe or reserved file name). The
+// running server is the only writer of users.json; it picks requests up
+// within seconds, or at its next start.
+type deletions struct{ dir string }
+
+func (d deletions) Request(name string) error {
+	if err := os.MkdirAll(d.dir, 0700); err != nil {
+		return err
+	}
+	f := filepath.Join(d.dir, hex.EncodeToString([]byte(directory.NameKey(name))))
+	return os.WriteFile(f, []byte(name+"\n"), 0600)
+}
+
+// Pending returns the names waiting to be deleted.
+func (d deletions) Pending() []string {
+	entries, err := os.ReadDir(d.dir)
+	if err != nil {
+		return nil
+	}
+	var names []string
+	for _, e := range entries {
+		raw, err := hex.DecodeString(e.Name())
+		if err != nil || !directory.ValidUsername(string(raw)) {
+			continue
+		}
+		names = append(names, string(raw))
+	}
+	return names
+}
+
+func (d deletions) Done(name string) {
+	_ = os.Remove(filepath.Join(d.dir, hex.EncodeToString([]byte(directory.NameKey(name)))))
 }
 
 // passwordProblem explains why a new password is not acceptable, or "".
