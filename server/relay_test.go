@@ -8,6 +8,9 @@ import (
 	"testing"
 	"time"
 
+	"github.com/necromancer124/tarion/internal/directory"
+	"github.com/necromancer124/tarion/internal/identity"
+	"github.com/necromancer124/tarion/internal/network"
 	"github.com/necromancer124/tarion/internal/relay"
 )
 
@@ -75,3 +78,21 @@ func receive(t *testing.T, c *testClient) incomingMsg {
 }
 
 type incomingMsg struct{ Body, PeerID, Addr string }
+
+// A client behind a strict NAT accepts packets only from the server, so it
+// must know the server's address before its very first handshake.
+func TestStrictNATClientCanLogIn(t *testing.T) {
+	server, _ := startServer(t)
+	id, _ := identity.Generate()
+	nm := network.NewNetworkManager(freePort(t), id)
+	if err := nm.StartListener(); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = nm.Close() })
+	nm.Relay().SimulateStrictNAT(true)
+	c := directory.NewClient(nm, directory.ClientConfig{Server: server, User: "bob", Pass: "battery-staple-2"})
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	go c.Run(ctx)
+	waitFor(t, "strict-NAT client logged in", c.Connected)
+}

@@ -98,7 +98,7 @@ type node struct {
 	revoked   map[string]bool // keys banned by the server
 
 	relayedMu sync.Mutex
-	relayed   map[string]time.Time // contacts last reached via the relay
+	relayed   map[string]relaySession // contacts last reached via the relay
 
 	outboxMu    sync.Mutex    // one outbox pass at a time
 	outboxWake  chan struct{} // nudges the outbox loop
@@ -452,6 +452,14 @@ var (
 )
 
 func (n *node) deliverMsg(id string, sent time.Time, to, addr, body string) error {
+	// Refuse a banned contact up front: once the ban disconnects them they
+	// look merely offline, and the message would sit in the outbox.
+	if p, ok := storage.PeerByName(to); ok && n.isRevoked(p.ID) {
+		return fmt.Errorf("%s is %w", to, errRevoked)
+	}
+	if id := configuredID(n.cfg, to); id != "" && n.isRevoked(id) {
+		return fmt.Errorf("%s is %w", to, errRevoked)
+	}
 	var candidates []string
 	dirID := ""
 	offline := false
@@ -505,6 +513,18 @@ func (n *node) deliverMsg(id string, sent time.Time, to, addr, body string) erro
 	// fails (strict NATs). The packets stay end-to-end encrypted.
 	canRelay := dirID != ""
 	viaRelay := func() error {
+		// Reuse the contact's relay session while it is alive; the server
+		// caps how many each user may hold open.
+		if s, ok := n.relaySession(to); ok {
+			err := attempt(s.addr, 3*time.Second, s.peerID)
+			if err == nil {
+				n.setRelaySession(to, s)
+				return nil
+			}
+			if isIdentityErr(err) {
+				return err
+			}
+		}
 		raddr, relayID, err := n.dir.Relay(to)
 		if err != nil {
 			return err
@@ -512,7 +532,7 @@ func (n *node) deliverMsg(id string, sent time.Time, to, addr, body string) erro
 		if err := attempt(raddr, n.sendTimeout, relayID); err != nil {
 			return err
 		}
-		n.setRelayed(to, true)
+		n.setRelaySession(to, relaySession{addr: raddr, peerID: relayID})
 		return nil
 	}
 	triedRelay := false
@@ -534,7 +554,7 @@ func (n *node) deliverMsg(id string, sent time.Time, to, addr, body string) erro
 		}
 		err := attempt(cand, timeout, dirID)
 		if err == nil {
-			n.setRelayed(to, false)
+			n.clearRelay(to)
 			return nil
 		}
 		if isIdentityErr(err) {
@@ -555,27 +575,47 @@ func (n *node) deliverMsg(id string, sent time.Time, to, addr, body string) erro
 	return lastErr
 }
 
-const relayMemory = 10 * time.Minute
+const (
+	relayMemory     = 10 * time.Minute // go straight to the relay for this long
+	relaySessionTTL = 90 * time.Second // reuse a session (the server keeps it 2 min)
+)
 
-// relayedRecently reports whether to reached us only through the relay in
+type relaySession struct {
+	addr, peerID string
+	used         time.Time
+}
+
+// relayedRecently reports whether to was reached only through the relay in
 // the last few minutes, so the next message can skip the direct attempts.
 func (n *node) relayedRecently(to string) bool {
 	n.relayedMu.Lock()
 	defer n.relayedMu.Unlock()
-	return time.Since(n.relayed[strings.ToLower(to)]) < relayMemory
+	s, ok := n.relayed[strings.ToLower(to)]
+	return ok && time.Since(s.used) < relayMemory
 }
 
-func (n *node) setRelayed(to string, on bool) {
+// relaySession returns a still-usable relay session to to.
+func (n *node) relaySession(to string) (relaySession, bool) {
+	n.relayedMu.Lock()
+	defer n.relayedMu.Unlock()
+	s, ok := n.relayed[strings.ToLower(to)]
+	return s, ok && s.addr != "" && time.Since(s.used) < relaySessionTTL
+}
+
+func (n *node) setRelaySession(to string, s relaySession) {
 	n.relayedMu.Lock()
 	defer n.relayedMu.Unlock()
 	if n.relayed == nil {
-		n.relayed = map[string]time.Time{}
+		n.relayed = map[string]relaySession{}
 	}
-	if on {
-		n.relayed[strings.ToLower(to)] = time.Now()
-	} else {
-		delete(n.relayed, strings.ToLower(to))
-	}
+	s.used = time.Now()
+	n.relayed[strings.ToLower(to)] = s
+}
+
+func (n *node) clearRelay(to string) {
+	n.relayedMu.Lock()
+	delete(n.relayed, strings.ToLower(to))
+	n.relayedMu.Unlock()
 }
 
 // The local API: one JSON object per line over TCP on 127.0.0.1, each

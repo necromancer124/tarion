@@ -214,6 +214,11 @@ func (c *Client) dial(ctx context.Context) (*quic.Conn, error) {
 		MaxIdleTimeout:       45 * time.Second,
 		KeepAlivePeriod:      15 * time.Second,
 	}
+	// The relay wrapper must recognize the server before the handshake: a
+	// client behind a strict NAT accepts packets from nobody else.
+	if srv, err := net.ResolveUDPAddr("udp", c.cfg.Server); err == nil && c.nm.Relay() != nil {
+		c.nm.Relay().SetServer(srv)
+	}
 	dialCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
 	defer cancel()
 	conn, err := c.nm.Dial(dialCtx, c.cfg.Server, tlsConf, quicConf)

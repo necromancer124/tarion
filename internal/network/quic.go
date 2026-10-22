@@ -160,7 +160,9 @@ func (nm *NetworkManager) StartListener() error {
 		for {
 			conn, err := listener.Accept(context.Background())
 			if err != nil {
-				log.Printf("QUIC accept stopped: %v", err)
+				if !errors.Is(err, quic.ErrServerClosed) {
+					log.Printf("QUIC accept stopped: %v", err)
+				}
 				return
 			}
 			if nm.active.Add(1) > maxActiveConns {

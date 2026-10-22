@@ -350,3 +350,21 @@ func TestLateMessageShowsSendTime(t *testing.T) {
 		t.Fatalf("fresh message should not show a time: %q", line)
 	}
 }
+
+func TestBannedContactIsRefusedNotQueued(t *testing.T) {
+	t.Setenv("TARION_HOME", t.TempDir())
+	alice, _ := startTestNode(t, &storage.Config{Username: "alice"})
+	bobID, _ := identity.Generate()
+	// alice knows bob from before; then the server bans him and he is offline.
+	if err := storage.PinOutgoing("bob", bobID.ID, ""); err != nil {
+		t.Fatal(err)
+	}
+	alice.setRevoked([]string{bobID.ID})
+	queued, err := alice.send("bob", "", "are you there?")
+	if queued || !errors.Is(err, errRevoked) {
+		t.Fatalf("banned contact: queued=%v err=%v", queued, err)
+	}
+	if items, _ := storage.Outbox(); len(items) != 0 {
+		t.Fatalf("message to a banned contact was queued: %+v", items)
+	}
+}
