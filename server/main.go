@@ -157,6 +157,14 @@ func serve(args []string) error {
 	if *relayOn {
 		go srv.ServeRelay(tr)
 	}
+	// Reachability tests come from a second port, as a stranger's packet
+	// would, so they don't ride on the client's existing NAT mapping.
+	if probe, err := net.ListenUDP("udp", &net.UDPAddr{}); err != nil {
+		log.Printf("probe socket unavailable, clients can't test forwarded ports: %v", err)
+	} else {
+		srv.SetProbeConn(probe)
+		defer probe.Close()
+	}
 	log.Printf("tariond listening on UDP/%d, data in %s, registration %s, relay %v", *port, p.data, *reg, *relayOn)
 	log.Printf("server ID: %s (clients pin this; give it to users as server_id)", identity.Fingerprint(id.ID))
 

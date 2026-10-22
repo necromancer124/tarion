@@ -80,6 +80,9 @@ type Server struct {
 	hashing    chan struct{}
 	nextID     atomic.Uint64
 
+	probe      net.PacketConn // separate socket for reachability tests
+	probeLimit *limiter
+
 	relayMu    sync.Mutex
 	relays     map[relay.ID]*relaySession
 	relayRate  *limiter // bytes per session
@@ -148,6 +151,7 @@ func NewServer(id *identity.Identity, accounts *Accounts, opts Options) *Server 
 		relays:     map[relay.ID]*relaySession{},
 		relayRate:  newByteLimiter(opts.RelayRate),
 		relayTotal: newByteLimiter(opts.RelayTotal),
+		probeLimit: newLimiter(10*time.Second, 3),
 	}
 }
 
@@ -303,6 +307,10 @@ func (s *Server) handle(sess *session, req directory.Request) directory.Response
 		return s.lookup(sess, req)
 	case directory.OpRelay:
 		return s.openRelay(sess, req)
+	case directory.OpAdvertise:
+		return s.advertise(sess, req)
+	case directory.OpProbe:
+		return s.sendProbe(sess, req)
 	case directory.OpChangePassword:
 		return s.changePassword(sess, req)
 	case directory.OpDeleteAccount:
@@ -543,6 +551,57 @@ func (s *Server) pushPunch(target *session, push directory.Push) {
 	_ = stream.SetDeadline(time.Now().Add(5 * time.Second))
 	_ = wire.WriteFrame(stream, push)
 	_ = stream.Close()
+}
+
+// SetProbeConn gives the server a socket, on a different port from its
+// main one, for reachability tests. Without it, probes are unavailable.
+func (s *Server) SetProbeConn(pc net.PacketConn) { s.probe = pc }
+
+// advertise sets (or clears) the address a user made reachable, such as a
+// port their router forwards after login.
+func (s *Server) advertise(sess *session, req directory.Request) directory.Response {
+	if user, _ := sess.loggedIn(); user == "" {
+		return fail(directory.ErrNotLoggedIn)
+	}
+	if req.PublicAddr != "" && !directory.ValidPublicAddr(req.PublicAddr) {
+		return fail(directory.ErrBadRequest)
+	}
+	sess.mu.Lock()
+	sess.publicAddr = req.PublicAddr
+	sess.mu.Unlock()
+	return directory.Response{OK: true}
+}
+
+// sendProbe sends a test packet to the user's advertised address from the
+// probe socket, so the client can tell whether strangers can reach it. It
+// only goes to the user's own public IP and is rate-limited, so it can't
+// be used to send packets anywhere else.
+func (s *Server) sendProbe(sess *session, req directory.Request) directory.Response {
+	if user, _ := sess.loggedIn(); user == "" {
+		return fail(directory.ErrNotLoggedIn)
+	}
+	if s.probe == nil {
+		return fail(directory.ErrProbeOff)
+	}
+	nonce, ok := relay.ParseID(req.Nonce)
+	sess.mu.Lock()
+	target := sess.publicAddr
+	sess.mu.Unlock()
+	if !ok || target == "" {
+		return fail(directory.ErrBadRequest)
+	}
+	if !s.probeLimit.Allow(sess.id) {
+		return fail(directory.ErrRateLimited)
+	}
+	addr, err := net.ResolveUDPAddr("udp", target)
+	seen, isUDP := sess.udp.(*net.UDPAddr)
+	if err != nil || !isUDP || !addr.IP.Equal(seen.IP) {
+		return fail(directory.ErrProbeNotYours)
+	}
+	if _, err := s.probe.WriteTo(relay.Probe(nonce), addr); err != nil {
+		return fail(directory.ErrServer)
+	}
+	return directory.Response{OK: true}
 }
 
 const relayIdle = 2 * time.Minute

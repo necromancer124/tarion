@@ -38,6 +38,8 @@ const (
 	OpLookup   = "lookup"   // a user's address and key; also signals a punch
 
 	OpRelay          = "relay"           // open a relay session to Target (direct path failed)
+	OpAdvertise      = "advertise"       // set or clear PublicAddr after login
+	OpProbe          = "probe"           // ask for a test packet to PublicAddr (Nonce)
 	OpChangePassword = "change_password" // Pass = current, NewPass = new
 	OpDeleteAccount  = "delete_account"  // Pass = current; the session then closes
 )
@@ -61,6 +63,8 @@ const (
 	ErrRegistrationOff  = "registration_closed"
 	ErrRelayOff         = "relay_disabled"
 	ErrRelayRefused     = "relay_refused" // the target turned the relay off
+	ErrProbeOff         = "probe_unavailable"
+	ErrProbeNotYours    = "probe_not_yours" // only your own public IP can be probed
 )
 
 // QUIC application error codes tariond closes a session with.
@@ -83,6 +87,7 @@ type Request struct {
 	// made reachable themselves, such as a forwarded port.
 	AcceptRelay bool   `json:"accept_relay,omitempty"`
 	PublicAddr  string `json:"public_addr,omitempty"`
+	Nonce       string `json:"nonce,omitempty"` // probe: 8 bytes, hex
 }
 
 type Response struct {
