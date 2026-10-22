@@ -5,6 +5,8 @@
 package directory
 
 import (
+	"net"
+	"strconv"
 	"strings"
 	"unicode"
 	"unicode/utf8"
@@ -25,6 +27,7 @@ const (
 	MaxPasswordLen     = 256
 	MaxListedUsers     = 500
 	MaxLocalAddrs      = 4
+	MaxRevoked         = 1000 // banned keys sent to clients
 )
 
 // Request operations.
@@ -33,6 +36,10 @@ const (
 	OpLogin    = "login"    // with a password, or with the bound key alone
 	OpList     = "list"     // names of online users
 	OpLookup   = "lookup"   // a user's address and key; also signals a punch
+
+	OpRelay          = "relay"           // open a relay session to Target (direct path failed)
+	OpChangePassword = "change_password" // Pass = current, NewPass = new
+	OpDeleteAccount  = "delete_account"  // Pass = current; the session then closes
 )
 
 // Error codes in Response.Error.
@@ -52,21 +59,30 @@ const (
 	ErrInviteRequired   = "invite_required"
 	ErrBadInvite        = "bad_invite"
 	ErrRegistrationOff  = "registration_closed"
+	ErrRelayOff         = "relay_disabled"
+	ErrRelayRefused     = "relay_refused" // the target turned the relay off
 )
 
 // QUIC application error codes tariond closes a session with.
 const (
 	CodeReplaced quic.ApplicationErrorCode = 3 // a newer login took over
 	CodeBanned   quic.ApplicationErrorCode = 4 // the operator banned the account or key
+	CodeDeleted  quic.ApplicationErrorCode = 5 // the account was deleted
 )
 
 type Request struct {
 	Op         string   `json:"op"`
 	User       string   `json:"user,omitempty"`
 	Pass       string   `json:"pass,omitempty"`
+	NewPass    string   `json:"new_pass,omitempty"`
 	Target     string   `json:"target,omitempty"`
 	Invite     string   `json:"invite,omitempty"` // one-time code, for servers in invite mode
 	LocalAddrs []string `json:"local_addrs,omitempty"`
+	// AcceptRelay (login) says whether this client lets others reach it
+	// through the server's relay. PublicAddr (login) is an address the user
+	// made reachable themselves, such as a forwarded port.
+	AcceptRelay bool   `json:"accept_relay,omitempty"`
+	PublicAddr  string `json:"public_addr,omitempty"`
 }
 
 type Response struct {
@@ -80,6 +96,13 @@ type Response struct {
 	Addr       string   `json:"addr,omitempty"`
 	LocalAddrs []string `json:"local_addrs,omitempty"` // only when both share a public IP
 	PeerID     string   `json:"peer_id,omitempty"`
+	// Revoked (on login) lists keys the operator banned. Clients refuse to
+	// exchange messages with them even over a direct connection.
+	Revoked []string `json:"revoked,omitempty"`
+	// Relay is a relay session ID (hex) for op "relay".
+	Relay string `json:"relay,omitempty"`
+	// PublicAddr (lookup) is the address the target advertised itself.
+	PublicAddr string `json:"public_addr,omitempty"`
 }
 
 // Push is sent by the server on a stream it opens to a logged-in client.
@@ -92,9 +115,17 @@ type Push struct {
 	// behind the same public IP: the requester dials that first, so the
 	// target must open its firewall toward it too.
 	LocalAddrs []string `json:"local_addrs,omitempty"`
+	// Revoked is the full, current list of banned keys (type "revoked").
+	Revoked []string `json:"revoked,omitempty"`
+	// Relay is the session the requester will send through (type "relay").
+	Relay string `json:"relay,omitempty"`
 }
 
-const PushPunch = "punch"
+const (
+	PushPunch   = "punch"
+	PushRevoked = "revoked"
+	PushRelay   = "relay"
+)
 
 // ValidUsername allows 1-32 letters or digits (any script) plus . _ -,
 // starting with a letter or digit. Nothing here can break a file format,
@@ -108,6 +139,30 @@ func ValidUsername(name string) bool {
 		case unicode.IsLetter(r) || unicode.IsDigit(r):
 		case i > 0 && (r == '.' || r == '_' || r == '-'):
 		default:
+			return false
+		}
+	}
+	return true
+}
+
+// ValidPublicAddr accepts "host:port" where host is an IP or a DNS name
+// (letters, digits, dots, hyphens) and port is 1-65535.
+func ValidPublicAddr(s string) bool {
+	if len(s) > 255 {
+		return false
+	}
+	host, port, err := net.SplitHostPort(s)
+	if err != nil || host == "" {
+		return false
+	}
+	if p, err := strconv.Atoi(port); err != nil || p < 1 || p > 65535 {
+		return false
+	}
+	if net.ParseIP(host) != nil {
+		return true
+	}
+	for _, r := range host {
+		if !(r >= 'a' && r <= 'z' || r >= 'A' && r <= 'Z' || r >= '0' && r <= '9' || r == '.' || r == '-') {
 			return false
 		}
 	}

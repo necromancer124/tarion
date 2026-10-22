@@ -16,6 +16,7 @@ import (
 	"unicode/utf8"
 
 	"github.com/necromancer124/tarion/internal/identity"
+	"github.com/necromancer124/tarion/internal/relay"
 	"github.com/necromancer124/tarion/internal/wire"
 	"github.com/quic-go/quic-go"
 )
@@ -59,6 +60,7 @@ type NetworkManager struct {
 
 	id       *identity.Identity
 	udp      *net.UDPConn
+	relay    *relay.Conn // wraps udp; carries relayed peers through tariond
 	tr       *quic.Transport
 	listener *quic.Listener
 	active   atomic.Int32
@@ -106,8 +108,11 @@ func quicConfig() *quic.Config {
 	return &quic.Config{
 		// Home routers typically forget an idle UDP mapping after ~30s; close
 		// idle chat connections before that so we never reuse a dead one.
-		MaxIdleTimeout:     25 * time.Second,
-		MaxIncomingStreams: 32,
+		MaxIdleTimeout: 25 * time.Second,
+		// Messages are small, and a relayed packet carries a 12-byte header
+		// that must still fit in a 1500-byte path, so stay at 1280 bytes.
+		DisablePathMTUDiscovery: true,
+		MaxIncomingStreams:      32,
 	}
 }
 
@@ -142,19 +147,22 @@ func (nm *NetworkManager) StartListener() error {
 	if err != nil {
 		return fmt.Errorf("start QUIC listener on UDP %d: %w", nm.Port, err)
 	}
-	tr := &quic.Transport{Conn: udp}
+	rc := relay.NewConn(udp)
+	tr := &quic.Transport{Conn: rc}
 	listener, err := tr.Listen(nm.serverTLS(), quicConfig())
 	if err != nil {
 		_ = udp.Close()
 		return fmt.Errorf("start QUIC listener on UDP %d: %w", nm.Port, err)
 	}
-	nm.udp, nm.tr, nm.listener = udp, tr, listener
+	nm.udp, nm.relay, nm.tr, nm.listener = udp, rc, tr, listener
 
 	go func() {
 		for {
 			conn, err := listener.Accept(context.Background())
 			if err != nil {
-				log.Printf("QUIC accept stopped: %v", err)
+				if !errors.Is(err, quic.ErrServerClosed) {
+					log.Printf("QUIC accept stopped: %v", err)
+				}
 				return
 			}
 			if nm.active.Add(1) > maxActiveConns {
@@ -313,6 +321,13 @@ func (nm *NetworkManager) Send(peerAddr, from, body string, verify func(peerID s
 // SendContext is Send with a caller-chosen deadline, used to try a peer's
 // LAN address briefly before falling back to its public one.
 func (nm *NetworkManager) SendContext(ctx context.Context, peerAddr, from, body string, verify func(peerID string) error) (string, error) {
+	return nm.SendMessage(ctx, NewMessageID(), time.Now(), peerAddr, from, body, verify)
+}
+
+// SendMessage is SendContext with a caller-chosen message ID and send time.
+// Retrying a queued message with its original ID lets the receiver drop a
+// duplicate if an earlier attempt did arrive.
+func (nm *NetworkManager) SendMessage(ctx context.Context, id string, sent time.Time, peerAddr, from, body string, verify func(peerID string) error) (string, error) {
 	if nm.tr == nil {
 		return "", errors.New("listener not started")
 	}
@@ -329,7 +344,10 @@ func (nm *NetworkManager) SendContext(ctx context.Context, peerAddr, from, body 
 	if len(from) > MaxNameBytes {
 		from = from[:MaxNameBytes]
 	}
-	env := envelope{V: ProtocolVersion, Type: "msg", ID: newMessageID(), TS: time.Now().Unix(), From: from, Body: body}
+	if id == "" || len(id) > maxIDBytes {
+		return "", errors.New("bad message id")
+	}
+	env := envelope{V: ProtocolVersion, Type: "msg", ID: id, TS: sent.Unix(), From: from, Body: body}
 
 	// The first attempt may use a cached connection that has silently died;
 	// retry once on a fresh one.
@@ -415,11 +433,11 @@ func (nm *NetworkManager) conn(ctx context.Context, addr string, fresh bool) (*q
 			return conn, true, nil
 		}
 	}
-	udpAddr, err := net.ResolveUDPAddr("udp", addr)
+	target, err := resolve(addr)
 	if err != nil {
 		return nil, false, err
 	}
-	conn, err := nm.tr.Dial(ctx, udpAddr, nm.clientTLS(), quicConfig())
+	conn, err := nm.tr.Dial(ctx, target, nm.clientTLS(), quicConfig())
 	if err != nil {
 		return nil, false, err
 	}
@@ -441,11 +459,28 @@ func (nm *NetworkManager) dropConn(addr string, conn *quic.Conn) {
 	_ = conn.CloseWithError(errCodeNone, "dropped")
 }
 
-func newMessageID() string {
+// NewMessageID returns a random 128-bit message ID.
+func NewMessageID() string {
 	var b [16]byte
 	_, _ = rand.Read(b[:])
 	return hex.EncodeToString(b[:])
 }
+
+// resolve turns "host:port" or "relay:<id>" into the address quic-go dials.
+func resolve(addr string) (net.Addr, error) {
+	if relay.IsAddr(addr) {
+		a, ok := relay.ParseAddr(addr)
+		if !ok {
+			return nil, fmt.Errorf("bad relay address %q", addr)
+		}
+		return a, nil
+	}
+	return net.ResolveUDPAddr("udp", addr)
+}
+
+// Relay is the socket wrapper that carries relayed peers; the directory
+// client tells it the server address and which sessions to accept.
+func (nm *NetworkManager) Relay() *relay.Conn { return nm.relay }
 
 // Identity returns the key this endpoint authenticates with.
 func (nm *NetworkManager) Identity() *identity.Identity { return nm.id }

@@ -38,10 +38,26 @@ Send one message through the background process, print incoming messages as JSON
 .\tarion.exe history -n 20 bob
 ```
 
+If someone is offline or can't be reached, the message is **queued** instead of lost. The background process (or the open menu) retries automatically: right away when the server shows them online, otherwise with growing gaps, for up to 7 days. The chat then shows `✓ delivered later`, and late messages show when they were written.
+
+See what's waiting, and what was given up on or refused (also printed in `background.log`):
+
+```powershell
+.\tarion.exe outbox
+.\tarion.exe dropped
+```
+
 Only accept messages from people you know (contacts in `config.json`, people you messaged, and people who messaged you before):
 
 ```powershell
 .\tarion.exe start -accept contacts
+```
+
+Change your password, or delete your account on the server (both ask for the current password; deleting also asks you to type your username):
+
+```powershell
+.\tarion.exe passwd
+.\tarion.exe delete-account
 ```
 
 Stop the detached background process:
@@ -120,8 +136,11 @@ The config is saved to:
 - `contacts` are optional. A contact with an `addr` can be reached without the server. Its `id` is also optional: when set, Tarion only talks to the peer holding that key. Without it, the first key that answers gets pinned (trust on first use).
 - `control_port` is optional (see [Ports](#ports)).
 - `accept` is `anyone` (default) or `contacts` (see above). Strangers who write to you then get "this user only accepts messages from contacts".
+- `server_bans` is `on` (default) or `off` (`-server-bans`): whether your client refuses keys your server's operator banned.
+- `relay` is `off` (default) or `on` (`-relay`): whether messages may pass through the server when no direct path exists. See [Getting through strict NATs](#getting-through-strict-nats).
+- `public_addr` (`-public-addr`): an address peers can reach you at directly, such as a forwarded port.
 
-The folder also holds `identity.key` (your private key, keep it secret), `peers.json` (pinned contacts) and, while the background process runs, `control.token`.
+The folder also holds `identity.key` (your private key, keep it secret), `peers.json` (pinned contacts), `outbox.json` (messages waiting to be delivered), `dropped.log` (messages given up on or refused), `revoked.json` (keys your server banned) and, while the background process runs, `control.token`.
 
 ## Controls
 
@@ -136,7 +155,7 @@ The folder also holds `identity.key` (your private key, keep it secret), `peers.
 
 - **Identity.** `identity.key` is an Ed25519 key created on first run. Your peer ID is a hash of its public key. Both sides present their key in the QUIC/TLS 1.3 handshake (mutual TLS), so a peer ID cannot be claimed without owning the private key.
 - **Encryption.** Every connection is QUIC with TLS 1.3 (AES-GCM) and a post-quantum hybrid key exchange (X25519MLKEM768), so recorded traffic stays private even against a future quantum computer. The Ed25519 identity keys are not post-quantum.
-- **Server login.** The password is only ever sent inside that encrypted connection. It links your account to your device's key; later logins use the key alone, and the password isn't stored on your device. The server stores argon2id hashes (64 MiB, 3 passes), requires 10+ character passwords for new accounts, rate-limits logins and registrations, and checks usernames (1–32 letters/digits plus `. _ -`, not case-sensitive). Operators can make the server invite-only and ban users or keys.
+- **Server login.** The password is only ever sent inside that encrypted connection. It links your account to your device's key; later logins use the key alone, and the password isn't stored on your device. The server stores argon2id hashes (64 MiB, 3 passes), requires 10+ character passwords for new accounts, rate-limits logins and registrations, and checks usernames (1–32 letters/digits plus `. _ -`, not case-sensitive). Operators can make the server invite-only and ban users or keys. Your client also receives the server's list of banned keys and, unless you set `-server-bans off`, refuses to exchange messages with them, even over a direct connection.
 - **Server pinning.** The client pins the server's key (`server_id`), so an impostor server can't collect passwords.
 - **Pinning.** The first time you talk to a name, its peer ID is pinned in `peers.json`. If that name later answers with a different key, sending is refused. When the server knows a user, it also reports their key, and the key that answers must match it too. A new key that claims a pinned name shows up as a separate chat such as `bob~1a2b3c4d`, so it can't pose as Bob.
 - **Delivery.** Each message carries an ID and waits for the receiver's acknowledgement. The menu shows `delivered` or `not delivered: <reason>`, and failed sends are marked in the history. Duplicate deliveries are dropped.
@@ -148,7 +167,15 @@ The folder also holds `identity.key` (your private key, keep it secret), `peers.
 1. The client keeps a QUIC connection to `tariond` open from its chat port. Its keep-alives are the heartbeat, and they also keep the router's mapping for that port open.
 2. To message bob, the client asks the server for bob. The server answers with bob's public address, his key, and (only if you're behind the same router) his LAN address.
 3. At the same moment, the server tells bob, over his open connection, to send a few tiny packets toward your address. That opens bob's router for your incoming connection (NAT hole punching).
-4. The client connects to bob directly: LAN address first, public address second. The message never passes through the server.
+4. The client connects to bob directly: LAN address first, then an address bob made reachable himself (a forwarded port), then the public address the server sees.
+5. If none work, the message is queued and retried. **No message passes through the server** unless you, bob and the server operator all turned the relay on (see below).
+
+### Getting through strict NATs
+
+Hole punching works with most home routers. When both sides are behind strict ("symmetric") NATs, there are two options:
+
+- **Forward a port (no server involved).** On your router, forward UDP to your chat port (default 63426), then tell Tarion: `-public-addr YOUR_PUBLIC_IP:63426` (a DNS name works too). The server passes it to people who look you up, and they connect straight to you.
+- **The relay (opt-in, off by default).** With `-relay on` on both clients and `tariond -relay` on the server, the server forwards the QUIC packets between you. You still run your own encrypted handshake inside it and keys are checked as usual, so the server only sees ciphertext, but your traffic does go through it. A client with the relay off never uses it and refuses relayed connections. After needing it, messages to that contact use the relay right away for 10 minutes.
 
 ### Wire protocol
 
@@ -167,18 +194,22 @@ The directory uses ALPN `tarion-dir/1` with the same framing; see [`internal/dir
 - **What a firewall can see:** UDP packets between your IP and the server or peers, their sizes and timing, and that they are QUIC with the ALPN `tarion/2` or `tarion-dir/1`. Chat connections send no server name (SNI). The certificates, and so the identity keys, are encrypted in TLS 1.3.
 - **What it can't see:** messages, usernames, passwords, or the server's password hashes (those never leave the server). There is nothing in the traffic to "crack".
 - **TLS-inspecting firewalls** (company proxies with their own root certificate) can't read Tarion either. Peers and the server are pinned by key, not trusted through certificate authorities, so an interception attempt makes the connection fail instead of being decrypted.
-- **Blocking:** a firewall can still block Tarion, either by ALPN or by blocking UDP altogether (common on company and school networks). Tarion then can't connect; a TCP/relay fallback is tracked in #13.
+- **Blocking:** a firewall can still block Tarion, either by ALPN or by blocking UDP altogether (common on company and school networks). Strict NATs can be handled by a forwarded port or the opt-in relay, but a network that blocks UDP stops Tarion completely; a TCP transport is tracked in #13.
 - **Your own PC's firewall** (Windows Defender may ask the first time): allowing it is best. If you decline, connections still work, because Tarion punches outward first, which opens a temporary opening for that peer.
 - **Server:** open UDP 63425 inbound. Clients need no inbound rules or port forwarding.
 
 ### Known limitations
 
-- Hole punching works with most home routers but can fail when both sides are behind strict ("symmetric") NATs, such as some mobile carriers, or on networks that block UDP. A relay fallback is tracked in #13.
-- Messages to offline peers fail instead of being queued (#14).
+- Networks that block UDP entirely can't use Tarion yet; a TCP transport is tracked in #13.
+- Queued messages wait on the *sender's* device, so both of you need to be online at the same moment eventually. A server mailbox is tracked in #22.
 - One device per account (#15).
 - `identity.key` and the history are stored unencrypted, protected by file permissions (#16).
 - Trust on first use: on the very first contact you trust the key the server reports. Compare `tarion id` with your contact, or put their `id` in `config.json`, to rule that out.
 
+### Testing strict NATs
+
+Set `TARION_SIMULATE_STRICT_NAT=1` before starting a client. It then drops every direct packet from peers, like a strict NAT. With the relay on (both clients and the server), messages take the relay; with it off, they're queued.
+
 ## Privacy
 
-The server handles login and address lookup only. Chats go directly peer-to-peer over mutually authenticated TLS 1.3 and are never relayed through the server. The server's user list shows names only, not IP addresses. Local history is stored as plain text in the config folder with owner-only permissions.
+The server handles login and address lookup. By default it never carries messages: chats go directly between the two people. Only if everyone involved turns the relay on does it forward encrypted packets it can't read. Either way, chats are end-to-end encrypted with mutually authenticated TLS 1.3. The server's user list shows names only, not IP addresses. Local history is stored as plain text in the config folder with owner-only permissions.

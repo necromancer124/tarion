@@ -22,8 +22,16 @@ func newLimiter(every time.Duration, burst int) *limiter {
 	return &limiter{rate: 1 / every.Seconds(), burst: float64(burst), buckets: map[string]*bucket{}}
 }
 
+// newByteLimiter allows perSecond bytes per key, with one second of burst.
+func newByteLimiter(perSecond int) *limiter {
+	return &limiter{rate: float64(perSecond), burst: float64(perSecond), buckets: map[string]*bucket{}}
+}
+
 // Allow takes one token for key, reporting false when none is left.
-func (l *limiter) Allow(key string) bool {
+func (l *limiter) Allow(key string) bool { return l.AllowN(key, 1) }
+
+// AllowN takes n tokens for key, or none if fewer are left.
+func (l *limiter) AllowN(key string, n float64) bool {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	now := time.Now()
@@ -37,10 +45,10 @@ func (l *limiter) Allow(key string) bool {
 		b.tokens = l.burst
 	}
 	b.last = now
-	if b.tokens < 1 {
+	if b.tokens < n {
 		return false
 	}
-	b.tokens--
+	b.tokens -= n
 	return true
 }
 

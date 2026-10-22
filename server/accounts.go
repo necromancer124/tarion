@@ -275,6 +275,55 @@ func (a *Accounts) LoginWithPassword(name, pass, peerID string) (string, bool, e
 	return cur.Name, changed && u.PeerID != "", nil
 }
 
+// ChangePassword replaces the password after checking the current one. The
+// caller checks the new password's strength.
+func (a *Accounts) ChangePassword(name, oldPass, newPass string) error {
+	u, ok := a.get(name)
+	if !ok {
+		return errNoSuchUser
+	}
+	params := a.argon()
+	if match, _ := verifyPassword(u.Hash, oldPass, params); !match {
+		return errAuthFailed
+	}
+	hash, err := hashPassword(newPass, params)
+	if err != nil {
+		return err
+	}
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	cur := a.byKey[directory.NameKey(name)]
+	if cur == nil || cur.Hash != u.Hash {
+		return errAuthFailed // changed underneath us
+	}
+	cur.Hash = hash
+	return a.saveLocked()
+}
+
+// CheckPassword verifies a password without changing anything.
+func (a *Accounts) CheckPassword(name, pass string) error {
+	u, ok := a.get(name)
+	if !ok {
+		return errNoSuchUser
+	}
+	if match, _ := verifyPassword(u.Hash, pass, a.argon()); !match {
+		return errAuthFailed
+	}
+	return nil
+}
+
+// Delete removes an account, reporting whether it existed.
+func (a *Accounts) Delete(name string) (bool, error) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	key := directory.NameKey(name)
+	if a.byKey[key] == nil {
+		return false, nil
+	}
+	delete(a.byKey, key)
+	return true, a.saveLocked()
+}
+
 // LoginWithKey succeeds when peerID is the key bound to the account.
 func (a *Accounts) LoginWithKey(name, peerID string) (string, error) {
 	u, ok := a.get(name)

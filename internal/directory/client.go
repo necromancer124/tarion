@@ -13,6 +13,7 @@ import (
 
 	"github.com/necromancer124/tarion/internal/identity"
 	"github.com/necromancer124/tarion/internal/network"
+	"github.com/necromancer124/tarion/internal/relay"
 	"github.com/necromancer124/tarion/internal/wire"
 	"github.com/quic-go/quic-go"
 )
@@ -27,6 +28,13 @@ type ClientConfig struct {
 	ServerID string // pinned server key; empty means trust on first use
 	Invite   string // one-time code, needed only to register on an invite-only server
 
+	// AcceptRelay lets others reach this client through the server's relay
+	// (and lets it use the relay). Off means no message ever passes through
+	// the server.
+	AcceptRelay bool
+	// PublicAddr is an address the user made reachable (a forwarded port).
+	PublicAddr string
+
 	// OnServerID is called once when an unpinned server key is first seen,
 	// so the caller can persist the pin.
 	OnServerID func(id string)
@@ -36,6 +44,9 @@ type ClientConfig struct {
 	OnLoggedIn func(usedPassword bool)
 	// OnPunch is called for each punch request the server forwards.
 	OnPunch func(Push)
+	// OnRevoked receives the server's full list of banned keys at every
+	// login and whenever it changes. Callers enforce and persist it.
+	OnRevoked func(keys []string)
 }
 
 // Client keeps one QUIC connection to tariond open from the chat socket.
@@ -149,6 +160,12 @@ func (c *Client) session(ctx context.Context) (bool, error) {
 	if c.cfg.OnLoggedIn != nil {
 		c.cfg.OnLoggedIn(usedPassword)
 	}
+	if c.cfg.OnRevoked != nil {
+		c.cfg.OnRevoked(resp.Revoked)
+	}
+	if srv, ok := conn.RemoteAddr().(*net.UDPAddr); ok && c.nm.Relay() != nil {
+		c.nm.Relay().SetServer(srv) // relay packets travel this same path
+	}
 
 	for {
 		stream, err := conn.AcceptStream(ctx)
@@ -160,6 +177,8 @@ func (c *Client) session(ctx context.Context) (bool, error) {
 					return true, &FatalError{Msg: "logged in from another device; this session was closed"}
 				case CodeBanned:
 					return true, &FatalError{Msg: "banned from this server"}
+				case CodeDeleted:
+					return true, &FatalError{Msg: "this account was deleted"}
 				}
 			}
 			return true, err
@@ -202,6 +221,11 @@ func (c *Client) dial(ctx context.Context) (*quic.Conn, error) {
 		MaxIdleTimeout:       45 * time.Second,
 		KeepAlivePeriod:      15 * time.Second,
 	}
+	// The relay wrapper must recognize the server before the handshake: a
+	// client behind a strict NAT accepts packets from nobody else.
+	if srv, err := net.ResolveUDPAddr("udp", c.cfg.Server); err == nil && c.nm.Relay() != nil {
+		c.nm.Relay().SetServer(srv)
+	}
 	dialCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
 	defer cancel()
 	conn, err := c.nm.Dial(dialCtx, c.cfg.Server, tlsConf, quicConf)
@@ -228,7 +252,8 @@ func (c *Client) dial(ctx context.Context) (*quic.Conn, error) {
 func (c *Client) login(ctx context.Context, conn *quic.Conn) (Response, bool, error) {
 	local := c.nm.LocalAddrs()
 	usedPassword := c.cfg.Pass != ""
-	resp, err := roundTrip(ctx, conn, Request{Op: OpLogin, User: c.cfg.User, Pass: c.cfg.Pass, LocalAddrs: local})
+	resp, err := roundTrip(ctx, conn, Request{Op: OpLogin, User: c.cfg.User, Pass: c.cfg.Pass, LocalAddrs: local,
+		AcceptRelay: c.cfg.AcceptRelay, PublicAddr: c.cfg.PublicAddr})
 	if err != nil {
 		return resp, false, err
 	}
@@ -240,7 +265,8 @@ func (c *Client) login(ctx context.Context, conn *quic.Conn) (Response, bool, er
 		if c.cfg.Pass == "" {
 			return resp, false, &FatalError{Msg: fmt.Sprintf("account %s does not exist; run once with -pass to create it", c.cfg.User)}
 		}
-		resp, err = roundTrip(ctx, conn, Request{Op: OpRegister, User: c.cfg.User, Pass: c.cfg.Pass, Invite: c.cfg.Invite, LocalAddrs: local})
+		resp, err = roundTrip(ctx, conn, Request{Op: OpRegister, User: c.cfg.User, Pass: c.cfg.Pass, Invite: c.cfg.Invite, LocalAddrs: local,
+			AcceptRelay: c.cfg.AcceptRelay, PublicAddr: c.cfg.PublicAddr})
 		if err != nil {
 			return resp, false, err
 		}
@@ -293,6 +319,60 @@ func (c *Client) List() ([]string, error) {
 		return nil, err
 	}
 	return resp.Users, nil
+}
+
+// Relay asks the server for a relay session to target, for when a direct
+// connection fails. It returns the address to dial and the target's key.
+func (c *Client) Relay(target string) (addr, peerID string, err error) {
+	if !c.cfg.AcceptRelay {
+		return "", "", errors.New("relay is turned off")
+	}
+	resp, err := c.request(Request{Op: OpRelay, Target: target})
+	if err != nil {
+		return "", "", err
+	}
+	id, ok := relay.ParseID(resp.Relay)
+	if !ok {
+		return "", "", errors.New("server sent a bad relay session")
+	}
+	c.nm.Relay().Allow(id)
+	return relay.Addr{ID: id}.String(), resp.PeerID, nil
+}
+
+// ChangePassword changes the account password. The new password must meet
+// the server's rules; the error says why when it does not.
+func (c *Client) ChangePassword(oldPass, newPass string) error {
+	return c.accountOp(Request{Op: OpChangePassword, Pass: oldPass, NewPass: newPass})
+}
+
+// DeleteAccount deletes the account (the name becomes free) and ends the
+// session. Local history and keys stay on this device.
+func (c *Client) DeleteAccount(pass string) error {
+	return c.accountOp(Request{Op: OpDeleteAccount, Pass: pass})
+}
+
+func (c *Client) accountOp(req Request) error {
+	conn := c.current()
+	if conn == nil {
+		return errors.New("not connected to server")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), requestTimeout)
+	defer cancel()
+	resp, err := roundTrip(ctx, conn, req)
+	if err != nil {
+		return err
+	}
+	switch {
+	case resp.OK:
+		return nil
+	case resp.Error == ErrAuthFailed:
+		return errors.New("wrong password")
+	case resp.Error == ErrWeakPassword && resp.Detail != "":
+		return errors.New("new password rejected: " + resp.Detail)
+	case resp.Error == ErrRateLimited:
+		return errors.New("too many attempts; try again later")
+	}
+	return fmt.Errorf("server: %s", resp.Error)
 }
 
 // ErrUserOffline means the server has no online session for the target.
@@ -355,7 +435,25 @@ func (c *Client) handlePush(stream *quic.Stream) {
 	defer stream.Close()
 	_ = stream.SetDeadline(time.Now().Add(5 * time.Second))
 	var push Push
-	if err := wire.ReadFrame(stream, &push); err != nil || push.Type != PushPunch || push.Addr == "" {
+	if err := wire.ReadFrame(stream, &push); err != nil {
+		return
+	}
+	if push.Type == PushRelay {
+		if !c.cfg.AcceptRelay {
+			return // relay is off here: its packets stay unknown and are dropped
+		}
+		if id, ok := relay.ParseID(push.Relay); ok && c.nm.Relay() != nil {
+			c.nm.Relay().Allow(id)
+		}
+		return
+	}
+	if push.Type == PushRevoked {
+		if c.cfg.OnRevoked != nil {
+			c.cfg.OnRevoked(push.Revoked)
+		}
+		return
+	}
+	if push.Type != PushPunch || push.Addr == "" {
 		return
 	}
 	// The server rate-limits punches too; this just avoids repeating one

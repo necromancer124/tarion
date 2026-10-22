@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bufio"
 	"context"
 	"crypto/rand"
 	"crypto/subtle"
@@ -23,7 +24,9 @@ import (
 	"github.com/necromancer124/tarion/internal/directory"
 	"github.com/necromancer124/tarion/internal/identity"
 	"github.com/necromancer124/tarion/internal/network"
+	"github.com/necromancer124/tarion/internal/relay"
 	"github.com/necromancer124/tarion/internal/storage"
+	"golang.org/x/term"
 )
 
 var (
@@ -71,8 +74,9 @@ type model struct {
 
 type msgIncomingChat network.IncomingMessage
 type msgSendResult struct {
-	to  string
-	err error
+	to     string
+	err    error
+	queued bool
 }
 type msgDirectory struct {
 	status   string
@@ -89,6 +93,91 @@ type node struct {
 	dir    *directory.Client
 	cancel context.CancelFunc
 	events *hub
+
+	revokedMu sync.RWMutex
+	revoked   map[string]bool // keys banned by the server
+
+	relayedMu sync.Mutex
+	relayed   map[string]relaySession // contacts last reached via the relay
+
+	logMu sync.Mutex
+	logFn func(string) // background process log; nil in the menu
+
+	outboxMu    sync.Mutex    // one outbox pass at a time
+	outboxWake  chan struct{} // nudges the outbox loop
+	sendTimeout time.Duration // per public-address attempt; tests shorten it
+}
+
+// isRevoked reports whether the server banned this key.
+func (n *node) isRevoked(peerID string) bool {
+	if !n.cfg.EnforcesServerBans() {
+		return false
+	}
+	n.revokedMu.RLock()
+	defer n.revokedMu.RUnlock()
+	return n.revoked[strings.ToLower(peerID)]
+}
+
+func (n *node) setRevoked(keys []string) {
+	set := make(map[string]bool, len(keys))
+	for _, k := range keys {
+		set[strings.ToLower(k)] = true
+	}
+	n.revokedMu.Lock()
+	n.revoked = set
+	n.revokedMu.Unlock()
+	_ = storage.SaveRevoked(keys)
+}
+
+// errRevoked marks a peer the server operator banned.
+var errRevoked = errors.New("banned on your server")
+
+// accept filters incoming messages: never from banned keys, and only from
+// contacts when cfg.Accept is "contacts".
+func (n *node) accept(peerID string) error {
+	err := n.acceptRule(peerID)
+	if err != nil {
+		from := "peer-" + identity.Short(peerID)
+		if p, ok := storage.PeerByID(peerID); ok {
+			from = p.Name
+		}
+		n.logDrop(storage.DroppedMessage{Dir: "in", Peer: from, Reason: "refused: " + err.Error()})
+	}
+	return err
+}
+
+func (n *node) acceptRule(peerID string) error {
+	if n.isRevoked(peerID) {
+		return errors.New("you are banned on this user's server")
+	}
+	if f := acceptFor(n.cfg); f != nil {
+		return f(peerID)
+	}
+	return nil
+}
+
+func (n *node) setLogger(f func(string)) {
+	n.logMu.Lock()
+	n.logFn = f
+	n.logMu.Unlock()
+}
+
+// logDrop records a message that will never be delivered, in dropped.log,
+// the background log, and as a "dropped" event for local API apps.
+func (n *node) logDrop(d storage.DroppedMessage) {
+	d.Time = time.Now()
+	_ = storage.LogDropped(d)
+	n.events.publish(controlEvent{Type: "dropped", Chat: d.Peer, Body: d.Body, Reason: d.Reason, Time: d.Time.Format(time.RFC3339)})
+	n.logMu.Lock()
+	f := n.logFn
+	n.logMu.Unlock()
+	if f != nil {
+		dir := "to"
+		if d.Dir == "in" {
+			dir = "from"
+		}
+		f(fmt.Sprintf("dropped message %s %s: %s", dir, d.Peer, d.Reason))
+	}
 }
 
 // controlEvent is one line of a `subscribe` stream.
@@ -99,6 +188,7 @@ type controlEvent struct {
 	Body   string `json:"body,omitempty"`
 	Time   string `json:"time,omitempty"` // when it arrived, RFC 3339
 	Status string `json:"status,omitempty"`
+	Reason string `json:"reason,omitempty"` // for "dropped"
 }
 
 // hub fans events out to local API subscribers. A subscriber that falls
@@ -156,23 +246,39 @@ func acceptFor(cfg *storage.Config) func(peerID string) error {
 
 func startNode(cfg *storage.Config, id *identity.Identity) (*node, error) {
 	nm := network.NewNetworkManager(cfg.Port, id)
-	nm.Accept = acceptFor(cfg)
+	n := &node{
+		cfg:         cfg,
+		nm:          nm,
+		events:      &hub{subs: map[chan controlEvent]struct{}{}},
+		revoked:     storage.LoadRevoked(),
+		outboxWake:  make(chan struct{}, 1),
+		sendTimeout: 10 * time.Second,
+	}
+	nm.Accept = n.accept
 	if err := nm.StartListener(); err != nil {
 		return nil, err
 	}
-	n := &node{cfg: cfg, nm: nm, cancel: func() {}, events: &hub{subs: map[chan controlEvent]struct{}{}}}
+	if os.Getenv("TARION_SIMULATE_STRICT_NAT") == "1" {
+		// Testing aid: behave like a strict NAT (only the server gets in),
+		// so messages must take the relay.
+		nm.Relay().SimulateStrictNAT(true)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	n.cancel = cancel
+	go n.runOutbox(ctx)
 	if cfg.ServerAddr != "" && cfg.Username != "" {
-		ctx, cancel := context.WithCancel(context.Background())
-		n.cancel = cancel
 		n.dir = directory.NewClient(nm, directory.ClientConfig{
-			Server:   cfg.ServerAddr,
-			User:     cfg.Username,
-			Pass:     cfg.Password,
-			Invite:   cfg.Invite,
-			ServerID: cfg.ServerID,
+			Server:      cfg.ServerAddr,
+			User:        cfg.Username,
+			Pass:        cfg.Password,
+			Invite:      cfg.Invite,
+			ServerID:    cfg.ServerID,
+			AcceptRelay: cfg.RelayEnabled(),
+			PublicAddr:  cfg.PublicAddr,
 			OnServerID: func(id string) {
 				_ = storage.UpdateConfig(func(c *storage.Config) { c.ServerID = id })
 			},
+			OnRevoked: n.setRevoked,
 			OnLoggedIn: func(usedPassword bool) {
 				if usedPassword {
 					// The account now trusts this device's key; stop keeping the
@@ -184,6 +290,137 @@ func startNode(cfg *storage.Config, id *identity.Identity) (*node, error) {
 		go n.dir.Run(ctx)
 	}
 	return n, nil
+}
+
+const (
+	outboxRetryBase = 15 * time.Second
+	outboxRetryMax  = 10 * time.Minute
+	outboxExpiry    = 7 * 24 * time.Hour
+)
+
+// send delivers now or, if the contact can't be reached, queues the message
+// in the outbox and keeps retrying it. queued says which; err says why it
+// was not delivered right away.
+func (n *node) send(to, addr, body string) (queued bool, err error) {
+	if body == "" || len(body) > network.MaxBodyBytes {
+		return false, fmt.Errorf("message must be 1-%d bytes", network.MaxBodyBytes)
+	}
+	id, now := network.NewMessageID(), time.Now()
+	err = n.deliverMsg(id, now, to, addr, body)
+	if err == nil {
+		return false, nil
+	}
+	if !n.retryable(err) {
+		n.logDrop(storage.DroppedMessage{Dir: "out", Peer: to, Reason: err.Error(), Body: body})
+		return false, err
+	}
+	item := storage.OutboxItem{ID: id, To: to, Addr: addr, Body: body, Created: now, Attempts: 1,
+		NextTry: now.Add(outboxRetryBase), LastError: err.Error()}
+	if qerr := storage.Enqueue(item); qerr != nil {
+		err = fmt.Errorf("%v (could not queue it: %v)", err, qerr)
+		n.logDrop(storage.DroppedMessage{Dir: "out", Peer: to, Reason: err.Error(), Body: body})
+		return false, err
+	}
+	select {
+	case n.outboxWake <- struct{}{}:
+	default:
+	}
+	return true, err
+}
+
+// retryable is false for failures waiting won't fix: a wrong or banned key,
+// a refusal, or nowhere to look for the contact.
+func (n *node) retryable(err error) bool {
+	var mismatch *storage.IdentityMismatchError
+	var rejected *network.RejectedError
+	switch {
+	case errors.Is(err, errRevoked), errors.As(err, &mismatch):
+		return false
+	case errors.As(err, &rejected):
+		return rejected.Reason == "receiver busy"
+	case errors.Is(err, errNoAddress):
+		return n.dir != nil // they may still log in to the server
+	}
+	return true
+}
+
+func (n *node) runOutbox(ctx context.Context) {
+	ticker := time.NewTicker(5 * time.Second)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+		case <-n.outboxWake:
+		}
+		n.flushOutbox()
+	}
+}
+
+// flushOutbox retries queued messages that are due, or whose recipient the
+// server now lists as online. Messages to one contact stay in order: after
+// a failure, that contact's later messages wait for the next pass.
+func (n *node) flushOutbox() {
+	n.outboxMu.Lock()
+	defer n.outboxMu.Unlock()
+	items, err := storage.Outbox()
+	if err != nil || len(items) == 0 {
+		return
+	}
+	online := map[string]bool{}
+	if n.dir != nil && n.dir.Connected() {
+		users, _ := n.dir.List()
+		for _, u := range users {
+			online[strings.ToLower(u)] = true
+		}
+	}
+	now := time.Now()
+	blocked := map[string]bool{}
+	for _, it := range items {
+		key := strings.ToLower(it.To)
+		if blocked[key] {
+			continue
+		}
+		if now.Sub(it.Created) > outboxExpiry {
+			_ = storage.RemoveOutbox(it.ID)
+			_ = storage.AppendHistory(it.To, "  ! gave up after 7 days, not delivered: "+snippet(it.Body))
+			n.logDrop(storage.DroppedMessage{Dir: "out", Peer: it.To, Reason: "gave up after 7 days: " + it.LastError, Body: it.Body})
+			continue
+		}
+		if now.Before(it.NextTry) && !online[key] {
+			blocked[key] = true
+			continue
+		}
+		err := n.deliverMsg(it.ID, it.Created, it.To, it.Addr, it.Body)
+		switch {
+		case err == nil:
+			_ = storage.RemoveOutbox(it.ID)
+			_ = storage.AppendHistory(it.To, "  ✓ delivered later: "+snippet(it.Body))
+			n.events.publish(controlEvent{Type: "delivered", Chat: it.To, Body: it.Body, Time: time.Now().Format(time.RFC3339)})
+		case !n.retryable(err):
+			_ = storage.RemoveOutbox(it.ID)
+			_ = storage.AppendHistory(it.To, "  ! not delivered: "+storage.CleanText(err.Error()))
+			n.logDrop(storage.DroppedMessage{Dir: "out", Peer: it.To, Reason: err.Error(), Body: it.Body})
+		default:
+			it.Attempts++
+			wait := outboxRetryBase << min(it.Attempts, 6)
+			if wait > outboxRetryMax {
+				wait = outboxRetryMax
+			}
+			it.NextTry, it.LastError = now.Add(wait), err.Error()
+			_ = storage.UpdateOutbox(it)
+			blocked[key] = true
+		}
+	}
+}
+
+func snippet(s string) string {
+	s = storage.CleanText(s)
+	if r := []rune(s); len(r) > 40 {
+		return string(r[:40]) + "…"
+	}
+	return s
 }
 
 // serveIncoming records each incoming message and tells subscribers. The
@@ -253,6 +490,23 @@ func configuredID(cfg *storage.Config, name string) string {
 // answers must match the key fixed in config, the server's record, and the
 // key pinned on first contact; otherwise nothing is sent.
 func (n *node) deliver(to, addr, body string) error {
+	return n.deliverMsg(network.NewMessageID(), time.Now(), to, addr, body)
+}
+
+var (
+	errOffline   = errors.New("offline")
+	errNoAddress = errors.New("no address")
+)
+
+func (n *node) deliverMsg(id string, sent time.Time, to, addr, body string) error {
+	// Refuse a banned contact up front: once the ban disconnects them they
+	// look merely offline, and the message would sit in the outbox.
+	if p, ok := storage.PeerByName(to); ok && n.isRevoked(p.ID) {
+		return fmt.Errorf("%s is %w", to, errRevoked)
+	}
+	if id := configuredID(n.cfg, to); id != "" && n.isRevoked(id) {
+		return fmt.Errorf("%s is %w", to, errRevoked)
+	}
 	var candidates []string
 	dirID := ""
 	offline := false
@@ -261,7 +515,13 @@ func (n *node) deliver(to, addr, body string) error {
 		switch {
 		case err == nil:
 			dirID = resp.PeerID
-			candidates = append(append(candidates, resp.LocalAddrs...), resp.Addr)
+			// LAN first, then an address they made reachable themselves
+			// (a forwarded port), then the one the server observed.
+			candidates = append(candidates, resp.LocalAddrs...)
+			if resp.PublicAddr != "" && resp.PublicAddr != resp.Addr {
+				candidates = append(candidates, resp.PublicAddr)
+			}
+			candidates = append(candidates, resp.Addr)
 		case errors.Is(err, directory.ErrUserOffline):
 			offline = true
 		}
@@ -272,44 +532,144 @@ func (n *node) deliver(to, addr, body string) error {
 		}
 		if addr == "" {
 			if offline {
-				return fmt.Errorf("%s is offline", to)
+				return fmt.Errorf("%s is %w", to, errOffline)
 			}
-			return fmt.Errorf("no address for %s", to)
+			return fmt.Errorf("%w for %s", errNoAddress, to)
 		}
 		candidates = []string{addr}
 	}
 
 	configured := configuredID(n.cfg, to)
-	var lastErr, identityErr error
-	for i, cand := range candidates {
-		timeout := 10 * time.Second
-		if i < len(candidates)-1 {
-			timeout = 3 * time.Second // a LAN address either answers fast or is wrong
-		}
+	attempt := func(cand string, timeout time.Duration, wantID string) error {
 		ctx, cancel := context.WithTimeout(context.Background(), timeout)
-		_, err := n.nm.SendContext(ctx, cand, senderName(n.cfg), body, func(peerID string) error {
+		defer cancel()
+		_, err := n.nm.SendMessage(ctx, id, sent, cand, senderName(n.cfg), body, func(peerID string) error {
+			if n.isRevoked(peerID) {
+				return fmt.Errorf("%s is %w", to, errRevoked)
+			}
 			if configured != "" && !strings.EqualFold(configured, peerID) {
 				return &storage.IdentityMismatchError{Name: to, Expected: configured, Got: peerID}
 			}
-			if dirID != "" && !strings.EqualFold(dirID, peerID) {
-				return &storage.IdentityMismatchError{Name: to, Expected: dirID, Got: peerID}
+			if wantID != "" && !strings.EqualFold(wantID, peerID) {
+				return &storage.IdentityMismatchError{Name: to, Expected: wantID, Got: peerID}
 			}
 			return storage.PinOutgoing(to, peerID, cand)
 		})
-		cancel()
+		return err
+	}
+	// final errors end the attempt: a wrong or banned key, or the peer was
+	// reached and refused. Trying their other addresses (or the relay)
+	// would only repeat the same answer.
+	isIdentityErr := func(err error) bool {
+		var mismatch *storage.IdentityMismatchError
+		var rejected *network.RejectedError
+		return errors.As(err, &mismatch) || errors.Is(err, errRevoked) || errors.As(err, &rejected)
+	}
+
+	// When the server knows the contact, it can relay if the direct path
+	// fails (strict NATs). The packets stay end-to-end encrypted.
+	canRelay := dirID != "" && n.cfg.RelayEnabled()
+	viaRelay := func() error {
+		// Reuse the contact's relay session while it is alive; the server
+		// caps how many each user may hold open.
+		if s, ok := n.relaySession(to); ok {
+			err := attempt(s.addr, 3*time.Second, s.peerID)
+			if err == nil {
+				n.setRelaySession(to, s)
+				return nil
+			}
+			if isIdentityErr(err) {
+				return err
+			}
+		}
+		raddr, relayID, err := n.dir.Relay(to)
+		if err != nil {
+			return err
+		}
+		if err := attempt(raddr, n.sendTimeout, relayID); err != nil {
+			return err
+		}
+		n.setRelaySession(to, relaySession{addr: raddr, peerID: relayID})
+		return nil
+	}
+	triedRelay := false
+	if canRelay && n.relayedRecently(to) {
+		triedRelay = true
+		if err := viaRelay(); err == nil || isIdentityErr(err) {
+			return err
+		}
+	}
+
+	var lastErr error
+	for i, cand := range candidates {
+		timeout := n.sendTimeout
+		if canRelay {
+			timeout /= 2 // the relay is the fallback, don't wait the full time
+		}
+		if i < len(candidates)-1 {
+			timeout = 3 * time.Second // a LAN address either answers fast or is wrong
+		}
+		err := attempt(cand, timeout, dirID)
 		if err == nil {
+			n.clearRelay(to)
 			return nil
 		}
-		var mismatch *storage.IdentityMismatchError
-		if errors.As(err, &mismatch) {
-			identityErr = err
+		if isIdentityErr(err) {
+			return err
 		}
 		lastErr = err
 	}
-	if identityErr != nil {
-		return identityErr
+	if canRelay && !triedRelay {
+		err := viaRelay()
+		if err == nil || isIdentityErr(err) {
+			return err
+		}
+		return fmt.Errorf("%w (relay: %v)", lastErr, err)
 	}
 	return lastErr
+}
+
+const (
+	relayMemory     = 10 * time.Minute // go straight to the relay for this long
+	relaySessionTTL = 90 * time.Second // reuse a session (the server keeps it 2 min)
+)
+
+type relaySession struct {
+	addr, peerID string
+	used         time.Time
+}
+
+// relayedRecently reports whether to was reached only through the relay in
+// the last few minutes, so the next message can skip the direct attempts.
+func (n *node) relayedRecently(to string) bool {
+	n.relayedMu.Lock()
+	defer n.relayedMu.Unlock()
+	s, ok := n.relayed[strings.ToLower(to)]
+	return ok && time.Since(s.used) < relayMemory
+}
+
+// relaySession returns a still-usable relay session to to.
+func (n *node) relaySession(to string) (relaySession, bool) {
+	n.relayedMu.Lock()
+	defer n.relayedMu.Unlock()
+	s, ok := n.relayed[strings.ToLower(to)]
+	return s, ok && s.addr != "" && time.Since(s.used) < relaySessionTTL
+}
+
+func (n *node) setRelaySession(to string, s relaySession) {
+	n.relayedMu.Lock()
+	defer n.relayedMu.Unlock()
+	if n.relayed == nil {
+		n.relayed = map[string]relaySession{}
+	}
+	s.used = time.Now()
+	n.relayed[strings.ToLower(to)] = s
+}
+
+func (n *node) clearRelay(to string) {
+	n.relayedMu.Lock()
+	delete(n.relayed, strings.ToLower(to))
+	n.relayedMu.Unlock()
 }
 
 // The local API: one JSON object per line over TCP on 127.0.0.1, each
@@ -321,6 +681,9 @@ type controlRequest struct {
 	Addr  string `json:"addr,omitempty"`
 	Body  string `json:"body,omitempty"`
 	Limit int    `json:"limit,omitempty"`
+	// Pass and NewPass are only used by change_password / delete_account.
+	Pass    string `json:"pass,omitempty"`
+	NewPass string `json:"new_pass,omitempty"`
 }
 
 type controlResponse struct {
@@ -329,6 +692,9 @@ type controlResponse struct {
 	Status string   `json:"status,omitempty"`
 	Users  []string `json:"users,omitempty"`
 	Lines  []string `json:"lines,omitempty"`
+	// Queued (on send) means the contact couldn't be reached and the message
+	// waits in the outbox; Error says why.
+	Queued bool `json:"queued,omitempty"`
 }
 
 const maxControlRequest = 64 * 1024
@@ -500,10 +866,25 @@ func handleControlConn(conn net.Conn, token string, n *node) {
 			os.Exit(0)
 		}()
 	case "send":
-		reply(n.deliver(req.To, req.Addr, req.Body))
+		queued, err := n.send(req.To, req.Addr, req.Body)
+		if queued {
+			send(controlResponse{OK: true, Queued: true, Error: err.Error()})
+		} else {
+			reply(err)
+		}
 	case "online":
 		status, users := n.directoryStatus()
 		send(controlResponse{OK: true, Status: status, Users: users})
+	case "change_password", "delete_account":
+		if n.dir == nil || !n.dir.Connected() {
+			reply(errors.New("not connected to a server"))
+			return
+		}
+		if req.Cmd == "change_password" {
+			reply(n.dir.ChangePassword(req.Pass, req.NewPass))
+		} else {
+			reply(n.dir.DeleteAccount(req.Pass))
+		}
 	case "history":
 		if req.To == "" {
 			reply(errors.New(`history needs "to"`))
@@ -547,6 +928,9 @@ func recordIncoming(msg network.IncomingMessage) (chat, line string) {
 		chat = "peer-" + identity.Short(msg.PeerID)
 	}
 	line = fmt.Sprintf("%s: %s", chat, storage.CleanText(msg.Body))
+	if late := time.Since(msg.Sent); late > 2*time.Minute && msg.Sent.Year() > 2000 {
+		line += "  (sent " + msg.Sent.Local().Format("Jan 2 15:04") + ")"
+	}
 	_ = storage.AppendHistory(chat, line)
 	return chat, line
 }
@@ -771,15 +1155,20 @@ func (m model) sendCmd(to, addr, body string) tea.Cmd {
 	cfg, n, useBackground := m.cfg, m.node, m.useBackground
 	return func() tea.Msg {
 		var err error
+		var queued bool
 		switch {
 		case useBackground:
-			err = backgroundRequest(cfg, controlRequest{Cmd: "send", To: to, Addr: addr, Body: body})
+			var resp controlResponse
+			resp, err = backgroundCall(cfg, controlRequest{Cmd: "send", To: to, Addr: addr, Body: body})
+			if resp.Queued {
+				queued, err = true, errors.New(resp.Error)
+			}
 		case n != nil:
-			err = n.deliver(to, addr, body)
+			queued, err = n.send(to, addr, body)
 		default:
 			err = errors.New("not connected: no listener and no background process")
 		}
-		return msgSendResult{to: to, err: err}
+		return msgSendResult{to: to, err: err, queued: queued}
 	}
 }
 
@@ -849,13 +1238,24 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		incoming := network.IncomingMessage(msg)
 		name, line := recordIncoming(incoming)
 		viewing := m.state == StateChatView && m.activeContact == name
-		m.upsertContact(Contact{Username: name, Addr: incoming.Addr, Online: true, Unread: !viewing})
+		addr := incoming.Addr
+		if relay.IsAddr(addr) {
+			addr = "" // only valid during that relay session
+		}
+		m.upsertContact(Contact{Username: name, Addr: addr, Online: true, Unread: !viewing})
 		if viewing {
 			m.chatHistory = append(m.chatHistory, line)
 		}
 		return m, m.listenForMessages()
 	case msgSendResult:
-		if msg.err != nil {
+		if msg.queued {
+			m.statusLine = "queued for " + msg.to + " (" + msg.err.Error() + "); it will be delivered automatically"
+			line := "  … queued: " + storage.CleanText(msg.err.Error()) + "; will retry"
+			_ = storage.AppendHistory(msg.to, line)
+			if m.state == StateChatView && m.activeContact == msg.to {
+				m.chatHistory = append(m.chatHistory, line)
+			}
+		} else if msg.err != nil {
 			m.statusLine = styleError.Render("not delivered to " + msg.to + ": " + msg.err.Error())
 			line := "  ! not delivered: " + storage.CleanText(msg.err.Error())
 			_ = storage.AppendHistory(msg.to, line)
@@ -1036,17 +1436,21 @@ func setStopUsage(fs *flag.FlagSet) {
 type clientFlags struct {
 	port, ctrl                         *int
 	server, user, pass, invite, accept *string
+	serverBans, relayMode, publicAddr  *string
 }
 
 func addClientFlags(fs *flag.FlagSet) clientFlags {
 	return clientFlags{
-		port:   fs.Int("p", 0, fmt.Sprintf("local UDP port for chat and server traffic (default %d)", storage.DefaultPort)),
-		ctrl:   fs.Int("cp", 0, "local TCP port of the background control socket (default: -p plus 10000)"),
-		server: fs.String("server", "", fmt.Sprintf("directory server host:port (tariond default port %d)", directory.DefaultServerPort)),
-		user:   fs.String("user", "", "directory username"),
-		pass:   fs.String("pass", "", "directory password (only needed the first time on this device)"),
-		invite: fs.String("invite", "", "one-time invite code, if the server is invite-only"),
-		accept: fs.String("accept", "", "who may message you: anyone or contacts (saved)"),
+		port:       fs.Int("p", 0, fmt.Sprintf("local UDP port for chat and server traffic (default %d)", storage.DefaultPort)),
+		ctrl:       fs.Int("cp", 0, "local TCP port of the background control socket (default: -p plus 10000)"),
+		server:     fs.String("server", "", fmt.Sprintf("directory server host:port (tariond default port %d)", directory.DefaultServerPort)),
+		user:       fs.String("user", "", "directory username"),
+		pass:       fs.String("pass", "", "directory password (only needed the first time on this device)"),
+		invite:     fs.String("invite", "", "one-time invite code, if the server is invite-only"),
+		accept:     fs.String("accept", "", "who may message you: anyone or contacts (saved)"),
+		serverBans: fs.String("server-bans", "", "on (default) or off: refuse keys the server banned (saved)"),
+		relayMode:  fs.String("relay", "", "off (default) or on: allow messages through the server when no direct path exists (saved)"),
+		publicAddr: fs.String("public-addr", "", `address peers can reach you at directly, e.g. a forwarded port "203.0.113.7:63426"; "none" clears it (saved)`),
 	}
 }
 
@@ -1071,6 +1475,26 @@ func (f clientFlags) apply(cfg *storage.Config) error {
 	case "", "anyone", "contacts":
 	default:
 		return errors.New(`-accept must be "anyone" or "contacts"`)
+	}
+	if f.serverBans != nil && *f.serverBans != "" {
+		cfg.ServerBans = *f.serverBans
+	}
+	if f.relayMode != nil && *f.relayMode != "" {
+		cfg.Relay = *f.relayMode
+	}
+	for name, v := range map[string]string{"-server-bans": cfg.ServerBans, "-relay": cfg.Relay} {
+		if v != "" && v != "on" && v != "off" {
+			return fmt.Errorf(`%s must be "on" or "off"`, name)
+		}
+	}
+	if f.publicAddr != nil && *f.publicAddr != "" {
+		cfg.PublicAddr = *f.publicAddr
+		if cfg.PublicAddr == "none" {
+			cfg.PublicAddr = ""
+		}
+	}
+	if cfg.PublicAddr != "" && !directory.ValidPublicAddr(cfg.PublicAddr) {
+		return errors.New(`-public-addr must be "host:port" (an IP or DNS name)`)
 	}
 	if *f.port != 0 {
 		cfg.Port = *f.port
@@ -1168,6 +1592,7 @@ func runBackground(args []string) error {
 		fmt.Printf("new message from %s (%s, id %s)\n", chat, msg.Addr, identity.Short(msg.PeerID))
 	})
 	go n.watchStatus(func(s string) { fmt.Println(s) })
+	n.setLogger(func(s string) { fmt.Println(s) })
 
 	stop := make(chan os.Signal, 1)
 	signal.Notify(stop, os.Interrupt, syscall.SIGTERM)
@@ -1236,10 +1661,16 @@ func runSend(args []string) error {
 	if !backgroundRunning(cfg) {
 		return errors.New("no background process running; start one with: tarion background --detach")
 	}
-	if err := backgroundRequest(cfg, controlRequest{Cmd: "send", To: to, Body: body}); err != nil {
+	resp, err := backgroundCall(cfg, controlRequest{Cmd: "send", To: to, Body: body})
+	if err != nil {
 		return fmt.Errorf("not delivered to %s: %w", to, err)
 	}
 	_ = storage.AppendHistory(to, "Me: "+storage.CleanText(body))
+	if resp.Queued {
+		_ = storage.AppendHistory(to, "  … queued: "+storage.CleanText(resp.Error)+"; will retry")
+		fmt.Printf("queued for %s (%s); the background process delivers it when they can be reached\n", to, resp.Error)
+		return nil
+	}
 	fmt.Println("delivered to", to)
 	return nil
 }
@@ -1311,6 +1742,180 @@ func parseInterspersed(fs *flag.FlagSet, args []string) []string {
 	}
 }
 
+var stdinLines = bufio.NewReader(os.Stdin)
+
+// readSecret prompts on stderr and reads without echo from a terminal, or a
+// plain line when input is piped (for scripts).
+func readSecret(prompt string) (string, error) {
+	fmt.Fprint(os.Stderr, prompt)
+	if fd := int(os.Stdin.Fd()); term.IsTerminal(fd) {
+		b, err := term.ReadPassword(fd)
+		fmt.Fprintln(os.Stderr)
+		return string(b), err
+	}
+	return readLine("")
+}
+
+func readLine(prompt string) (string, error) {
+	fmt.Fprint(os.Stderr, prompt)
+	line, err := stdinLines.ReadString('\n')
+	if err != nil && line == "" {
+		return "", err
+	}
+	return strings.TrimRight(line, "\r\n"), nil
+}
+
+// runAccountOp performs an account operation through the background
+// process if one is running (it owns the server session), or else logs in
+// briefly with this device's key.
+func runAccountOp(cfg *storage.Config, ctl controlRequest, op func(*directory.Client) error) error {
+	if backgroundRunning(cfg) {
+		return backgroundRequest(cfg, ctl)
+	}
+	if cfg.ServerAddr == "" || cfg.Username == "" {
+		return errors.New("no server account configured (log in once with -server and -user)")
+	}
+	id, err := loadIdentity()
+	if err != nil {
+		return err
+	}
+	n, err := startNode(cfg, id)
+	if err != nil {
+		return err
+	}
+	defer n.close()
+	for deadline := time.Now().Add(15 * time.Second); !n.dir.Connected(); time.Sleep(100 * time.Millisecond) {
+		if time.Now().After(deadline) {
+			return fmt.Errorf("could not log in: %s", n.dir.Status())
+		}
+	}
+	return op(n.dir)
+}
+
+func runPasswd(args []string) error {
+	fs := flag.NewFlagSet("passwd", flag.ExitOnError)
+	apply := portFlags(fs)
+	_ = fs.Parse(args)
+	cfg, err := storage.LoadOrCreateConfig()
+	if err != nil {
+		return err
+	}
+	apply(cfg)
+	oldPass, err := readSecret("Current password: ")
+	if err != nil {
+		return err
+	}
+	newPass, err := readSecret("New password: ")
+	if err != nil {
+		return err
+	}
+	again, err := readSecret("Repeat new password: ")
+	if err != nil {
+		return err
+	}
+	if newPass != again {
+		return errors.New("the new passwords don't match")
+	}
+	err = runAccountOp(cfg, controlRequest{Cmd: "change_password", Pass: oldPass, NewPass: newPass},
+		func(d *directory.Client) error { return d.ChangePassword(oldPass, newPass) })
+	if err != nil {
+		return err
+	}
+	fmt.Println("Password changed.")
+	return nil
+}
+
+func runDeleteAccount(args []string) error {
+	fs := flag.NewFlagSet("delete-account", flag.ExitOnError)
+	apply := portFlags(fs)
+	_ = fs.Parse(args)
+	cfg, err := storage.LoadOrCreateConfig()
+	if err != nil {
+		return err
+	}
+	apply(cfg)
+	if cfg.Username == "" {
+		return errors.New("no account configured")
+	}
+	confirm, err := readLine(fmt.Sprintf("This deletes the account %q on %s. Type the username to confirm: ", cfg.Username, cfg.ServerAddr))
+	if err != nil {
+		return err
+	}
+	if confirm != cfg.Username {
+		return errors.New("username did not match; nothing deleted")
+	}
+	pass, err := readSecret("Password: ")
+	if err != nil {
+		return err
+	}
+	err = runAccountOp(cfg, controlRequest{Cmd: "delete_account", Pass: pass},
+		func(d *directory.Client) error { return d.DeleteAccount(pass) })
+	if err != nil {
+		return err
+	}
+	_ = storage.UpdateConfig(func(c *storage.Config) { c.Username, c.Password, c.Invite = "", "", "" })
+	fmt.Println("Account deleted. Your history and identity key on this device were kept.")
+	if backgroundRunning(cfg) {
+		fmt.Println("The background process is still running without an account; stop it with: tarion stop")
+	}
+	return nil
+}
+
+// runOutbox lists messages waiting to be delivered.
+func runOutbox(args []string) error {
+	fs := flag.NewFlagSet("outbox", flag.ExitOnError)
+	_ = fs.Parse(args)
+	items, err := storage.Outbox()
+	if err != nil {
+		return err
+	}
+	if len(items) == 0 {
+		fmt.Println("Nothing is waiting to be delivered.")
+		return nil
+	}
+	now := time.Now()
+	for _, it := range items {
+		fmt.Printf("to %-16s queued %s ago, %d tries, next %s\n    %s\n    last error: %s\n",
+			it.To, now.Sub(it.Created).Round(time.Second), it.Attempts, nextTry(it.NextTry, now),
+			snippet(it.Body), storage.CleanText(it.LastError))
+	}
+	fmt.Printf("%d waiting. The background process (or open menu) retries them for up to 7 days.\n", len(items))
+	return nil
+}
+
+func nextTry(t, now time.Time) string {
+	if !t.After(now) {
+		return "now"
+	}
+	return "in " + t.Sub(now).Round(time.Second).String()
+}
+
+// runDropped lists messages that were given up on or refused.
+func runDropped(args []string) error {
+	fs := flag.NewFlagSet("dropped", flag.ExitOnError)
+	n := fs.Int("n", 20, "how many recent entries (0 = all)")
+	_ = fs.Parse(args)
+	entries, err := storage.ReadDropped(*n)
+	if err != nil {
+		return err
+	}
+	if len(entries) == 0 {
+		fmt.Println("No dropped messages.")
+		return nil
+	}
+	for _, d := range entries {
+		dir := "to  "
+		if d.Dir == "in" {
+			dir = "from"
+		}
+		fmt.Printf("%s  %s %-16s %s\n", d.Time.Local().Format("2006-01-02 15:04"), dir, d.Peer, storage.CleanText(d.Reason))
+		if d.Body != "" {
+			fmt.Printf("    %s\n", snippet(d.Body))
+		}
+	}
+	return nil
+}
+
 func runID() error {
 	id, err := loadIdentity()
 	if err != nil {
@@ -1369,6 +1974,10 @@ func printGeneralHelp() {
 		"  send        Send one message through the background process",
 		"  listen      Print incoming messages as JSON lines (for scripts and apps)",
 		"  history     Print a chat's recent history",
+		"  outbox      List messages waiting to be delivered",
+		"  dropped     List messages that were given up on or refused",
+		"  passwd      Change your account password",
+		"  delete-account  Delete your account on the server",
 		"  id          Show your peer ID so contacts can verify you",
 		"  peers       List pinned contacts and their peer IDs",
 		"  forget      Remove a contact's pinned key (after they reinstall)",
@@ -1404,7 +2013,7 @@ func main() {
 	cmd := "start"
 	if len(args) > 0 {
 		switch args[0] {
-		case "start", "menu", "background", "stop", "send", "listen", "history", "id", "peers", "forget":
+		case "start", "menu", "background", "stop", "send", "listen", "history", "outbox", "dropped", "passwd", "delete-account", "id", "peers", "forget":
 			cmd, args = args[0], args[1:]
 		}
 	}
@@ -1421,6 +2030,14 @@ func main() {
 		err = runListen(args)
 	case "history":
 		err = runHistory(args)
+	case "outbox":
+		err = runOutbox(args)
+	case "dropped":
+		err = runDropped(args)
+	case "passwd":
+		err = runPasswd(args)
+	case "delete-account":
+		err = runDeleteAccount(args)
 	case "id":
 		err = runID()
 	case "peers":

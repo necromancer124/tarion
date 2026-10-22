@@ -98,6 +98,36 @@ func PeerByName(name string) (Peer, bool) {
 	return Peer{}, false
 }
 
+func GetRevokedPath() string { return filepath.Join(GetBaseConfigDir(), "revoked.json") }
+
+// LoadRevoked returns the banned keys last received from the server, so
+// bans still apply before (or without) a server connection.
+func LoadRevoked() map[string]bool {
+	set := map[string]bool{}
+	data, err := os.ReadFile(GetRevokedPath())
+	if err != nil {
+		return set
+	}
+	var keys []string
+	if json.Unmarshal(data, &keys) == nil {
+		for _, k := range keys {
+			set[strings.ToLower(k)] = true
+		}
+	}
+	return set
+}
+
+func SaveRevoked(keys []string) error {
+	if keys == nil {
+		keys = []string{}
+	}
+	data, err := json.Marshal(keys)
+	if err != nil {
+		return err
+	}
+	return writeFileAtomic(GetRevokedPath(), data)
+}
+
 // PeerByID returns the pinned peer for a key.
 func PeerByID(id string) (Peer, bool) {
 	peers, err := ListPeers()
@@ -126,7 +156,10 @@ func ResolveIncoming(peerID, claimedName, addr string) (string, error) {
 	now := time.Now()
 	for i := range peers {
 		if peers[i].ID == peerID {
-			peers[i].Addr, peers[i].LastSeen = addr, now
+			if storableAddr(addr) {
+				peers[i].Addr = addr
+			}
+			peers[i].LastSeen = now
 			return peers[i].Name, savePeers(peers)
 		}
 	}
@@ -141,8 +174,17 @@ func ResolveIncoming(peerID, claimedName, addr string) (string, error) {
 			break
 		}
 	}
+	if !storableAddr(addr) {
+		addr = ""
+	}
 	peers = append(peers, Peer{ID: peerID, Name: name, Addr: addr, FirstSeen: now, LastSeen: now})
 	return name, savePeers(peers)
+}
+
+// storableAddr is false for relay addresses ("relay:<id>"): they only mean
+// something during one relay session, so they are never remembered.
+func storableAddr(addr string) bool {
+	return addr != "" && !strings.HasPrefix(addr, "relay:")
 }
 
 // PinOutgoing is called after the handshake with the contact the user chose
@@ -161,13 +203,22 @@ func PinOutgoing(name, peerID, addr string) error {
 			if peers[i].ID != peerID {
 				return &IdentityMismatchError{Name: name, Expected: peers[i].ID, Got: peerID}
 			}
-			peers[i].Addr, peers[i].LastSeen = addr, now
+			if storableAddr(addr) {
+				peers[i].Addr = addr
+			}
+			peers[i].LastSeen = now
 			return savePeers(peers)
 		}
 	}
+	if !storableAddr(addr) {
+		addr = ""
+	}
 	for i := range peers {
 		if peers[i].ID == peerID {
-			peers[i].Name, peers[i].Addr, peers[i].LastSeen = name, addr, now
+			peers[i].Name, peers[i].LastSeen = name, now
+			if addr != "" {
+				peers[i].Addr = addr
+			}
 			return savePeers(peers)
 		}
 	}

@@ -9,7 +9,9 @@ import (
 	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
+	"github.com/necromancer124/tarion/internal/directory"
 	"github.com/necromancer124/tarion/internal/identity"
+	"github.com/necromancer124/tarion/internal/network"
 	"github.com/necromancer124/tarion/internal/storage"
 )
 
@@ -241,5 +243,203 @@ func TestAcceptContactsOnly(t *testing.T) {
 	<-alice.nm.MessageChan
 	if err := alice.deliver("bob", bobAddr, "hi back"); err != nil {
 		t.Fatalf("contact refused: %v", err)
+	}
+}
+
+func TestRevokedPeerRefusedBothWays(t *testing.T) {
+	t.Setenv("TARION_HOME", t.TempDir())
+	alice, aliceAddr := startTestNode(t, &storage.Config{Username: "alice"})
+	bob, bobAddr := startTestNode(t, &storage.Config{Username: "bob"})
+
+	// alice's server banned bob.
+	alice.setRevoked([]string{bob.nm.ID()})
+	if err := alice.deliver("bob", bobAddr, "hi"); !errors.Is(err, errRevoked) {
+		t.Fatalf("sending to a banned key: %v", err)
+	}
+	if err := bob.deliver("alice", aliceAddr, "hi"); err == nil || !strings.Contains(err.Error(), "banned") {
+		t.Fatalf("banned key's message accepted: %v", err)
+	}
+	// Survives a restart: the list is saved.
+	if !storage.LoadRevoked()[strings.ToLower(bob.nm.ID())] {
+		t.Fatal("revocation list not persisted")
+	}
+	alice.setRevoked(nil)
+	if err := alice.deliver("bob", bobAddr, "unbanned"); err != nil {
+		t.Fatalf("after unban: %v", err)
+	}
+}
+
+func TestOfflineMessageIsQueuedAndDeliveredLater(t *testing.T) {
+	t.Setenv("TARION_HOME", t.TempDir())
+	alice, _ := startTestNode(t, &storage.Config{Username: "alice"})
+	alice.sendTimeout = time.Second
+	bobPort := freePort(t)
+	bobAddr := fmt.Sprintf("127.0.0.1:%d", bobPort)
+
+	queued, err := alice.send("bob", bobAddr, "while you were away")
+	if !queued || err == nil {
+		t.Fatalf("expected the message to be queued, got queued=%v err=%v", queued, err)
+	}
+	items, _ := storage.Outbox()
+	if len(items) != 1 {
+		t.Fatalf("outbox: %+v", items)
+	}
+
+	// bob comes online at that address (a bare endpoint, so no second
+	// outbox loop shares this test's data folder).
+	bobID, _ := identity.Generate()
+	bob := network.NewNetworkManager(bobPort, bobID)
+	if err := bob.StartListener(); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = bob.Close() })
+
+	items[0].NextTry = time.Now()
+	_ = storage.UpdateOutbox(items[0])
+	alice.flushOutbox()
+
+	select {
+	case m := <-bob.MessageChan:
+		if m.Body != "while you were away" || m.ID != items[0].ID {
+			t.Fatalf("got %+v, want the queued message with its original ID", m)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("queued message never arrived")
+	}
+	if left, _ := storage.Outbox(); len(left) != 0 {
+		t.Fatalf("outbox not emptied: %+v", left)
+	}
+	lines, _ := storage.ReadHistory("bob")
+	if len(lines) == 0 || !strings.Contains(lines[len(lines)-1], "delivered later") {
+		t.Fatalf("history: %v", lines)
+	}
+}
+
+func TestRetryableErrors(t *testing.T) {
+	withServer := &node{dir: &directory.Client{}}
+	without := &node{}
+	for _, tc := range []struct {
+		err       error
+		n         *node
+		retryable bool
+	}{
+		{fmt.Errorf("bob is %w", errOffline), without, true},
+		{errors.New("dial 1.2.3.4:5: timeout"), without, true},
+		{&network.RejectedError{Reason: "receiver busy"}, without, true},
+		{&network.RejectedError{Reason: "this user only accepts messages from contacts"}, without, false},
+		{&storage.IdentityMismatchError{Name: "bob"}, without, false},
+		{fmt.Errorf("bob is %w", errRevoked), without, false},
+		{fmt.Errorf("%w for bob", errNoAddress), without, false},
+		{fmt.Errorf("%w for bob", errNoAddress), withServer, true},
+	} {
+		if got := tc.n.retryable(tc.err); got != tc.retryable {
+			t.Errorf("%v (server=%v): retryable=%v", tc.err, tc.n.dir != nil, got)
+		}
+	}
+}
+
+func TestLateMessageShowsSendTime(t *testing.T) {
+	t.Setenv("TARION_HOME", t.TempDir())
+	id, _ := identity.Generate()
+	_, line := recordIncoming(network.IncomingMessage{PeerID: id.ID, Name: "bob", Body: "old news", Sent: time.Now().Add(-time.Hour)})
+	if !strings.Contains(line, "(sent ") {
+		t.Fatalf("late message line: %q", line)
+	}
+	_, line = recordIncoming(network.IncomingMessage{PeerID: id.ID, Name: "bob", Body: "fresh", Sent: time.Now()})
+	if strings.Contains(line, "(sent ") {
+		t.Fatalf("fresh message should not show a time: %q", line)
+	}
+}
+
+func TestBannedContactIsRefusedNotQueued(t *testing.T) {
+	t.Setenv("TARION_HOME", t.TempDir())
+	alice, _ := startTestNode(t, &storage.Config{Username: "alice"})
+	bobID, _ := identity.Generate()
+	// alice knows bob from before; then the server bans him and he is offline.
+	if err := storage.PinOutgoing("bob", bobID.ID, ""); err != nil {
+		t.Fatal(err)
+	}
+	alice.setRevoked([]string{bobID.ID})
+	queued, err := alice.send("bob", "", "are you there?")
+	if queued || !errors.Is(err, errRevoked) {
+		t.Fatalf("banned contact: queued=%v err=%v", queued, err)
+	}
+	if items, _ := storage.Outbox(); len(items) != 0 {
+		t.Fatalf("message to a banned contact was queued: %+v", items)
+	}
+}
+
+func TestServerBansCanBeTurnedOff(t *testing.T) {
+	t.Setenv("TARION_HOME", t.TempDir())
+	alice, _ := startTestNode(t, &storage.Config{Username: "alice", ServerBans: "off"})
+	bob, bobAddr := startTestNode(t, &storage.Config{Username: "bob"})
+	alice.setRevoked([]string{bob.nm.ID()})
+	if err := alice.deliver("bob", bobAddr, "my client ignores the ban list"); err != nil {
+		t.Fatalf("with server_bans off the ban list must not apply: %v", err)
+	}
+}
+
+func TestOptionFlagsValidate(t *testing.T) {
+	for _, tc := range []struct {
+		bans, relay, public string
+		ok                  bool
+	}{
+		{"", "", "", true},
+		{"off", "on", "203.0.113.7:63426", true},
+		{"on", "off", "my-home.example.net:63426", true},
+		{"maybe", "", "", false},
+		{"", "yes", "", false},
+		{"", "", "203.0.113.7", false},
+		{"", "", "bad host:1", false},
+	} {
+		empty, port, ctrl := "", 0, 0
+		f := clientFlags{port: &port, ctrl: &ctrl, server: &empty, user: &empty, pass: &empty,
+			serverBans: &tc.bans, relayMode: &tc.relay, publicAddr: &tc.public}
+		cfg := storage.DefaultConfig()
+		if err := f.apply(cfg); (err == nil) != tc.ok {
+			t.Errorf("bans=%q relay=%q public=%q: %v", tc.bans, tc.relay, tc.public, err)
+		}
+	}
+	if (&storage.Config{}).RelayEnabled() || !(&storage.Config{}).EnforcesServerBans() {
+		t.Fatal("defaults: relay must be off and server bans on")
+	}
+}
+
+func TestDroppedMessagesAreLogged(t *testing.T) {
+	t.Setenv("TARION_HOME", t.TempDir())
+	_, bobAddr := startTestNode(t, &storage.Config{Username: "bob", Accept: "contacts"})
+	alice, _ := startTestNode(t, &storage.Config{Username: "alice"})
+
+	queued, err := alice.send("bob", bobAddr, "let me in")
+	if queued || err == nil {
+		t.Fatalf("a contacts-only refusal is final: queued=%v err=%v", queued, err)
+	}
+	entries, _ := storage.ReadDropped(0)
+	var in, out bool
+	for _, d := range entries {
+		switch {
+		case d.Dir == "in" && strings.Contains(d.Reason, "only accepts messages from contacts") && d.Body == "":
+			in = true // bob's side: who and why, never the text
+		case d.Dir == "out" && d.Peer == "bob" && d.Body == "let me in":
+			out = true // alice's side keeps what was lost
+		}
+	}
+	if !in || !out {
+		t.Fatalf("expected both sides logged, got %+v", entries)
+	}
+}
+
+func TestOutboxGivesUpAfterSevenDays(t *testing.T) {
+	t.Setenv("TARION_HOME", t.TempDir())
+	alice, _ := startTestNode(t, &storage.Config{Username: "alice"})
+	old := time.Now().Add(-8 * 24 * time.Hour)
+	_ = storage.Enqueue(storage.OutboxItem{ID: network.NewMessageID(), To: "bob", Addr: "127.0.0.1:9", Body: "too late", Created: old, NextTry: old, LastError: "bob is offline"})
+	alice.flushOutbox()
+	if items, _ := storage.Outbox(); len(items) != 0 {
+		t.Fatalf("expired message still queued: %+v", items)
+	}
+	entries, _ := storage.ReadDropped(0)
+	if len(entries) != 1 || entries[0].Body != "too late" || !strings.Contains(entries[0].Reason, "7 days") {
+		t.Fatalf("dropped log: %+v", entries)
 	}
 }

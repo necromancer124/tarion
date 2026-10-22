@@ -35,9 +35,24 @@ type Config struct {
 	ControlPort int `json:"control_port,omitempty"`
 	// Accept is "anyone" (default) or "contacts": only keys in contacts or
 	// already pinned (people you messaged or who messaged you before).
-	Accept   string    `json:"accept,omitempty"`
-	Contacts []Contact `json:"contacts"`
+	Accept string `json:"accept,omitempty"`
+	// ServerBans is "on" (default) or "off": whether to refuse keys the
+	// server's operator banned.
+	ServerBans string `json:"server_bans,omitempty"`
+	// Relay is "off" (default) or "on": whether messages may travel through
+	// the server when a direct connection is impossible.
+	Relay string `json:"relay,omitempty"`
+	// PublicAddr is an address peers can reach directly, for example a port
+	// you forwarded on your router. The server passes it on in lookups.
+	PublicAddr string    `json:"public_addr,omitempty"`
+	Contacts   []Contact `json:"contacts"`
 }
+
+// EnforcesServerBans reports whether the server's ban list applies.
+func (c *Config) EnforcesServerBans() bool { return c.ServerBans != "off" }
+
+// RelayEnabled reports whether messages may go through the server's relay.
+func (c *Config) RelayEnabled() bool { return c.Relay == "on" }
 
 // DefaultPort is the client's UDP port. It differs from the server's default
 // (63425) so a client and tariond can run on the same machine.

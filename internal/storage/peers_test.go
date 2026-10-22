@@ -70,3 +70,25 @@ func TestCleanTextAndName(t *testing.T) {
 		t.Fatalf("safeName reserved: %q", got)
 	}
 }
+
+func TestRelayAddressesAreNeverStored(t *testing.T) {
+	t.Setenv("TARION_HOME", t.TempDir())
+	if _, err := ResolveIncoming("bobkey000000", "bob", "1.2.3.4:5"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := ResolveIncoming("bobkey000000", "bob", "relay:0011223344556677"); err != nil {
+		t.Fatal(err)
+	}
+	if err := PinOutgoing("bob", "bobkey000000", "relay:0011223344556677"); err != nil {
+		t.Fatal(err)
+	}
+	if p, _ := PeerByName("bob"); p.Addr != "1.2.3.4:5" {
+		t.Fatalf("relay address replaced the real one: %q", p.Addr)
+	}
+	if _, err := ResolveIncoming("carolkey0000", "carol", "relay:0011223344556677"); err != nil {
+		t.Fatal(err)
+	}
+	if p, _ := PeerByName("carol"); p.Addr != "" {
+		t.Fatalf("relay address stored for a new peer: %q", p.Addr)
+	}
+}

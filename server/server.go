@@ -8,12 +8,14 @@ import (
 	"net"
 	"sort"
 	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
 
 	"github.com/necromancer124/tarion/internal/directory"
 	"github.com/necromancer124/tarion/internal/identity"
+	"github.com/necromancer124/tarion/internal/relay"
 	"github.com/necromancer124/tarion/internal/wire"
 	"github.com/quic-go/quic-go"
 )
@@ -31,22 +33,38 @@ const (
 type Options struct {
 	Registration string // RegOpen, RegInvite or RegClosed
 	InvitesDir   string // one file per unused invite code
+	DeletionsDir string // operator requests to delete accounts
 	BansPath     string // usernames / peer IDs, re-read when changed
 	MinPassword  int
+
+	// Relay forwards (still end-to-end encrypted) packets between peers
+	// whose NATs block a direct connection.
+	Relay            bool
+	RelayRate        int // bytes per second per session
+	RelayTotal       int // bytes per second for all sessions
+	MaxRelaysPerUser int
 }
 
 func DefaultOptions() Options {
-	return Options{Registration: RegOpen, MinPassword: directory.DefaultMinPassword}
+	return Options{
+		Registration:     RegOpen,
+		MinPassword:      directory.DefaultMinPassword,
+		Relay:            false, // opt-in: by default no message passes through the server
+		RelayRate:        256 * 1024,
+		RelayTotal:       8 * 1024 * 1024,
+		MaxRelaysPerUser: 8,
+	}
 }
 
 // Server is tariond: it tracks who is online and where, and tells peers to
 // punch toward each other. It never relays chat messages.
 type Server struct {
-	id       *identity.Identity
-	accounts *Accounts
-	opts     Options
-	bans     *banList
-	invites  invites
+	id        *identity.Identity
+	accounts  *Accounts
+	opts      Options
+	bans      *banList
+	invites   invites
+	deletions deletions
 
 	mu         sync.Mutex
 	sessions   map[string]*session // account key -> live session
@@ -61,6 +79,17 @@ type Server struct {
 	punchLimit *limiter // punch signals per requester->target pair
 	hashing    chan struct{}
 	nextID     atomic.Uint64
+
+	relayMu    sync.Mutex
+	relays     map[relay.ID]*relaySession
+	relayRate  *limiter // bytes per session
+	relayTotal *limiter // bytes for all sessions
+}
+
+// relaySession joins two logged-in sessions for packet forwarding.
+type relaySession struct {
+	a, b *session
+	last time.Time
 }
 
 type session struct {
@@ -68,11 +97,14 @@ type session struct {
 	conn   *quic.Conn
 	peerID string
 	ip     string
-	addr   string // public address the server observes = the client's chat socket
+	addr   string   // public address the server observes = the client's chat socket
+	udp    net.Addr // the same, as quic-go reports it; relay packets come from here
 
-	mu         sync.Mutex
-	user       string
-	localAddrs []string
+	mu          sync.Mutex
+	user        string
+	localAddrs  []string
+	publicAddr  string // advertised by the user (e.g. a forwarded port)
+	acceptRelay bool
 }
 
 func (s *session) loggedIn() (string, []string) {
@@ -88,12 +120,22 @@ func NewServer(id *identity.Identity, accounts *Accounts, opts Options) *Server 
 	if opts.MinPassword < 1 {
 		opts.MinPassword = directory.DefaultMinPassword
 	}
+	if opts.RelayRate < 1 {
+		opts.RelayRate = DefaultOptions().RelayRate
+	}
+	if opts.RelayTotal < 1 {
+		opts.RelayTotal = DefaultOptions().RelayTotal
+	}
+	if opts.MaxRelaysPerUser < 1 {
+		opts.MaxRelaysPerUser = DefaultOptions().MaxRelaysPerUser
+	}
 	return &Server{
 		id:         id,
 		accounts:   accounts,
 		opts:       opts,
 		bans:       newBanList(opts.BansPath),
 		invites:    invites{dir: opts.InvitesDir},
+		deletions:  deletions{dir: opts.DeletionsDir},
 		sessions:   map[string]*session{},
 		connsPerIP: map[string]int{},
 		connLimit:  newLimiter(2*time.Second, 20),
@@ -103,6 +145,9 @@ func NewServer(id *identity.Identity, accounts *Accounts, opts Options) *Server 
 		reqLimit:   newLimiter(500*time.Millisecond, 30),
 		punchLimit: newLimiter(2*time.Second, 3),
 		hashing:    make(chan struct{}, maxHashingAtOnce),
+		relays:     map[relay.ID]*relaySession{},
+		relayRate:  newByteLimiter(opts.RelayRate),
+		relayTotal: newByteLimiter(opts.RelayTotal),
 	}
 }
 
@@ -128,16 +173,19 @@ func QUICConfig() *quic.Config {
 func (s *Server) Serve(ln *quic.Listener) error {
 	go func() {
 		for range time.Tick(time.Minute) {
-			for _, l := range []*limiter{s.connLimit, s.authLimit, s.userLimit, s.regLimit, s.reqLimit, s.punchLimit} {
+			for _, l := range []*limiter{s.connLimit, s.authLimit, s.userLimit, s.regLimit, s.reqLimit, s.punchLimit, s.relayRate} {
 				l.sweep()
 			}
+			s.sweepRelays()
 		}
 	}()
 	go func() {
-		for range time.Tick(2 * time.Second) {
+		for ; ; time.Sleep(2 * time.Second) {
 			if s.bans.refresh() {
 				s.kickBanned()
+				s.broadcastRevoked()
 			}
+			s.processDeletions()
 		}
 	}()
 	for {
@@ -200,6 +248,7 @@ func (s *Server) handleConn(conn *quic.Conn, ip string) {
 		peerID: peerID,
 		ip:     ip,
 		addr:   conn.RemoteAddr().String(),
+		udp:    conn.RemoteAddr(),
 	}
 	defer s.endSession(sess)
 	for {
@@ -252,6 +301,12 @@ func (s *Server) handle(sess *session, req directory.Request) directory.Response
 		return s.list(sess)
 	case directory.OpLookup:
 		return s.lookup(sess, req)
+	case directory.OpRelay:
+		return s.openRelay(sess, req)
+	case directory.OpChangePassword:
+		return s.changePassword(sess, req)
+	case directory.OpDeleteAccount:
+		return s.deleteAccount(sess, req)
 	}
 	return fail(directory.ErrBadRequest)
 }
@@ -300,7 +355,7 @@ func (s *Server) register(sess *session, req directory.Request) directory.Respon
 		return fail(directory.ErrServer)
 	}
 	log.Printf("registered: %s (key %s)", name, identity.Short(sess.peerID))
-	return s.bind(sess, name, req.LocalAddrs)
+	return s.bind(sess, name, req)
 }
 
 func (s *Server) login(sess *session, req directory.Request) directory.Response {
@@ -344,14 +399,14 @@ func (s *Server) login(sess *session, req directory.Request) directory.Response 
 		log.Printf("login %q: %v", req.User, err)
 		return fail(directory.ErrServer)
 	}
-	return s.bind(sess, name, req.LocalAddrs)
+	return s.bind(sess, name, req)
 }
 
 // bind makes sess the account's live session. An older session for the same
 // account (another device, or a stale connection) is closed.
-func (s *Server) bind(sess *session, name string, local []string) directory.Response {
+func (s *Server) bind(sess *session, name string, req directory.Request) directory.Response {
 	var clean []string
-	for _, a := range local {
+	for _, a := range req.LocalAddrs {
 		if host, port, err := net.SplitHostPort(a); err == nil && net.ParseIP(host) != nil && port != "" {
 			clean = append(clean, a)
 			if len(clean) == directory.MaxLocalAddrs {
@@ -359,8 +414,13 @@ func (s *Server) bind(sess *session, name string, local []string) directory.Resp
 			}
 		}
 	}
+	public := ""
+	if directory.ValidPublicAddr(req.PublicAddr) {
+		public = req.PublicAddr
+	}
 	sess.mu.Lock()
 	sess.user, sess.localAddrs = name, clean
+	sess.publicAddr, sess.acceptRelay = public, req.AcceptRelay
 	sess.mu.Unlock()
 
 	key := directory.NameKey(name)
@@ -372,7 +432,7 @@ func (s *Server) bind(sess *session, name string, local []string) directory.Resp
 		_ = old.conn.CloseWithError(directory.CodeReplaced, "logged in elsewhere")
 	}
 	log.Printf("online: %s", name)
-	return directory.Response{OK: true, User: name, YourAddr: sess.addr}
+	return directory.Response{OK: true, User: name, YourAddr: sess.addr, Revoked: s.revokedKeys()}
 }
 
 func (s *Server) list(sess *session) directory.Response {
@@ -416,6 +476,9 @@ func (s *Server) lookup(sess *session, req directory.Request) directory.Response
 		return fail(directory.ErrOffline)
 	}
 	resp := directory.Response{OK: true, User: targetName, Addr: target.addr, PeerID: target.peerID}
+	target.mu.Lock()
+	resp.PublicAddr = target.publicAddr
+	target.mu.Unlock()
 	// LAN addresses only help (and are only shared) when both are behind the
 	// same public IP, where dialing the public address needs NAT hairpinning.
 	push := directory.Push{Type: directory.PushPunch, From: user, PeerID: sess.peerID, Addr: sess.addr}
@@ -429,8 +492,47 @@ func (s *Server) lookup(sess *session, req directory.Request) directory.Response
 	return resp
 }
 
-// pushPunch asks target to send a few packets from its chat socket to the
-// requester, opening target's NAT toward the requester's incoming dial.
+// revokedKeys is every banned key: keys listed directly, plus the key
+// linked to each banned username.
+func (s *Server) revokedKeys() []string {
+	names, keys := s.bans.snapshot()
+	set := map[string]bool{}
+	for _, k := range keys {
+		set[k] = true
+	}
+	for _, n := range names {
+		if u, ok := s.accounts.get(n); ok && u.PeerID != "" {
+			set[strings.ToLower(u.PeerID)] = true
+		}
+	}
+	out := make([]string, 0, len(set))
+	for k := range set {
+		out = append(out, k)
+	}
+	sort.Strings(out)
+	if len(out) > directory.MaxRevoked {
+		out = out[:directory.MaxRevoked]
+	}
+	return out
+}
+
+// broadcastRevoked sends the current ban list to every online client.
+func (s *Server) broadcastRevoked() {
+	push := directory.Push{Type: directory.PushRevoked, Revoked: s.revokedKeys()}
+	s.mu.Lock()
+	targets := make([]*session, 0, len(s.sessions))
+	for _, sess := range s.sessions {
+		targets = append(targets, sess)
+	}
+	s.mu.Unlock()
+	for _, t := range targets {
+		go s.pushPunch(t, push)
+	}
+}
+
+// pushPunch sends a push (a punch request, or the ban list) to target on a
+// stream the server opens. For a punch, target then sends a few packets from
+// its chat socket to the requester, opening its NAT for the incoming dial.
 func (s *Server) pushPunch(target *session, push directory.Push) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
@@ -441,6 +543,193 @@ func (s *Server) pushPunch(target *session, push directory.Push) {
 	_ = stream.SetDeadline(time.Now().Add(5 * time.Second))
 	_ = wire.WriteFrame(stream, push)
 	_ = stream.Close()
+}
+
+const relayIdle = 2 * time.Minute
+
+// openRelay creates a relay session from sess to the target user and tells
+// the target before answering, so its client accepts the first packets.
+func (s *Server) openRelay(sess *session, req directory.Request) directory.Response {
+	user, _ := sess.loggedIn()
+	if user == "" {
+		return fail(directory.ErrNotLoggedIn)
+	}
+	if !s.opts.Relay {
+		return fail(directory.ErrRelayOff)
+	}
+	s.mu.Lock()
+	target := s.sessions[directory.NameKey(req.Target)]
+	s.mu.Unlock()
+	if target == nil || target == sess {
+		return fail(directory.ErrOffline)
+	}
+	targetName, _ := target.loggedIn()
+	if s.bans.Banned(targetName, target.peerID) || !s.punchLimit.Allow(sess.id+">relay>"+target.id) {
+		return fail(directory.ErrOffline)
+	}
+	target.mu.Lock()
+	accepts := target.acceptRelay
+	target.mu.Unlock()
+	if !accepts {
+		return fail(directory.ErrRelayRefused)
+	}
+
+	id := relay.NewID()
+	s.relayMu.Lock()
+	open := 0
+	for _, r := range s.relays {
+		if r.a == sess {
+			open++
+		}
+	}
+	if open >= s.opts.MaxRelaysPerUser {
+		s.relayMu.Unlock()
+		return fail(directory.ErrRateLimited)
+	}
+	s.relays[id] = &relaySession{a: sess, b: target, last: time.Now()}
+	s.relayMu.Unlock()
+
+	s.pushPunch(target, directory.Push{Type: directory.PushRelay, From: user, PeerID: sess.peerID, Relay: id.String()})
+	log.Printf("relay opened: %s -> %s", user, targetName)
+	return directory.Response{OK: true, User: targetName, PeerID: target.peerID, Relay: id.String()}
+}
+
+// ServeRelay forwards relay packets arriving on the server's UDP socket
+// between the two members of their session. It runs until tr is closed.
+func (s *Server) ServeRelay(tr *quic.Transport) {
+	buf := make([]byte, 2048)
+	for {
+		n, from, err := tr.ReadNonQUICPacket(context.Background(), buf)
+		if err != nil {
+			return
+		}
+		id, _, ok := relay.Unwrap(buf[:n])
+		if !ok {
+			continue
+		}
+		s.relayMu.Lock()
+		r := s.relays[id]
+		var to net.Addr
+		if r != nil {
+			switch {
+			case sameAddr(from, r.a.udp):
+				to = r.b.udp
+			case sameAddr(from, r.b.udp):
+				to = r.a.udp
+			}
+			if to != nil {
+				r.last = time.Now()
+			}
+		}
+		s.relayMu.Unlock()
+		if to == nil || !s.relayRate.AllowN(id.String(), float64(n)) || !s.relayTotal.AllowN("", float64(n)) {
+			continue
+		}
+		_, _ = tr.WriteTo(buf[:n], to)
+	}
+}
+
+func sameAddr(a, b net.Addr) bool {
+	ua, ok1 := a.(*net.UDPAddr)
+	ub, ok2 := b.(*net.UDPAddr)
+	if ok1 && ok2 {
+		return ua.Port == ub.Port && ua.IP.Equal(ub.IP)
+	}
+	return a != nil && b != nil && a.String() == b.String()
+}
+
+// sweepRelays drops idle sessions and ones whose members went offline.
+func (s *Server) sweepRelays() {
+	s.relayMu.Lock()
+	defer s.relayMu.Unlock()
+	for id, r := range s.relays {
+		if time.Since(r.last) > relayIdle || r.a.conn.Context().Err() != nil || r.b.conn.Context().Err() != nil {
+			delete(s.relays, id)
+		}
+	}
+}
+
+// passwordCheck rate-limits and runs a password-verifying account operation.
+func (s *Server) passwordCheck(sess *session, user string, op func() error) directory.Response {
+	if !s.authLimit.Allow(sess.ip) || !s.userLimit.Allow(directory.NameKey(user)) {
+		return fail(directory.ErrRateLimited)
+	}
+	s.hashing <- struct{}{}
+	err := op()
+	<-s.hashing
+	switch {
+	case errors.Is(err, errAuthFailed):
+		log.Printf("failed password check for %q", user)
+		return fail(directory.ErrAuthFailed)
+	case errors.Is(err, errNoSuchUser):
+		return fail(directory.ErrNoSuchUser)
+	case err != nil:
+		log.Printf("account change for %q: %v", user, err)
+		return fail(directory.ErrServer)
+	}
+	return directory.Response{OK: true, User: user}
+}
+
+func (s *Server) changePassword(sess *session, req directory.Request) directory.Response {
+	user, _ := sess.loggedIn()
+	if user == "" {
+		return fail(directory.ErrNotLoggedIn)
+	}
+	if problem := passwordProblem(user, req.NewPass, s.opts.MinPassword); problem != "" {
+		return directory.Response{Error: directory.ErrWeakPassword, Detail: problem}
+	}
+	resp := s.passwordCheck(sess, user, func() error { return s.accounts.ChangePassword(user, req.Pass, req.NewPass) })
+	if resp.OK {
+		log.Printf("password changed: %s", user)
+	}
+	return resp
+}
+
+func (s *Server) deleteAccount(sess *session, req directory.Request) directory.Response {
+	user, _ := sess.loggedIn()
+	if user == "" {
+		return fail(directory.ErrNotLoggedIn)
+	}
+	resp := s.passwordCheck(sess, user, func() error {
+		if err := s.accounts.CheckPassword(user, req.Pass); err != nil {
+			return err
+		}
+		_, err := s.accounts.Delete(user)
+		return err
+	})
+	if resp.OK {
+		log.Printf("account deleted by its owner: %s", user)
+		s.endAccount(user, 300*time.Millisecond) // let the reply go out first
+	}
+	return resp
+}
+
+// processDeletions carries out operator requests from `tariond delete`.
+func (s *Server) processDeletions() {
+	for _, name := range s.deletions.Pending() {
+		if existed, err := s.accounts.Delete(name); err != nil {
+			log.Printf("delete %q: %v", name, err)
+			continue
+		} else if existed {
+			log.Printf("account deleted by the operator: %s", name)
+			s.endAccount(name, 0)
+		}
+		s.deletions.Done(name)
+	}
+}
+
+// endAccount closes the live session of a deleted account.
+func (s *Server) endAccount(name string, delay time.Duration) {
+	s.mu.Lock()
+	sess := s.sessions[directory.NameKey(name)]
+	delete(s.sessions, directory.NameKey(name))
+	s.mu.Unlock()
+	if sess != nil {
+		go func() {
+			time.Sleep(delay)
+			_ = sess.conn.CloseWithError(directory.CodeDeleted, "account deleted")
+		}()
+	}
 }
 
 // kickBanned closes the sessions of users or keys that were just banned.
