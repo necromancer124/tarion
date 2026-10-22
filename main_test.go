@@ -404,3 +404,42 @@ func TestOptionFlagsValidate(t *testing.T) {
 		t.Fatal("defaults: relay must be off and server bans on")
 	}
 }
+
+func TestDroppedMessagesAreLogged(t *testing.T) {
+	t.Setenv("TARION_HOME", t.TempDir())
+	_, bobAddr := startTestNode(t, &storage.Config{Username: "bob", Accept: "contacts"})
+	alice, _ := startTestNode(t, &storage.Config{Username: "alice"})
+
+	queued, err := alice.send("bob", bobAddr, "let me in")
+	if queued || err == nil {
+		t.Fatalf("a contacts-only refusal is final: queued=%v err=%v", queued, err)
+	}
+	entries, _ := storage.ReadDropped(0)
+	var in, out bool
+	for _, d := range entries {
+		switch {
+		case d.Dir == "in" && strings.Contains(d.Reason, "only accepts messages from contacts") && d.Body == "":
+			in = true // bob's side: who and why, never the text
+		case d.Dir == "out" && d.Peer == "bob" && d.Body == "let me in":
+			out = true // alice's side keeps what was lost
+		}
+	}
+	if !in || !out {
+		t.Fatalf("expected both sides logged, got %+v", entries)
+	}
+}
+
+func TestOutboxGivesUpAfterSevenDays(t *testing.T) {
+	t.Setenv("TARION_HOME", t.TempDir())
+	alice, _ := startTestNode(t, &storage.Config{Username: "alice"})
+	old := time.Now().Add(-8 * 24 * time.Hour)
+	_ = storage.Enqueue(storage.OutboxItem{ID: network.NewMessageID(), To: "bob", Addr: "127.0.0.1:9", Body: "too late", Created: old, NextTry: old, LastError: "bob is offline"})
+	alice.flushOutbox()
+	if items, _ := storage.Outbox(); len(items) != 0 {
+		t.Fatalf("expired message still queued: %+v", items)
+	}
+	entries, _ := storage.ReadDropped(0)
+	if len(entries) != 1 || entries[0].Body != "too late" || !strings.Contains(entries[0].Reason, "7 days") {
+		t.Fatalf("dropped log: %+v", entries)
+	}
+}

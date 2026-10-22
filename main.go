@@ -100,6 +100,9 @@ type node struct {
 	relayedMu sync.Mutex
 	relayed   map[string]relaySession // contacts last reached via the relay
 
+	logMu sync.Mutex
+	logFn func(string) // background process log; nil in the menu
+
 	outboxMu    sync.Mutex    // one outbox pass at a time
 	outboxWake  chan struct{} // nudges the outbox loop
 	sendTimeout time.Duration // per public-address attempt; tests shorten it
@@ -132,6 +135,18 @@ var errRevoked = errors.New("banned on your server")
 // accept filters incoming messages: never from banned keys, and only from
 // contacts when cfg.Accept is "contacts".
 func (n *node) accept(peerID string) error {
+	err := n.acceptRule(peerID)
+	if err != nil {
+		from := "peer-" + identity.Short(peerID)
+		if p, ok := storage.PeerByID(peerID); ok {
+			from = p.Name
+		}
+		n.logDrop(storage.DroppedMessage{Dir: "in", Peer: from, Reason: "refused: " + err.Error()})
+	}
+	return err
+}
+
+func (n *node) acceptRule(peerID string) error {
 	if n.isRevoked(peerID) {
 		return errors.New("you are banned on this user's server")
 	}
@@ -139,6 +154,30 @@ func (n *node) accept(peerID string) error {
 		return f(peerID)
 	}
 	return nil
+}
+
+func (n *node) setLogger(f func(string)) {
+	n.logMu.Lock()
+	n.logFn = f
+	n.logMu.Unlock()
+}
+
+// logDrop records a message that will never be delivered, in dropped.log,
+// the background log, and as a "dropped" event for local API apps.
+func (n *node) logDrop(d storage.DroppedMessage) {
+	d.Time = time.Now()
+	_ = storage.LogDropped(d)
+	n.events.publish(controlEvent{Type: "dropped", Chat: d.Peer, Body: d.Body, Reason: d.Reason, Time: d.Time.Format(time.RFC3339)})
+	n.logMu.Lock()
+	f := n.logFn
+	n.logMu.Unlock()
+	if f != nil {
+		dir := "to"
+		if d.Dir == "in" {
+			dir = "from"
+		}
+		f(fmt.Sprintf("dropped message %s %s: %s", dir, d.Peer, d.Reason))
+	}
 }
 
 // controlEvent is one line of a `subscribe` stream.
@@ -149,6 +188,7 @@ type controlEvent struct {
 	Body   string `json:"body,omitempty"`
 	Time   string `json:"time,omitempty"` // when it arrived, RFC 3339
 	Status string `json:"status,omitempty"`
+	Reason string `json:"reason,omitempty"` // for "dropped"
 }
 
 // hub fans events out to local API subscribers. A subscriber that falls
@@ -267,13 +307,19 @@ func (n *node) send(to, addr, body string) (queued bool, err error) {
 	}
 	id, now := network.NewMessageID(), time.Now()
 	err = n.deliverMsg(id, now, to, addr, body)
-	if err == nil || !n.retryable(err) {
+	if err == nil {
+		return false, nil
+	}
+	if !n.retryable(err) {
+		n.logDrop(storage.DroppedMessage{Dir: "out", Peer: to, Reason: err.Error(), Body: body})
 		return false, err
 	}
 	item := storage.OutboxItem{ID: id, To: to, Addr: addr, Body: body, Created: now, Attempts: 1,
 		NextTry: now.Add(outboxRetryBase), LastError: err.Error()}
 	if qerr := storage.Enqueue(item); qerr != nil {
-		return false, fmt.Errorf("%v (could not queue it: %v)", err, qerr)
+		err = fmt.Errorf("%v (could not queue it: %v)", err, qerr)
+		n.logDrop(storage.DroppedMessage{Dir: "out", Peer: to, Reason: err.Error(), Body: body})
+		return false, err
 	}
 	select {
 	case n.outboxWake <- struct{}{}:
@@ -338,7 +384,8 @@ func (n *node) flushOutbox() {
 		}
 		if now.Sub(it.Created) > outboxExpiry {
 			_ = storage.RemoveOutbox(it.ID)
-			n.outboxNote(it, "  ! gave up after 7 days, not delivered: "+snippet(it.Body), "expired")
+			_ = storage.AppendHistory(it.To, "  ! gave up after 7 days, not delivered: "+snippet(it.Body))
+			n.logDrop(storage.DroppedMessage{Dir: "out", Peer: it.To, Reason: "gave up after 7 days: " + it.LastError, Body: it.Body})
 			continue
 		}
 		if now.Before(it.NextTry) && !online[key] {
@@ -349,10 +396,12 @@ func (n *node) flushOutbox() {
 		switch {
 		case err == nil:
 			_ = storage.RemoveOutbox(it.ID)
-			n.outboxNote(it, "  ✓ delivered later: "+snippet(it.Body), "delivered")
+			_ = storage.AppendHistory(it.To, "  ✓ delivered later: "+snippet(it.Body))
+			n.events.publish(controlEvent{Type: "delivered", Chat: it.To, Body: it.Body, Time: time.Now().Format(time.RFC3339)})
 		case !n.retryable(err):
 			_ = storage.RemoveOutbox(it.ID)
-			n.outboxNote(it, "  ! not delivered: "+storage.CleanText(err.Error()), "failed")
+			_ = storage.AppendHistory(it.To, "  ! not delivered: "+storage.CleanText(err.Error()))
+			n.logDrop(storage.DroppedMessage{Dir: "out", Peer: it.To, Reason: err.Error(), Body: it.Body})
 		default:
 			it.Attempts++
 			wait := outboxRetryBase << min(it.Attempts, 6)
@@ -364,13 +413,6 @@ func (n *node) flushOutbox() {
 			blocked[key] = true
 		}
 	}
-}
-
-// outboxNote records what happened to a queued message in its chat and
-// tells local API subscribers.
-func (n *node) outboxNote(it storage.OutboxItem, line, kind string) {
-	_ = storage.AppendHistory(it.To, line)
-	n.events.publish(controlEvent{Type: kind, Chat: it.To, Body: it.Body, Time: time.Now().Format(time.RFC3339)})
 }
 
 func snippet(s string) string {
@@ -1549,6 +1591,7 @@ func runBackground(args []string) error {
 		fmt.Printf("new message from %s (%s, id %s)\n", chat, msg.Addr, identity.Short(msg.PeerID))
 	})
 	go n.watchStatus(func(s string) { fmt.Println(s) })
+	n.setLogger(func(s string) { fmt.Println(s) })
 
 	stop := make(chan os.Signal, 1)
 	signal.Notify(stop, os.Interrupt, syscall.SIGTERM)
@@ -1817,6 +1860,61 @@ func runDeleteAccount(args []string) error {
 	return nil
 }
 
+// runOutbox lists messages waiting to be delivered.
+func runOutbox(args []string) error {
+	fs := flag.NewFlagSet("outbox", flag.ExitOnError)
+	_ = fs.Parse(args)
+	items, err := storage.Outbox()
+	if err != nil {
+		return err
+	}
+	if len(items) == 0 {
+		fmt.Println("Nothing is waiting to be delivered.")
+		return nil
+	}
+	now := time.Now()
+	for _, it := range items {
+		fmt.Printf("to %-16s queued %s ago, %d tries, next %s\n    %s\n    last error: %s\n",
+			it.To, now.Sub(it.Created).Round(time.Second), it.Attempts, nextTry(it.NextTry, now),
+			snippet(it.Body), storage.CleanText(it.LastError))
+	}
+	fmt.Printf("%d waiting. The background process (or open menu) retries them for up to 7 days.\n", len(items))
+	return nil
+}
+
+func nextTry(t, now time.Time) string {
+	if !t.After(now) {
+		return "now"
+	}
+	return "in " + t.Sub(now).Round(time.Second).String()
+}
+
+// runDropped lists messages that were given up on or refused.
+func runDropped(args []string) error {
+	fs := flag.NewFlagSet("dropped", flag.ExitOnError)
+	n := fs.Int("n", 20, "how many recent entries (0 = all)")
+	_ = fs.Parse(args)
+	entries, err := storage.ReadDropped(*n)
+	if err != nil {
+		return err
+	}
+	if len(entries) == 0 {
+		fmt.Println("No dropped messages.")
+		return nil
+	}
+	for _, d := range entries {
+		dir := "to  "
+		if d.Dir == "in" {
+			dir = "from"
+		}
+		fmt.Printf("%s  %s %-16s %s\n", d.Time.Local().Format("2006-01-02 15:04"), dir, d.Peer, storage.CleanText(d.Reason))
+		if d.Body != "" {
+			fmt.Printf("    %s\n", snippet(d.Body))
+		}
+	}
+	return nil
+}
+
 func runID() error {
 	id, err := loadIdentity()
 	if err != nil {
@@ -1875,6 +1973,8 @@ func printGeneralHelp() {
 		"  send        Send one message through the background process",
 		"  listen      Print incoming messages as JSON lines (for scripts and apps)",
 		"  history     Print a chat's recent history",
+		"  outbox      List messages waiting to be delivered",
+		"  dropped     List messages that were given up on or refused",
 		"  passwd      Change your account password",
 		"  delete-account  Delete your account on the server",
 		"  id          Show your peer ID so contacts can verify you",
@@ -1912,7 +2012,7 @@ func main() {
 	cmd := "start"
 	if len(args) > 0 {
 		switch args[0] {
-		case "start", "menu", "background", "stop", "send", "listen", "history", "passwd", "delete-account", "id", "peers", "forget":
+		case "start", "menu", "background", "stop", "send", "listen", "history", "outbox", "dropped", "passwd", "delete-account", "id", "peers", "forget":
 			cmd, args = args[0], args[1:]
 		}
 	}
@@ -1929,6 +2029,10 @@ func main() {
 		err = runListen(args)
 	case "history":
 		err = runHistory(args)
+	case "outbox":
+		err = runOutbox(args)
+	case "dropped":
+		err = runDropped(args)
 	case "passwd":
 		err = runPasswd(args)
 	case "delete-account":
