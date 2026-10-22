@@ -156,7 +156,10 @@ func ResolveIncoming(peerID, claimedName, addr string) (string, error) {
 	now := time.Now()
 	for i := range peers {
 		if peers[i].ID == peerID {
-			peers[i].Addr, peers[i].LastSeen = addr, now
+			if addr != "" {
+				peers[i].Addr = addr
+			}
+			peers[i].LastSeen = now
 			return peers[i].Name, savePeers(peers)
 		}
 	}

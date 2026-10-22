@@ -73,8 +73,9 @@ type model struct {
 
 type msgIncomingChat network.IncomingMessage
 type msgSendResult struct {
-	to  string
-	err error
+	to     string
+	err    error
+	queued bool
 }
 type msgDirectory struct {
 	status   string
@@ -94,6 +95,10 @@ type node struct {
 
 	revokedMu sync.RWMutex
 	revoked   map[string]bool // keys banned by the server
+
+	outboxMu    sync.Mutex    // one outbox pass at a time
+	outboxWake  chan struct{} // nudges the outbox loop
+	sendTimeout time.Duration // per public-address attempt; tests shorten it
 }
 
 // isRevoked reports whether the server banned this key.
@@ -194,14 +199,22 @@ func acceptFor(cfg *storage.Config) func(peerID string) error {
 
 func startNode(cfg *storage.Config, id *identity.Identity) (*node, error) {
 	nm := network.NewNetworkManager(cfg.Port, id)
-	n := &node{cfg: cfg, nm: nm, cancel: func() {}, events: &hub{subs: map[chan controlEvent]struct{}{}}, revoked: storage.LoadRevoked()}
+	n := &node{
+		cfg:         cfg,
+		nm:          nm,
+		events:      &hub{subs: map[chan controlEvent]struct{}{}},
+		revoked:     storage.LoadRevoked(),
+		outboxWake:  make(chan struct{}, 1),
+		sendTimeout: 10 * time.Second,
+	}
 	nm.Accept = n.accept
 	if err := nm.StartListener(); err != nil {
 		return nil, err
 	}
+	ctx, cancel := context.WithCancel(context.Background())
+	n.cancel = cancel
+	go n.runOutbox(ctx)
 	if cfg.ServerAddr != "" && cfg.Username != "" {
-		ctx, cancel := context.WithCancel(context.Background())
-		n.cancel = cancel
 		n.dir = directory.NewClient(nm, directory.ClientConfig{
 			Server:   cfg.ServerAddr,
 			User:     cfg.Username,
@@ -223,6 +236,135 @@ func startNode(cfg *storage.Config, id *identity.Identity) (*node, error) {
 		go n.dir.Run(ctx)
 	}
 	return n, nil
+}
+
+const (
+	outboxRetryBase = 15 * time.Second
+	outboxRetryMax  = 10 * time.Minute
+	outboxExpiry    = 7 * 24 * time.Hour
+)
+
+// send delivers now or, if the contact can't be reached, queues the message
+// in the outbox and keeps retrying it. queued says which; err says why it
+// was not delivered right away.
+func (n *node) send(to, addr, body string) (queued bool, err error) {
+	if body == "" || len(body) > network.MaxBodyBytes {
+		return false, fmt.Errorf("message must be 1-%d bytes", network.MaxBodyBytes)
+	}
+	id, now := network.NewMessageID(), time.Now()
+	err = n.deliverMsg(id, now, to, addr, body)
+	if err == nil || !n.retryable(err) {
+		return false, err
+	}
+	item := storage.OutboxItem{ID: id, To: to, Addr: addr, Body: body, Created: now, Attempts: 1,
+		NextTry: now.Add(outboxRetryBase), LastError: err.Error()}
+	if qerr := storage.Enqueue(item); qerr != nil {
+		return false, fmt.Errorf("%v (could not queue it: %v)", err, qerr)
+	}
+	select {
+	case n.outboxWake <- struct{}{}:
+	default:
+	}
+	return true, err
+}
+
+// retryable is false for failures waiting won't fix: a wrong or banned key,
+// a refusal, or nowhere to look for the contact.
+func (n *node) retryable(err error) bool {
+	var mismatch *storage.IdentityMismatchError
+	var rejected *network.RejectedError
+	switch {
+	case errors.Is(err, errRevoked), errors.As(err, &mismatch):
+		return false
+	case errors.As(err, &rejected):
+		return rejected.Reason == "receiver busy"
+	case errors.Is(err, errNoAddress):
+		return n.dir != nil // they may still log in to the server
+	}
+	return true
+}
+
+func (n *node) runOutbox(ctx context.Context) {
+	ticker := time.NewTicker(5 * time.Second)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+		case <-n.outboxWake:
+		}
+		n.flushOutbox()
+	}
+}
+
+// flushOutbox retries queued messages that are due, or whose recipient the
+// server now lists as online. Messages to one contact stay in order: after
+// a failure, that contact's later messages wait for the next pass.
+func (n *node) flushOutbox() {
+	n.outboxMu.Lock()
+	defer n.outboxMu.Unlock()
+	items, err := storage.Outbox()
+	if err != nil || len(items) == 0 {
+		return
+	}
+	online := map[string]bool{}
+	if n.dir != nil && n.dir.Connected() {
+		users, _ := n.dir.List()
+		for _, u := range users {
+			online[strings.ToLower(u)] = true
+		}
+	}
+	now := time.Now()
+	blocked := map[string]bool{}
+	for _, it := range items {
+		key := strings.ToLower(it.To)
+		if blocked[key] {
+			continue
+		}
+		if now.Sub(it.Created) > outboxExpiry {
+			_ = storage.RemoveOutbox(it.ID)
+			n.outboxNote(it, "  ! gave up after 7 days, not delivered: "+snippet(it.Body), "expired")
+			continue
+		}
+		if now.Before(it.NextTry) && !online[key] {
+			blocked[key] = true
+			continue
+		}
+		err := n.deliverMsg(it.ID, it.Created, it.To, it.Addr, it.Body)
+		switch {
+		case err == nil:
+			_ = storage.RemoveOutbox(it.ID)
+			n.outboxNote(it, "  ✓ delivered later: "+snippet(it.Body), "delivered")
+		case !n.retryable(err):
+			_ = storage.RemoveOutbox(it.ID)
+			n.outboxNote(it, "  ! not delivered: "+storage.CleanText(err.Error()), "failed")
+		default:
+			it.Attempts++
+			wait := outboxRetryBase << min(it.Attempts, 6)
+			if wait > outboxRetryMax {
+				wait = outboxRetryMax
+			}
+			it.NextTry, it.LastError = now.Add(wait), err.Error()
+			_ = storage.UpdateOutbox(it)
+			blocked[key] = true
+		}
+	}
+}
+
+// outboxNote records what happened to a queued message in its chat and
+// tells local API subscribers.
+func (n *node) outboxNote(it storage.OutboxItem, line, kind string) {
+	_ = storage.AppendHistory(it.To, line)
+	n.events.publish(controlEvent{Type: kind, Chat: it.To, Body: it.Body, Time: time.Now().Format(time.RFC3339)})
+}
+
+func snippet(s string) string {
+	s = storage.CleanText(s)
+	if r := []rune(s); len(r) > 40 {
+		return string(r[:40]) + "…"
+	}
+	return s
 }
 
 // serveIncoming records each incoming message and tells subscribers. The
@@ -292,6 +434,15 @@ func configuredID(cfg *storage.Config, name string) string {
 // answers must match the key fixed in config, the server's record, and the
 // key pinned on first contact; otherwise nothing is sent.
 func (n *node) deliver(to, addr, body string) error {
+	return n.deliverMsg(network.NewMessageID(), time.Now(), to, addr, body)
+}
+
+var (
+	errOffline   = errors.New("offline")
+	errNoAddress = errors.New("no address")
+)
+
+func (n *node) deliverMsg(id string, sent time.Time, to, addr, body string) error {
 	var candidates []string
 	dirID := ""
 	offline := false
@@ -311,9 +462,9 @@ func (n *node) deliver(to, addr, body string) error {
 		}
 		if addr == "" {
 			if offline {
-				return fmt.Errorf("%s is offline", to)
+				return fmt.Errorf("%s is %w", to, errOffline)
 			}
-			return fmt.Errorf("no address for %s", to)
+			return fmt.Errorf("%w for %s", errNoAddress, to)
 		}
 		candidates = []string{addr}
 	}
@@ -321,12 +472,12 @@ func (n *node) deliver(to, addr, body string) error {
 	configured := configuredID(n.cfg, to)
 	var lastErr, identityErr error
 	for i, cand := range candidates {
-		timeout := 10 * time.Second
+		timeout := n.sendTimeout
 		if i < len(candidates)-1 {
 			timeout = 3 * time.Second // a LAN address either answers fast or is wrong
 		}
 		ctx, cancel := context.WithTimeout(context.Background(), timeout)
-		_, err := n.nm.SendContext(ctx, cand, senderName(n.cfg), body, func(peerID string) error {
+		_, err := n.nm.SendMessage(ctx, id, sent, cand, senderName(n.cfg), body, func(peerID string) error {
 			if n.isRevoked(peerID) {
 				return fmt.Errorf("%s is %w", to, errRevoked)
 			}
@@ -374,6 +525,9 @@ type controlResponse struct {
 	Status string   `json:"status,omitempty"`
 	Users  []string `json:"users,omitempty"`
 	Lines  []string `json:"lines,omitempty"`
+	// Queued (on send) means the contact couldn't be reached and the message
+	// waits in the outbox; Error says why.
+	Queued bool `json:"queued,omitempty"`
 }
 
 const maxControlRequest = 64 * 1024
@@ -545,7 +699,12 @@ func handleControlConn(conn net.Conn, token string, n *node) {
 			os.Exit(0)
 		}()
 	case "send":
-		reply(n.deliver(req.To, req.Addr, req.Body))
+		queued, err := n.send(req.To, req.Addr, req.Body)
+		if queued {
+			send(controlResponse{OK: true, Queued: true, Error: err.Error()})
+		} else {
+			reply(err)
+		}
 	case "online":
 		status, users := n.directoryStatus()
 		send(controlResponse{OK: true, Status: status, Users: users})
@@ -602,6 +761,9 @@ func recordIncoming(msg network.IncomingMessage) (chat, line string) {
 		chat = "peer-" + identity.Short(msg.PeerID)
 	}
 	line = fmt.Sprintf("%s: %s", chat, storage.CleanText(msg.Body))
+	if late := time.Since(msg.Sent); late > 2*time.Minute && msg.Sent.Year() > 2000 {
+		line += "  (sent " + msg.Sent.Local().Format("Jan 2 15:04") + ")"
+	}
 	_ = storage.AppendHistory(chat, line)
 	return chat, line
 }
@@ -826,15 +988,20 @@ func (m model) sendCmd(to, addr, body string) tea.Cmd {
 	cfg, n, useBackground := m.cfg, m.node, m.useBackground
 	return func() tea.Msg {
 		var err error
+		var queued bool
 		switch {
 		case useBackground:
-			err = backgroundRequest(cfg, controlRequest{Cmd: "send", To: to, Addr: addr, Body: body})
+			var resp controlResponse
+			resp, err = backgroundCall(cfg, controlRequest{Cmd: "send", To: to, Addr: addr, Body: body})
+			if resp.Queued {
+				queued, err = true, errors.New(resp.Error)
+			}
 		case n != nil:
-			err = n.deliver(to, addr, body)
+			queued, err = n.send(to, addr, body)
 		default:
 			err = errors.New("not connected: no listener and no background process")
 		}
-		return msgSendResult{to: to, err: err}
+		return msgSendResult{to: to, err: err, queued: queued}
 	}
 }
 
@@ -910,7 +1077,14 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		return m, m.listenForMessages()
 	case msgSendResult:
-		if msg.err != nil {
+		if msg.queued {
+			m.statusLine = "queued for " + msg.to + " (" + msg.err.Error() + "); it will be delivered automatically"
+			line := "  … queued: " + storage.CleanText(msg.err.Error()) + "; will retry"
+			_ = storage.AppendHistory(msg.to, line)
+			if m.state == StateChatView && m.activeContact == msg.to {
+				m.chatHistory = append(m.chatHistory, line)
+			}
+		} else if msg.err != nil {
 			m.statusLine = styleError.Render("not delivered to " + msg.to + ": " + msg.err.Error())
 			line := "  ! not delivered: " + storage.CleanText(msg.err.Error())
 			_ = storage.AppendHistory(msg.to, line)
@@ -1291,10 +1465,16 @@ func runSend(args []string) error {
 	if !backgroundRunning(cfg) {
 		return errors.New("no background process running; start one with: tarion background --detach")
 	}
-	if err := backgroundRequest(cfg, controlRequest{Cmd: "send", To: to, Body: body}); err != nil {
+	resp, err := backgroundCall(cfg, controlRequest{Cmd: "send", To: to, Body: body})
+	if err != nil {
 		return fmt.Errorf("not delivered to %s: %w", to, err)
 	}
 	_ = storage.AppendHistory(to, "Me: "+storage.CleanText(body))
+	if resp.Queued {
+		_ = storage.AppendHistory(to, "  … queued: "+storage.CleanText(resp.Error)+"; will retry")
+		fmt.Printf("queued for %s (%s); the background process delivers it when they can be reached\n", to, resp.Error)
+		return nil
+	}
 	fmt.Println("delivered to", to)
 	return nil
 }

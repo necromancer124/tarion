@@ -313,6 +313,13 @@ func (nm *NetworkManager) Send(peerAddr, from, body string, verify func(peerID s
 // SendContext is Send with a caller-chosen deadline, used to try a peer's
 // LAN address briefly before falling back to its public one.
 func (nm *NetworkManager) SendContext(ctx context.Context, peerAddr, from, body string, verify func(peerID string) error) (string, error) {
+	return nm.SendMessage(ctx, NewMessageID(), time.Now(), peerAddr, from, body, verify)
+}
+
+// SendMessage is SendContext with a caller-chosen message ID and send time.
+// Retrying a queued message with its original ID lets the receiver drop a
+// duplicate if an earlier attempt did arrive.
+func (nm *NetworkManager) SendMessage(ctx context.Context, id string, sent time.Time, peerAddr, from, body string, verify func(peerID string) error) (string, error) {
 	if nm.tr == nil {
 		return "", errors.New("listener not started")
 	}
@@ -329,7 +336,10 @@ func (nm *NetworkManager) SendContext(ctx context.Context, peerAddr, from, body 
 	if len(from) > MaxNameBytes {
 		from = from[:MaxNameBytes]
 	}
-	env := envelope{V: ProtocolVersion, Type: "msg", ID: newMessageID(), TS: time.Now().Unix(), From: from, Body: body}
+	if id == "" || len(id) > maxIDBytes {
+		return "", errors.New("bad message id")
+	}
+	env := envelope{V: ProtocolVersion, Type: "msg", ID: id, TS: sent.Unix(), From: from, Body: body}
 
 	// The first attempt may use a cached connection that has silently died;
 	// retry once on a fresh one.
@@ -441,7 +451,8 @@ func (nm *NetworkManager) dropConn(addr string, conn *quic.Conn) {
 	_ = conn.CloseWithError(errCodeNone, "dropped")
 }
 
-func newMessageID() string {
+// NewMessageID returns a random 128-bit message ID.
+func NewMessageID() string {
 	var b [16]byte
 	_, _ = rand.Read(b[:])
 	return hex.EncodeToString(b[:])

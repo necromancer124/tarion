@@ -9,7 +9,9 @@ import (
 	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
+	"github.com/necromancer124/tarion/internal/directory"
 	"github.com/necromancer124/tarion/internal/identity"
+	"github.com/necromancer124/tarion/internal/network"
 	"github.com/necromancer124/tarion/internal/storage"
 )
 
@@ -264,5 +266,87 @@ func TestRevokedPeerRefusedBothWays(t *testing.T) {
 	alice.setRevoked(nil)
 	if err := alice.deliver("bob", bobAddr, "unbanned"); err != nil {
 		t.Fatalf("after unban: %v", err)
+	}
+}
+
+func TestOfflineMessageIsQueuedAndDeliveredLater(t *testing.T) {
+	t.Setenv("TARION_HOME", t.TempDir())
+	alice, _ := startTestNode(t, &storage.Config{Username: "alice"})
+	alice.sendTimeout = time.Second
+	bobPort := freePort(t)
+	bobAddr := fmt.Sprintf("127.0.0.1:%d", bobPort)
+
+	queued, err := alice.send("bob", bobAddr, "while you were away")
+	if !queued || err == nil {
+		t.Fatalf("expected the message to be queued, got queued=%v err=%v", queued, err)
+	}
+	items, _ := storage.Outbox()
+	if len(items) != 1 {
+		t.Fatalf("outbox: %+v", items)
+	}
+
+	// bob comes online at that address (a bare endpoint, so no second
+	// outbox loop shares this test's data folder).
+	bobID, _ := identity.Generate()
+	bob := network.NewNetworkManager(bobPort, bobID)
+	if err := bob.StartListener(); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = bob.Close() })
+
+	items[0].NextTry = time.Now()
+	_ = storage.UpdateOutbox(items[0])
+	alice.flushOutbox()
+
+	select {
+	case m := <-bob.MessageChan:
+		if m.Body != "while you were away" || m.ID != items[0].ID {
+			t.Fatalf("got %+v, want the queued message with its original ID", m)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("queued message never arrived")
+	}
+	if left, _ := storage.Outbox(); len(left) != 0 {
+		t.Fatalf("outbox not emptied: %+v", left)
+	}
+	lines, _ := storage.ReadHistory("bob")
+	if len(lines) == 0 || !strings.Contains(lines[len(lines)-1], "delivered later") {
+		t.Fatalf("history: %v", lines)
+	}
+}
+
+func TestRetryableErrors(t *testing.T) {
+	withServer := &node{dir: &directory.Client{}}
+	without := &node{}
+	for _, tc := range []struct {
+		err       error
+		n         *node
+		retryable bool
+	}{
+		{fmt.Errorf("bob is %w", errOffline), without, true},
+		{errors.New("dial 1.2.3.4:5: timeout"), without, true},
+		{&network.RejectedError{Reason: "receiver busy"}, without, true},
+		{&network.RejectedError{Reason: "this user only accepts messages from contacts"}, without, false},
+		{&storage.IdentityMismatchError{Name: "bob"}, without, false},
+		{fmt.Errorf("bob is %w", errRevoked), without, false},
+		{fmt.Errorf("%w for bob", errNoAddress), without, false},
+		{fmt.Errorf("%w for bob", errNoAddress), withServer, true},
+	} {
+		if got := tc.n.retryable(tc.err); got != tc.retryable {
+			t.Errorf("%v (server=%v): retryable=%v", tc.err, tc.n.dir != nil, got)
+		}
+	}
+}
+
+func TestLateMessageShowsSendTime(t *testing.T) {
+	t.Setenv("TARION_HOME", t.TempDir())
+	id, _ := identity.Generate()
+	_, line := recordIncoming(network.IncomingMessage{PeerID: id.ID, Name: "bob", Body: "old news", Sent: time.Now().Add(-time.Hour)})
+	if !strings.Contains(line, "(sent ") {
+		t.Fatalf("late message line: %q", line)
+	}
+	_, line = recordIncoming(network.IncomingMessage{PeerID: id.ID, Name: "bob", Body: "fresh", Sent: time.Now()})
+	if strings.Contains(line, "(sent ") {
+		t.Fatalf("fresh message should not show a time: %q", line)
 	}
 }
