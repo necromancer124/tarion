@@ -557,9 +557,13 @@ func (n *node) deliverMsg(id string, sent time.Time, to, addr, body string) erro
 		})
 		return err
 	}
+	// final errors end the attempt: a wrong or banned key, or the peer was
+	// reached and refused. Trying their other addresses (or the relay)
+	// would only repeat the same answer.
 	isIdentityErr := func(err error) bool {
 		var mismatch *storage.IdentityMismatchError
-		return errors.As(err, &mismatch) || errors.Is(err, errRevoked)
+		var rejected *network.RejectedError
+		return errors.As(err, &mismatch) || errors.Is(err, errRevoked) || errors.As(err, &rejected)
 	}
 
 	// When the server knows the contact, it can relay if the direct path
@@ -596,7 +600,7 @@ func (n *node) deliverMsg(id string, sent time.Time, to, addr, body string) erro
 		}
 	}
 
-	var lastErr, identityErr error
+	var lastErr error
 	for i, cand := range candidates {
 		timeout := n.sendTimeout
 		if canRelay {
@@ -611,12 +615,9 @@ func (n *node) deliverMsg(id string, sent time.Time, to, addr, body string) erro
 			return nil
 		}
 		if isIdentityErr(err) {
-			identityErr = err
+			return err
 		}
 		lastErr = err
-	}
-	if identityErr != nil {
-		return identityErr
 	}
 	if canRelay && !triedRelay {
 		err := viaRelay()
