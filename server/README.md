@@ -33,6 +33,9 @@ Everything lives in one data folder: `-data`, or the `TARIOND_DATA` environment 
 | `-min-password` | `10` | Minimum password length for new accounts (8 or more) |
 | `-argon-memory` | `64` | argon2id memory per hash, in MiB |
 | `-argon-time` | `3` | argon2id passes |
+| `-relay` | `true` | Relay encrypted packets between peers whose NATs block a direct connection |
+| `-relay-kbps` | `256` | Relay bandwidth per session, KiB/s |
+| `-relay-total-kbps` | `8192` | Relay bandwidth for all sessions together, KiB/s |
 
 `-users`, `-key`, `-invites`, `-bans` and `-legacy-users` override single file paths.
 
@@ -45,14 +48,16 @@ tariond accounts                    # list accounts, their keys, and bans
 tariond ban bob                     # ban a username...
 tariond ban "x5u5 zbuk qp3a g4dj hpyl ztgg u7z3 siop"   # ...or a device key
 tariond unban bob
+tariond delete bob                  # delete an account (frees the name)
 tariond id                          # print the server ID
 ```
 
 Operator commands take the same `-data` flag (or `TARIOND_DATA`) as the server.
 
 - **Invites:** a user registers once with `tarion start -server HOST:63425 -user NAME -pass PASSWORD -invite CODE`. Each code works exactly once; a failed registration gives the code back.
-- **Bans:** take effect within about 2 seconds, with no restart. A banned user is disconnected, can't log in or register, and doesn't show up in lookups. Banning a key blocks that device under any name.
-- **Limit:** the server controls *finding* people. Two users who already know each other's address can still chat directly with `-i`. Each user can also refuse strangers with `tarion -accept contacts`.
+- **Bans:** take effect within about 2 seconds, with no restart. A banned user is disconnected, can't log in or register, and doesn't show up in lookups. Banning a key blocks that device under any name. Every logged-in client also receives the list of banned keys (up to 1000) and refuses to exchange messages with them, even over a direct connection or when it already knows their address.
+- **Deleting:** `tariond delete NAME` takes effect within about 2 seconds, or at the next start if the server isn't running. Users can also delete their own account with `tarion delete-account`.
+- **Limit:** someone who never logs in to your server never receives its ban list, so two people using Tarion without any server can still talk directly with `-i`.
 
 ## What it does
 
@@ -61,6 +66,8 @@ Operator commands take the same `-data` flag (or `TARIOND_DATA`) as the server.
 - **Presence.** A user is online while their connection is open. Clients send keep-alives every 15 seconds, and the server drops a connection after 45 seconds of silence.
 - **Lookup.** The server returns the target's public chat address and key, and their LAN address only if both users share a public IP. It also tells the target to punch toward the requester, including the requester's LAN address in that case.
 - **List.** The server returns the names of online users (not their addresses), capped at 500.
+- **Relay.** When two peers can't connect directly, one asks for a relay session. The server forwards packets between the two members' known addresses only, without being able to decrypt them (the peers' TLS runs end to end inside). Sessions close after 2 minutes without traffic.
+- **Accounts can be changed.** Users can change their password (`tarion passwd`) or delete their account (`tarion delete-account`), both with the current password and rate-limited like logins.
 
 ## Abuse limits
 
@@ -69,6 +76,7 @@ Operator commands take the same `-data` flag (or `TARIOND_DATA`) as the server.
 - Registrations: 3 per IP, then one every 10 minutes.
 - Requests: a burst of 30 per session, then 2 per second. Punch signals are limited per user pair.
 - At most 2 argon2id hashes are computed at once.
+- Relay: 8 sessions per user, 256 KiB/s per session and 8 MiB/s in total (configurable).
 - QUIC itself checks the sender's address before replying with much data, so the server can't be used to flood a faked address.
 
 ## Running it for real

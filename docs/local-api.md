@@ -20,10 +20,12 @@
 | `cmd` | Fields | Reply |
 |---|---|---|
 | `ping` | | `{"ok":true}` |
-| `send` | `to`, `body`, optional `addr` | `{"ok":true}` once the peer acknowledged it, or `{"ok":false,"error":"..."}` |
+| `send` | `to`, `body`, optional `addr` | `{"ok":true}` once the peer acknowledged it; `{"ok":true,"queued":true,"error":"bob is offline"}` if it was queued for automatic retry; `{"ok":false,"error":"..."}` if it can't be sent (wrong or banned key, refused) |
 | `online` | | `{"ok":true,"status":"...","users":["bob",...]}` |
 | `history` | `to`, optional `limit` | `{"ok":true,"lines":["bob: hi","Me: hello"]}` |
 | `subscribe` | | `{"ok":true,"status":"..."}`, then the connection **stays open** and streams events |
+| `change_password` | `pass`, `new_pass` | `{"ok":true}` or an error explaining why |
+| `delete_account` | `pass` | `{"ok":true}`; the server then ends the session |
 | `stop` | | `{"ok":true}`, then the background exits |
 
 `send` doesn't add a `Me: ...` line to the history; write it yourself if your app needs it (the `tarion send` command does).
@@ -33,7 +35,10 @@
 ```json
 {"type":"message","chat":"bob","peer_id":"x5u5zbukqp3ag4djhpylztggu7z3siop","body":"hi","time":"2026-10-21T16:39:02+03:00"}
 {"type":"status","status":"server connected as alice (public address 203.0.113.7:63426)"}
+{"type":"delivered","chat":"bob","body":"queued earlier","time":"..."}
 ```
+
+`delivered`, `failed` and `expired` report what happened to a message that was queued earlier.
 
 - `chat` is the name the message is filed under. A stranger who claims a name you've already pinned shows up as `name~1a2b3c4d`.
 - `body` is the raw text. Escape it before displaying it in a terminal or as HTML.
