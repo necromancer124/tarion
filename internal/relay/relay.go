@@ -83,6 +83,27 @@ func ParseAddr(s string) (Addr, bool) {
 
 const sessionIdle = 10 * time.Minute
 
+// A probe is 0x00 'T' 'P' 'R' + an 8-byte nonce. The server sends one from
+// a different port to check that strangers can reach a forwarded port.
+var probeMagic = [4]byte{0x00, 'T', 'P', 'R'}
+
+// Probe builds a probe packet.
+func Probe(nonce ID) []byte {
+	pkt := make([]byte, HeaderLen)
+	copy(pkt, probeMagic[:])
+	copy(pkt[4:], nonce[:])
+	return pkt
+}
+
+func parseProbe(pkt []byte) (ID, bool) {
+	var nonce ID
+	if len(pkt) != HeaderLen || [4]byte(pkt[:4]) != probeMagic {
+		return nonce, false
+	}
+	copy(nonce[:], pkt[4:])
+	return nonce, true
+}
+
 // Conn wraps the chat socket for quic-go. Writes to an Addr go to the relay
 // server with a header; relay packets from the server for a known session
 // come back out with the header stripped and that Addr as the source.
@@ -94,10 +115,34 @@ type Conn struct {
 	server   *net.UDPAddr
 	sessions map[ID]time.Time
 	strict   bool
+	probes   map[ID]chan struct{}
 }
 
 func NewConn(pc *net.UDPConn) *Conn {
-	return &Conn{pc: pc, sessions: map[ID]time.Time{}}
+	return &Conn{pc: pc, sessions: map[ID]time.Time{}, probes: map[ID]chan struct{}{}}
+}
+
+// ExpectProbe returns a channel closed when a probe with this nonce
+// arrives, and a function to stop waiting.
+func (c *Conn) ExpectProbe(nonce ID) (<-chan struct{}, func()) {
+	ch := make(chan struct{})
+	c.mu.Lock()
+	c.probes[nonce] = ch
+	c.mu.Unlock()
+	return ch, func() {
+		c.mu.Lock()
+		delete(c.probes, nonce)
+		c.mu.Unlock()
+	}
+}
+
+func (c *Conn) gotProbe(nonce ID) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if ch, ok := c.probes[nonce]; ok {
+		close(ch)
+		delete(c.probes, nonce)
+	}
 }
 
 // SetServer sets where relay packets go (the directory server).
@@ -162,6 +207,10 @@ func (c *Conn) ReadFrom(p []byte) (int, net.Addr, error) {
 		strict := c.strict
 		c.mu.RUnlock()
 		if strict && !c.fromServer(addr) {
+			continue
+		}
+		if nonce, ok := parseProbe(p[:n]); ok {
+			c.gotProbe(nonce)
 			continue
 		}
 		return n, addr, nil

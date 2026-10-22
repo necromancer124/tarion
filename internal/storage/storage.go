@@ -44,8 +44,27 @@ type Config struct {
 	Relay string `json:"relay,omitempty"`
 	// PublicAddr is an address peers can reach directly, for example a port
 	// you forwarded on your router. The server passes it on in lookups.
-	PublicAddr string    `json:"public_addr,omitempty"`
-	Contacts   []Contact `json:"contacts"`
+	PublicAddr string `json:"public_addr,omitempty"`
+	// PortMapping is "auto" (default: ask the router to forward the chat
+	// port whenever the relay is off), "on" (always) or "off" (never).
+	PortMapping string    `json:"port_mapping,omitempty"`
+	Contacts    []Contact `json:"contacts"`
+}
+
+// PortMappingOff says why automatic port forwarding won't be tried, or
+// returns "" when it will be.
+func (c *Config) PortMappingOff() string {
+	switch {
+	case c.PortMapping == "off":
+		return "it is turned off (port_mapping off)"
+	case c.PublicAddr != "":
+		return "you set public_addr yourself (" + c.PublicAddr + ")"
+	case c.PortMapping != "on" && c.RelayEnabled():
+		return "the relay is on, so strict NATs are already handled (use -port-mapping on to forward anyway)"
+	case c.ServerAddr == "" || c.Username == "":
+		return "no server is configured, and the forwarded address is announced through the server"
+	}
+	return ""
 }
 
 // EnforcesServerBans reports whether the server's ban list applies.

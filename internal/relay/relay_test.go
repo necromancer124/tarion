@@ -87,3 +87,24 @@ func TestConnRelaysThroughServer(t *testing.T) {
 		t.Fatalf("strict NAT: got %q (%v)", buf[:n], err)
 	}
 }
+
+func TestProbeIsConsumed(t *testing.T) {
+	c := NewConn(listen(t))
+	sender := listen(t)
+	nonce := NewID()
+	got, stop := c.ExpectProbe(nonce)
+	defer stop()
+	_, _ = sender.WriteTo(Probe(nonce), c.LocalAddr())
+	_, _ = sender.WriteTo([]byte("after"), c.LocalAddr())
+	buf := make([]byte, 1500)
+	_ = c.SetReadDeadline(time.Now().Add(2 * time.Second))
+	n, _, err := c.ReadFrom(buf)
+	if err != nil || string(buf[:n]) != "after" {
+		t.Fatalf("the probe must be swallowed, then normal traffic passes: %q %v", buf[:n], err)
+	}
+	select {
+	case <-got:
+	default:
+		t.Fatal("probe not reported")
+	}
+}

@@ -56,11 +56,13 @@ type Client struct {
 	nm  *network.NetworkManager
 	cfg ClientConfig
 
-	mu        sync.Mutex
-	conn      *quic.Conn
-	status    string
-	serverID  string
-	lastPunch map[string]time.Time
+	mu         sync.Mutex
+	conn       *quic.Conn
+	status     string
+	serverID   string
+	lastPunch  map[string]time.Time
+	publicAddr string // may change after login (port mapping)
+	seenAddr   string // our address as the server observed it at login
 }
 
 // FatalError is a problem retrying will not fix (wrong password, server key
@@ -71,11 +73,12 @@ func (e *FatalError) Error() string { return e.Msg }
 
 func NewClient(nm *network.NetworkManager, cfg ClientConfig) *Client {
 	return &Client{
-		nm:        nm,
-		cfg:       cfg,
-		status:    "connecting to server " + cfg.Server,
-		serverID:  strings.ReplaceAll(strings.TrimSpace(cfg.ServerID), " ", ""),
-		lastPunch: map[string]time.Time{},
+		nm:         nm,
+		cfg:        cfg,
+		status:     "connecting to server " + cfg.Server,
+		serverID:   strings.ReplaceAll(strings.TrimSpace(cfg.ServerID), " ", ""),
+		lastPunch:  map[string]time.Time{},
+		publicAddr: cfg.PublicAddr,
 	}
 }
 
@@ -145,6 +148,7 @@ func (c *Client) session(ctx context.Context) (bool, error) {
 	}
 	c.mu.Lock()
 	c.conn = conn
+	c.seenAddr = resp.YourAddr
 	c.status = fmt.Sprintf("server connected as %s (public address %s)", resp.User, resp.YourAddr)
 	c.mu.Unlock()
 	defer func() {
@@ -252,8 +256,11 @@ func (c *Client) dial(ctx context.Context) (*quic.Conn, error) {
 func (c *Client) login(ctx context.Context, conn *quic.Conn) (Response, bool, error) {
 	local := c.nm.LocalAddrs()
 	usedPassword := c.cfg.Pass != ""
+	c.mu.Lock()
+	public := c.publicAddr
+	c.mu.Unlock()
 	resp, err := roundTrip(ctx, conn, Request{Op: OpLogin, User: c.cfg.User, Pass: c.cfg.Pass, LocalAddrs: local,
-		AcceptRelay: c.cfg.AcceptRelay, PublicAddr: c.cfg.PublicAddr})
+		AcceptRelay: c.cfg.AcceptRelay, PublicAddr: public})
 	if err != nil {
 		return resp, false, err
 	}
@@ -266,7 +273,7 @@ func (c *Client) login(ctx context.Context, conn *quic.Conn) (Response, bool, er
 			return resp, false, &FatalError{Msg: fmt.Sprintf("account %s does not exist; run once with -pass to create it", c.cfg.User)}
 		}
 		resp, err = roundTrip(ctx, conn, Request{Op: OpRegister, User: c.cfg.User, Pass: c.cfg.Pass, Invite: c.cfg.Invite, LocalAddrs: local,
-			AcceptRelay: c.cfg.AcceptRelay, PublicAddr: c.cfg.PublicAddr})
+			AcceptRelay: c.cfg.AcceptRelay, PublicAddr: public})
 		if err != nil {
 			return resp, false, err
 		}
@@ -337,6 +344,33 @@ func (c *Client) Relay(target string) (addr, peerID string, err error) {
 	}
 	c.nm.Relay().Allow(id)
 	return relay.Addr{ID: id}.String(), resp.PeerID, nil
+}
+
+// SeenAddr is this client's address as the server observed it at login.
+func (c *Client) SeenAddr() string {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.seenAddr
+}
+
+// SetPublicAddr changes the address advertised to peers (for example a
+// port the router now forwards) for this and future logins.
+func (c *Client) SetPublicAddr(addr string) error {
+	c.mu.Lock()
+	c.publicAddr = addr
+	c.mu.Unlock()
+	if !c.Connected() {
+		return nil // sent with the next login
+	}
+	_, err := c.request(Request{Op: OpAdvertise, PublicAddr: addr})
+	return err
+}
+
+// Probe asks the server to send a test packet, carrying nonce, to the
+// advertised public address from a different port.
+func (c *Client) Probe(nonce string) error {
+	_, err := c.request(Request{Op: OpProbe, Nonce: nonce})
+	return err
 }
 
 // ChangePassword changes the account password. The new password must meet

@@ -1,6 +1,20 @@
 # Tarion
 
+**No middleman. No doorman. You open your own doors.**
+
 Tarion is a hybrid peer-to-peer CLI chat over QUIC. Chats go directly between peers. A small directory server, `tariond` in [`server/`](server/README.md), tells peers where to find each other and helps them through home routers (NAT). Every install has its own Ed25519 identity key, and peers authenticate each other with it (see [Security model](#security-model)).
+
+## Why I built Tarion
+
+I got tired of hearing about data. Data, data and more data: who collects it, who sells it, who reads it, which company is training on it this week. Every app wants to sit between me and the people I talk to, and every one of them promises it's safe there. I find that obnoxious.
+
+So this is my answer: **no middleman, no doorman. You open your own doors.**
+
+- **No middleman.** Your messages go straight from your device to the other person's. Nobody stores them, nobody forwards them, and nobody can read them on the way, because they're end-to-end encrypted with keys that never leave your device. There's a relay for networks that make a direct connection impossible, but it's off unless you, the other person and the server operator all turn it on, and even then it only passes along encrypted packets it can't read.
+- **No doorman.** Your identity is a key on your own computer. The server keeps just enough to help people find you (a username linked to that key, and a password hash) and nothing about your conversations. You can run your own (`tariond`), or skip it and connect by address.
+- **You open your own doors.** Tarion asks *your* router to open *your* port, tells you plainly when it can't and why, and lets you do it by hand instead. You decide who may message you (`-accept contacts`), whose bans you respect (`-server-bans`), and whether anything may ever pass through a server (`-relay`).
+
+Being honest about the one helper that remains: the directory server knows your username, your key, your IP address while you're online, and which usernames you look up. It never sees what you say. If even that is too much, host the server yourself.
 
 ## Ports
 
@@ -138,7 +152,8 @@ The config is saved to:
 - `accept` is `anyone` (default) or `contacts` (see above). Strangers who write to you then get "this user only accepts messages from contacts".
 - `server_bans` is `on` (default) or `off` (`-server-bans`): whether your client refuses keys your server's operator banned.
 - `relay` is `off` (default) or `on` (`-relay`): whether messages may pass through the server when no direct path exists. See [Getting through strict NATs](#getting-through-strict-nats).
-- `public_addr` (`-public-addr`): an address peers can reach you at directly, such as a forwarded port.
+- `public_addr` (`-public-addr`): an address peers can reach you at directly, such as a port you forwarded by hand.
+- `port_mapping` is `auto` (default), `on` or `off` (`-port-mapping`): whether to ask your router to forward the chat port automatically. `auto` does it while the relay is off.
 
 The folder also holds `identity.key` (your private key, keep it secret), `peers.json` (pinned contacts), `outbox.json` (messages waiting to be delivered), `dropped.log` (messages given up on or refused), `revoked.json` (keys your server banned) and, while the background process runs, `control.token`.
 
@@ -172,9 +187,18 @@ The folder also holds `identity.key` (your private key, keep it secret), `peers.
 
 ### Getting through strict NATs
 
-Hole punching works with most home routers. When both sides are behind strict ("symmetric") NATs, there are two options:
+Hole punching works with most home routers. When both sides are behind strict ("symmetric") NATs, Tarion has these options:
 
-- **Forward a port (no server involved).** On your router, forward UDP to your chat port (default 63426), then tell Tarion: `-public-addr YOUR_PUBLIC_IP:63426` (a DNS name works too). The server passes it to people who look you up, and they connect straight to you.
+- **Automatic port forwarding (on by default while the relay is off).** At start, the client asks your router to forward its chat port, with UPnP first, then NAT-PMP. It checks that the router's internet address matches what the server sees, announces the address, and has the server send a test packet from a *different* port, the way a stranger would. Only if that packet arrives is the forward kept and given to people who look you up. The mapping is renewed while Tarion runs and removed when it exits (quitting the menu, Ctrl+C or `tarion stop`). If Tarion is killed instead, the router drops it by itself within an hour, because it is requested with a one-hour lease. The exception is routers that only allow permanent forwards: those keep it until Tarion's next start replaces it, or you delete it in the router's settings.
+
+  If it doesn't work, Tarion says why: no UPnP/NAT-PMP router answered, the router refused, the port is taken, your ISP shares one address between customers (carrier-grade NAT), there's a second router (double NAT), or a firewall blocked the test packet. It also lists what you can do. You see this in `background.log` and in the menu's status line, and `tarion portmap` retries at any time and prints the full explanation:
+
+  ```powershell
+  .\tarion.exe portmap
+  ```
+
+  `-port-mapping off` turns it off, and `-port-mapping on` uses it even with the relay on.
+- **Forward a port by hand (no server involved).** On your router, forward UDP to your chat port (default 63426), then tell Tarion: `-public-addr YOUR_PUBLIC_IP:63426` (a DNS name works too). The server passes it to people who look you up, and they connect straight to you. Setting this turns the automatic forwarding off.
 - **The relay (opt-in, off by default).** With `-relay on` on both clients and `tariond -relay` on the server, the server forwards the QUIC packets between you. You still run your own encrypted handshake inside it and keys are checked as usual, so the server only sees ciphertext, but your traffic does go through it. A client with the relay off never uses it and refuses relayed connections. After needing it, messages to that contact use the relay right away for 10 minutes.
 
 ### Wire protocol

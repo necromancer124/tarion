@@ -49,6 +49,12 @@ func startServerWith(t *testing.T, opts Options) (string, *identity.Identity) {
 	tr := &quic.Transport{Conn: udp}
 	accounts.SetArgon(testArgon)
 	srv := NewServer(id, accounts, opts)
+	probe, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	srv.SetProbeConn(probe)
+	t.Cleanup(func() { probe.Close() })
 	ln, err := tr.Listen(srv.TLSConfig(), QUICConfig())
 	if err != nil {
 		t.Fatal(err)

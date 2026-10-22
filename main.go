@@ -24,6 +24,7 @@ import (
 	"github.com/necromancer124/tarion/internal/directory"
 	"github.com/necromancer124/tarion/internal/identity"
 	"github.com/necromancer124/tarion/internal/network"
+	"github.com/necromancer124/tarion/internal/portmap"
 	"github.com/necromancer124/tarion/internal/relay"
 	"github.com/necromancer124/tarion/internal/storage"
 	"golang.org/x/term"
@@ -102,6 +103,10 @@ type node struct {
 
 	logMu sync.Mutex
 	logFn func(string) // background process log; nil in the menu
+
+	ctx     context.Context
+	mappers []portmap.Mapper // UPnP, NAT-PMP; tests use fakes
+	port    portState
 
 	outboxMu    sync.Mutex    // one outbox pass at a time
 	outboxWake  chan struct{} // nudges the outbox loop
@@ -264,7 +269,8 @@ func startNode(cfg *storage.Config, id *identity.Identity) (*node, error) {
 		nm.Relay().SimulateStrictNAT(true)
 	}
 	ctx, cancel := context.WithCancel(context.Background())
-	n.cancel = cancel
+	n.ctx, n.cancel = ctx, cancel
+	n.mappers = portmap.Default()
 	go n.runOutbox(ctx)
 	if cfg.ServerAddr != "" && cfg.Username != "" {
 		n.dir = directory.NewClient(nm, directory.ClientConfig{
@@ -456,6 +462,7 @@ func (n *node) watchStatus(log func(string)) {
 
 func (n *node) close() {
 	n.cancel()
+	n.removeMapping(false)
 	_ = n.nm.Close()
 }
 
@@ -471,7 +478,208 @@ func (n *node) directoryStatus() (string, []string) {
 	if err != nil {
 		return "server: " + err.Error(), nil
 	}
-	return n.dir.Status(), users
+	status := n.dir.Status()
+	if p := n.portStatus(); p != "" {
+		status += "; " + p
+	}
+	return status, users
+}
+
+// portState is the automatic port forwarding (see package portmap).
+type portState struct {
+	busy    sync.Mutex // one attempt at a time
+	mu      sync.Mutex
+	mapping *portmap.Mapping
+	status  string // one line for menus
+	report  string // the full story of the last attempt
+}
+
+func (n *node) portStatus() string {
+	n.port.mu.Lock()
+	defer n.port.mu.Unlock()
+	return n.port.status
+}
+
+func (n *node) setPort(m *portmap.Mapping, status, report string) {
+	n.port.mu.Lock()
+	n.port.mapping, n.port.status, n.port.report = m, status, report
+	n.port.mu.Unlock()
+	n.events.publish(controlEvent{Type: "portmap", Status: status, Reason: report, Time: time.Now().Format(time.RFC3339)})
+	n.logMu.Lock()
+	f := n.logFn
+	n.logMu.Unlock()
+	if f != nil && report != "" {
+		f(report)
+	}
+}
+
+// startPortMapping opens a port mapping in the background when the
+// settings call for it (by default: whenever the relay is off), and keeps
+// it renewed.
+func (n *node) startPortMapping() {
+	if n.cfg.PortMappingOff() != "" || n.dir == nil {
+		return
+	}
+	go func() {
+		// The server's view of our address is needed to check the mapping.
+		for deadline := time.Now().Add(30 * time.Second); !n.dir.Connected() && time.Now().Before(deadline); {
+			select {
+			case <-n.ctx.Done():
+				return
+			case <-time.After(200 * time.Millisecond):
+			}
+		}
+		n.mapPort()
+		for {
+			select {
+			case <-n.ctx.Done():
+				return
+			case <-time.After(portRenewEvery):
+			}
+			n.port.mu.Lock()
+			m := n.port.mapping
+			n.port.mu.Unlock()
+			if m == nil {
+				continue // failed earlier; `tarion portmap` retries on demand
+			}
+			ctx, cancel := context.WithTimeout(n.ctx, 10*time.Second)
+			err := m.Renew(ctx)
+			cancel()
+			if err != nil {
+				n.mapPort() // the router forgot it (reboot?): start over
+			}
+		}
+	}()
+}
+
+const (
+	portLease      = time.Hour
+	portRenewEvery = 25 * time.Minute
+)
+
+// mapPort asks the router to forward the chat port, checks that the result
+// is really reachable from the internet, and announces it to the server.
+// It reports whether it worked and, either way, explains what happened.
+func (n *node) mapPort() (bool, string) {
+	n.port.busy.Lock()
+	defer n.port.busy.Unlock()
+	n.removeMapping(true)
+	n.setPort(nil, "port forwarding: asking the router...", "")
+
+	ctx, cancel := context.WithTimeout(n.ctx, 45*time.Second)
+	defer cancel()
+	fail := func(report string) (bool, string) {
+		n.setPort(nil, "port forwarding failed (run 'tarion portmap' to see why)", report)
+		return false, report
+	}
+
+	m, err := portmap.Open(ctx, n.mappers, lanIP(n.nm), n.cfg.Port, portLease)
+	if err != nil {
+		return fail(err.Error())
+	}
+	drop := func() { _ = m.Remove(context.Background()) }
+
+	if m.ExternalIP == nil {
+		// The router forwarded the port but wouldn't say its internet
+		// address: use the one the server sees; the test packet below checks it.
+		seen := net.IP(nil)
+		if n.dir != nil {
+			seen = hostIP(n.dir.SeenAddr())
+		}
+		if seen == nil || seen.IsLoopback() || portmap.NotPublic(seen) != "" {
+			drop()
+			return fail("automatic port forwarding did not work:\n  - " + m.Method + ": the router forwarded the port but wouldn't say its internet address, and there is no server that sees a public one to use instead\n" + portmap.Advice(n.cfg.Port))
+		}
+		m.ExternalIP = seen
+	}
+
+	if n.dir != nil {
+		if seen := hostIP(n.dir.SeenAddr()); seen != nil && !seen.IsLoopback() && !seen.Equal(m.ExternalIP) {
+			drop()
+			return fail("automatic port forwarding did not work:\n  - " + portmap.DoubleNAT(m.ExternalIP.String(), seen.String()) + "\n" + portmap.Advice(n.cfg.Port))
+		}
+		if err := n.dir.SetPublicAddr(m.Addr()); err != nil {
+			drop()
+			return fail("the router forwards " + m.Addr() + ", but telling the server failed: " + err.Error())
+		}
+		reachable, err := n.probeReachable()
+		switch {
+		case err != nil:
+			// An older server, or one that can't test; keep it untested.
+			ok := fmt.Sprintf("port forwarding: on via %s, %s (not verified: %v)", m.Method, m.Addr(), err)
+			n.setPort(m, ok, ok)
+			return true, ok
+		case !reachable:
+			_ = n.dir.SetPublicAddr("")
+			drop()
+			return fail("automatic port forwarding did not work:\n  - " + m.Method + ": " + portmap.Unreachable(m.Addr(), n.cfg.Port) + "\n" + portmap.Advice(n.cfg.Port))
+		}
+	}
+	ok := fmt.Sprintf("port forwarding: on via %s, %s (reachable from the internet)", m.Method, m.Addr())
+	if n.dir == nil {
+		ok = fmt.Sprintf("port forwarding: on via %s, %s (not announced or tested: no server)", m.Method, m.Addr())
+	}
+	n.setPort(m, ok, ok)
+	return true, ok
+}
+
+// probeReachable has the server send a test packet to our advertised
+// address from a different port, as a stranger would.
+func (n *node) probeReachable() (bool, error) {
+	nonce := relay.NewID()
+	got, stop := n.nm.Relay().ExpectProbe(nonce)
+	defer stop()
+	if err := n.dir.Probe(nonce.String()); err != nil {
+		return false, err
+	}
+	select {
+	case <-got:
+		return true, nil
+	case <-time.After(4 * time.Second):
+		return false, nil
+	}
+}
+
+// prepareExit undoes what must not outlive the process: the router's port
+// forward (nothing would be listening behind it) and the control token.
+// `tarion stop` ends the process with os.Exit, which skips deferred
+// cleanup, so it calls this first.
+func (n *node) prepareExit() {
+	n.removeMapping(false)
+	_ = os.Remove(storage.GetControlTokenPath())
+}
+
+// removeMapping deletes the current mapping from the router and, when
+// announce is set, withdraws it from the server.
+func (n *node) removeMapping(announce bool) {
+	n.port.mu.Lock()
+	m := n.port.mapping
+	n.port.mapping = nil
+	n.port.mu.Unlock()
+	if m == nil {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	_ = m.Remove(ctx)
+	if announce && n.dir != nil && n.dir.Connected() {
+		_ = n.dir.SetPublicAddr("")
+	}
+}
+
+func lanIP(nm *network.NetworkManager) net.IP {
+	if addrs := nm.LocalAddrs(); len(addrs) > 0 {
+		return hostIP(addrs[0])
+	}
+	return nil
+}
+
+func hostIP(addr string) net.IP {
+	host, _, err := net.SplitHostPort(addr)
+	if err != nil {
+		return nil
+	}
+	return net.ParseIP(host)
 }
 
 func configuredID(cfg *storage.Config, name string) string {
@@ -755,7 +963,7 @@ func backgroundCall(cfg *storage.Config, req controlRequest) (controlResponse, e
 	defer conn.Close()
 	// A send may try a LAN address and then the public one, each waiting
 	// for the peer's ack.
-	_ = conn.SetDeadline(time.Now().Add(30 * time.Second))
+	_ = conn.SetDeadline(time.Now().Add(60 * time.Second))
 	if err := json.NewEncoder(conn).Encode(req); err != nil {
 		return resp, err
 	}
@@ -836,7 +1044,7 @@ func serveBackgroundControl(token string, n *node) error {
 
 func handleControlConn(conn net.Conn, token string, n *node) {
 	defer conn.Close()
-	_ = conn.SetDeadline(time.Now().Add(30 * time.Second))
+	_ = conn.SetDeadline(time.Now().Add(60 * time.Second))
 	send := func(resp controlResponse) { _ = json.NewEncoder(conn).Encode(resp) }
 	reply := func(err error) {
 		resp := controlResponse{OK: err == nil}
@@ -862,7 +1070,7 @@ func handleControlConn(conn net.Conn, token string, n *node) {
 		reply(nil)
 		go func() {
 			time.Sleep(100 * time.Millisecond)
-			_ = os.Remove(storage.GetControlTokenPath())
+			n.prepareExit()
 			os.Exit(0)
 		}()
 	case "send":
@@ -875,6 +1083,20 @@ func handleControlConn(conn net.Conn, token string, n *node) {
 	case "online":
 		status, users := n.directoryStatus()
 		send(controlResponse{OK: true, Status: status, Users: users})
+	case "portmap":
+		if why := n.cfg.PortMappingOff(); why != "" {
+			reply(errors.New("port forwarding is off: " + why))
+			return
+		}
+		if n.dir == nil {
+			reply(errors.New("port forwarding is off: no server configured"))
+			return
+		}
+		if ok, report := n.mapPort(); ok {
+			send(controlResponse{OK: true, Status: report})
+		} else {
+			reply(errors.New(report))
+		}
 	case "change_password", "delete_account":
 		if n.dir == nil || !n.dir.Connected() {
 			reply(errors.New("not connected to a server"))
@@ -977,6 +1199,7 @@ func initialModel(cfg *storage.Config, forceChatUser, forceChatAddr string) mode
 		m.statusLine = "menu-only: " + err.Error()
 	} else {
 		m.node = n
+		n.startPortMapping()
 		m.statusLine = fmt.Sprintf("listening UDP/%d as %s", cfg.Port, identity.Short(id.ID))
 	}
 	if forceChatUser != "" && forceChatAddr != "" {
@@ -1434,23 +1657,24 @@ func setStopUsage(fs *flag.FlagSet) {
 
 // clientFlags are the settings shared by start, menu and background.
 type clientFlags struct {
-	port, ctrl                         *int
-	server, user, pass, invite, accept *string
-	serverBans, relayMode, publicAddr  *string
+	port, ctrl                                     *int
+	server, user, pass, invite, accept             *string
+	serverBans, relayMode, publicAddr, portMapping *string
 }
 
 func addClientFlags(fs *flag.FlagSet) clientFlags {
 	return clientFlags{
-		port:       fs.Int("p", 0, fmt.Sprintf("local UDP port for chat and server traffic (default %d)", storage.DefaultPort)),
-		ctrl:       fs.Int("cp", 0, "local TCP port of the background control socket (default: -p plus 10000)"),
-		server:     fs.String("server", "", fmt.Sprintf("directory server host:port (tariond default port %d)", directory.DefaultServerPort)),
-		user:       fs.String("user", "", "directory username"),
-		pass:       fs.String("pass", "", "directory password (only needed the first time on this device)"),
-		invite:     fs.String("invite", "", "one-time invite code, if the server is invite-only"),
-		accept:     fs.String("accept", "", "who may message you: anyone or contacts (saved)"),
-		serverBans: fs.String("server-bans", "", "on (default) or off: refuse keys the server banned (saved)"),
-		relayMode:  fs.String("relay", "", "off (default) or on: allow messages through the server when no direct path exists (saved)"),
-		publicAddr: fs.String("public-addr", "", `address peers can reach you at directly, e.g. a forwarded port "203.0.113.7:63426"; "none" clears it (saved)`),
+		port:        fs.Int("p", 0, fmt.Sprintf("local UDP port for chat and server traffic (default %d)", storage.DefaultPort)),
+		ctrl:        fs.Int("cp", 0, "local TCP port of the background control socket (default: -p plus 10000)"),
+		server:      fs.String("server", "", fmt.Sprintf("directory server host:port (tariond default port %d)", directory.DefaultServerPort)),
+		user:        fs.String("user", "", "directory username"),
+		pass:        fs.String("pass", "", "directory password (only needed the first time on this device)"),
+		invite:      fs.String("invite", "", "one-time invite code, if the server is invite-only"),
+		accept:      fs.String("accept", "", "who may message you: anyone or contacts (saved)"),
+		serverBans:  fs.String("server-bans", "", "on (default) or off: refuse keys the server banned (saved)"),
+		relayMode:   fs.String("relay", "", "off (default) or on: allow messages through the server when no direct path exists (saved)"),
+		publicAddr:  fs.String("public-addr", "", `address peers can reach you at directly, e.g. a forwarded port "203.0.113.7:63426"; "none" clears it (saved)`),
+		portMapping: fs.String("port-mapping", "", "auto (default: ask the router to forward the port when the relay is off), on, or off (saved)"),
 	}
 }
 
@@ -1486,6 +1710,14 @@ func (f clientFlags) apply(cfg *storage.Config) error {
 		if v != "" && v != "on" && v != "off" {
 			return fmt.Errorf(`%s must be "on" or "off"`, name)
 		}
+	}
+	if f.portMapping != nil && *f.portMapping != "" {
+		cfg.PortMapping = *f.portMapping
+	}
+	switch cfg.PortMapping {
+	case "", "auto", "on", "off":
+	default:
+		return errors.New(`-port-mapping must be "auto", "on" or "off"`)
 	}
 	if f.publicAddr != nil && *f.publicAddr != "" {
 		cfg.PublicAddr = *f.publicAddr
@@ -1593,6 +1825,7 @@ func runBackground(args []string) error {
 	})
 	go n.watchStatus(func(s string) { fmt.Println(s) })
 	n.setLogger(func(s string) { fmt.Println(s) })
+	n.startPortMapping()
 
 	stop := make(chan os.Signal, 1)
 	signal.Notify(stop, os.Interrupt, syscall.SIGTERM)
@@ -1861,6 +2094,55 @@ func runDeleteAccount(args []string) error {
 	return nil
 }
 
+// runPortmap retries automatic port forwarding now, with the saved
+// settings, and explains the result.
+func runPortmap(args []string) error {
+	fs := flag.NewFlagSet("portmap", flag.ExitOnError)
+	apply := portFlags(fs)
+	_ = fs.Parse(args)
+	cfg, err := storage.LoadOrCreateConfig()
+	if err != nil {
+		return err
+	}
+	apply(cfg)
+	if why := cfg.PortMappingOff(); why != "" {
+		fmt.Println("Port forwarding is off: " + why + ".")
+		return nil
+	}
+	fmt.Printf("Asking your router to forward UDP port %d (UPnP, then NAT-PMP); this takes a few seconds...\n", cfg.Port)
+	if backgroundRunning(cfg) {
+		resp, err := backgroundCall(cfg, controlRequest{Cmd: "portmap"})
+		if err != nil {
+			return err
+		}
+		fmt.Println(resp.Status)
+		return nil
+	}
+	// No background process: check once here, then undo it, since
+	// nothing will be listening on the port afterwards.
+	id, err := loadIdentity()
+	if err != nil {
+		return err
+	}
+	n, err := startNode(cfg, id)
+	if err != nil {
+		return fmt.Errorf("%w (is another Tarion using UDP %d?)", err, cfg.Port)
+	}
+	defer n.close()
+	for deadline := time.Now().Add(15 * time.Second); !n.dir.Connected(); time.Sleep(100 * time.Millisecond) {
+		if time.Now().After(deadline) {
+			return fmt.Errorf("could not log in to the server to test it: %s", n.dir.Status())
+		}
+	}
+	ok, report := n.mapPort()
+	if !ok {
+		return errors.New(report)
+	}
+	fmt.Println(report)
+	fmt.Println("This was a test without the background process, so the forwarding is removed again; the background process sets it up by itself.")
+	return nil
+}
+
 // runOutbox lists messages waiting to be delivered.
 func runOutbox(args []string) error {
 	fs := flag.NewFlagSet("outbox", flag.ExitOnError)
@@ -1974,6 +2256,7 @@ func printGeneralHelp() {
 		"  send        Send one message through the background process",
 		"  listen      Print incoming messages as JSON lines (for scripts and apps)",
 		"  history     Print a chat's recent history",
+		"  portmap     Ask the router to forward your port again, and explain the result",
 		"  outbox      List messages waiting to be delivered",
 		"  dropped     List messages that were given up on or refused",
 		"  passwd      Change your account password",
@@ -2013,7 +2296,7 @@ func main() {
 	cmd := "start"
 	if len(args) > 0 {
 		switch args[0] {
-		case "start", "menu", "background", "stop", "send", "listen", "history", "outbox", "dropped", "passwd", "delete-account", "id", "peers", "forget":
+		case "start", "menu", "background", "stop", "send", "listen", "history", "portmap", "outbox", "dropped", "passwd", "delete-account", "id", "peers", "forget":
 			cmd, args = args[0], args[1:]
 		}
 	}
@@ -2030,6 +2313,8 @@ func main() {
 		err = runListen(args)
 	case "history":
 		err = runHistory(args)
+	case "portmap":
+		err = runPortmap(args)
 	case "outbox":
 		err = runOutbox(args)
 	case "dropped":
@@ -2048,7 +2333,14 @@ func main() {
 		err = runStart(args)
 	}
 	if err != nil {
-		fmt.Fprintln(os.Stderr, styleError.Render("tarion: "+err.Error()))
+		msg := "tarion: " + err.Error()
+		if strings.Contains(msg, "\n") {
+			// Multi-line explanations: plain text, so the terminal styling
+			// doesn't pad every line to the widest one.
+			fmt.Fprintln(os.Stderr, strings.TrimRight(msg, "\n"))
+		} else {
+			fmt.Fprintln(os.Stderr, styleError.Render(msg))
+		}
 		os.Exit(1)
 	}
 }
