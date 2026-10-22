@@ -89,6 +89,42 @@ type node struct {
 	dir    *directory.Client
 	cancel context.CancelFunc
 	events *hub
+
+	revokedMu sync.RWMutex
+	revoked   map[string]bool // keys banned by the server
+}
+
+// isRevoked reports whether the server banned this key.
+func (n *node) isRevoked(peerID string) bool {
+	n.revokedMu.RLock()
+	defer n.revokedMu.RUnlock()
+	return n.revoked[strings.ToLower(peerID)]
+}
+
+func (n *node) setRevoked(keys []string) {
+	set := make(map[string]bool, len(keys))
+	for _, k := range keys {
+		set[strings.ToLower(k)] = true
+	}
+	n.revokedMu.Lock()
+	n.revoked = set
+	n.revokedMu.Unlock()
+	_ = storage.SaveRevoked(keys)
+}
+
+// errRevoked marks a peer the server operator banned.
+var errRevoked = errors.New("banned on your server")
+
+// accept filters incoming messages: never from banned keys, and only from
+// contacts when cfg.Accept is "contacts".
+func (n *node) accept(peerID string) error {
+	if n.isRevoked(peerID) {
+		return errors.New("you are banned on this user's server")
+	}
+	if f := acceptFor(n.cfg); f != nil {
+		return f(peerID)
+	}
+	return nil
 }
 
 // controlEvent is one line of a `subscribe` stream.
@@ -156,11 +192,11 @@ func acceptFor(cfg *storage.Config) func(peerID string) error {
 
 func startNode(cfg *storage.Config, id *identity.Identity) (*node, error) {
 	nm := network.NewNetworkManager(cfg.Port, id)
-	nm.Accept = acceptFor(cfg)
+	n := &node{cfg: cfg, nm: nm, cancel: func() {}, events: &hub{subs: map[chan controlEvent]struct{}{}}, revoked: storage.LoadRevoked()}
+	nm.Accept = n.accept
 	if err := nm.StartListener(); err != nil {
 		return nil, err
 	}
-	n := &node{cfg: cfg, nm: nm, cancel: func() {}, events: &hub{subs: map[chan controlEvent]struct{}{}}}
 	if cfg.ServerAddr != "" && cfg.Username != "" {
 		ctx, cancel := context.WithCancel(context.Background())
 		n.cancel = cancel
@@ -173,6 +209,7 @@ func startNode(cfg *storage.Config, id *identity.Identity) (*node, error) {
 			OnServerID: func(id string) {
 				_ = storage.UpdateConfig(func(c *storage.Config) { c.ServerID = id })
 			},
+			OnRevoked: n.setRevoked,
 			OnLoggedIn: func(usedPassword bool) {
 				if usedPassword {
 					// The account now trusts this device's key; stop keeping the
@@ -288,6 +325,9 @@ func (n *node) deliver(to, addr, body string) error {
 		}
 		ctx, cancel := context.WithTimeout(context.Background(), timeout)
 		_, err := n.nm.SendContext(ctx, cand, senderName(n.cfg), body, func(peerID string) error {
+			if n.isRevoked(peerID) {
+				return fmt.Errorf("%s is %w", to, errRevoked)
+			}
 			if configured != "" && !strings.EqualFold(configured, peerID) {
 				return &storage.IdentityMismatchError{Name: to, Expected: configured, Got: peerID}
 			}

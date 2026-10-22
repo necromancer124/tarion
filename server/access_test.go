@@ -109,3 +109,38 @@ func TestParseInterspersed(t *testing.T) {
 		}
 	}
 }
+
+func TestBanListReachesClients(t *testing.T) {
+	bans := filepath.Join(t.TempDir(), "bans.txt")
+	opts := DefaultOptions()
+	opts.BansPath = bans
+	server, _ := startServerWith(t, opts)
+	alice := startClient(t, server, "alice", "correct-horse-1", "", nil)
+	bob := startClient(t, server, "bob", "battery-staple-2", "", nil)
+	waitFor(t, "both online", func() bool { return alice.dir.Connected() && bob.dir.Connected() })
+
+	latest := func(c *testClient) []string {
+		c.mu.Lock()
+		defer c.mu.Unlock()
+		if len(c.revoked) == 0 {
+			return nil
+		}
+		return c.revoked[len(c.revoked)-1]
+	}
+	// Banning bob by *name* sends alice bob's *key*, so her client can
+	// refuse him even on a direct connection.
+	if _, err := editBans(bans, "bob", true); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, "revocation pushed", func() bool {
+		l := latest(alice)
+		return len(l) == 1 && l[0] == bob.nm.ID()
+	})
+
+	// A client logging in later gets the list with its login.
+	carol := startClient(t, server, "carol", "orange-kite-37", "", nil)
+	waitFor(t, "carol online", carol.dir.Connected)
+	if l := latest(carol); len(l) != 1 || l[0] != bob.nm.ID() {
+		t.Fatalf("carol's login revoked list: %v", l)
+	}
+}

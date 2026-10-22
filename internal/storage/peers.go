@@ -98,6 +98,36 @@ func PeerByName(name string) (Peer, bool) {
 	return Peer{}, false
 }
 
+func GetRevokedPath() string { return filepath.Join(GetBaseConfigDir(), "revoked.json") }
+
+// LoadRevoked returns the banned keys last received from the server, so
+// bans still apply before (or without) a server connection.
+func LoadRevoked() map[string]bool {
+	set := map[string]bool{}
+	data, err := os.ReadFile(GetRevokedPath())
+	if err != nil {
+		return set
+	}
+	var keys []string
+	if json.Unmarshal(data, &keys) == nil {
+		for _, k := range keys {
+			set[strings.ToLower(k)] = true
+		}
+	}
+	return set
+}
+
+func SaveRevoked(keys []string) error {
+	if keys == nil {
+		keys = []string{}
+	}
+	data, err := json.Marshal(keys)
+	if err != nil {
+		return err
+	}
+	return writeFileAtomic(GetRevokedPath(), data)
+}
+
 // PeerByID returns the pinned peer for a key.
 func PeerByID(id string) (Peer, bool) {
 	peers, err := ListPeers()

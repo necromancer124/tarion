@@ -25,6 +25,7 @@ const (
 	MaxPasswordLen     = 256
 	MaxListedUsers     = 500
 	MaxLocalAddrs      = 4
+	MaxRevoked         = 1000 // banned keys sent to clients
 )
 
 // Request operations.
@@ -80,6 +81,9 @@ type Response struct {
 	Addr       string   `json:"addr,omitempty"`
 	LocalAddrs []string `json:"local_addrs,omitempty"` // only when both share a public IP
 	PeerID     string   `json:"peer_id,omitempty"`
+	// Revoked (on login) lists keys the operator banned. Clients refuse to
+	// exchange messages with them even over a direct connection.
+	Revoked []string `json:"revoked,omitempty"`
 }
 
 // Push is sent by the server on a stream it opens to a logged-in client.
@@ -92,9 +96,14 @@ type Push struct {
 	// behind the same public IP: the requester dials that first, so the
 	// target must open its firewall toward it too.
 	LocalAddrs []string `json:"local_addrs,omitempty"`
+	// Revoked is the full, current list of banned keys (type "revoked").
+	Revoked []string `json:"revoked,omitempty"`
 }
 
-const PushPunch = "punch"
+const (
+	PushPunch   = "punch"
+	PushRevoked = "revoked"
+)
 
 // ValidUsername allows 1-32 letters or digits (any script) plus . _ -,
 // starting with a letter or digit. Nothing here can break a file format,

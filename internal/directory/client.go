@@ -36,6 +36,9 @@ type ClientConfig struct {
 	OnLoggedIn func(usedPassword bool)
 	// OnPunch is called for each punch request the server forwards.
 	OnPunch func(Push)
+	// OnRevoked receives the server's full list of banned keys at every
+	// login and whenever it changes. Callers enforce and persist it.
+	OnRevoked func(keys []string)
 }
 
 // Client keeps one QUIC connection to tariond open from the chat socket.
@@ -148,6 +151,9 @@ func (c *Client) session(ctx context.Context) (bool, error) {
 	}
 	if c.cfg.OnLoggedIn != nil {
 		c.cfg.OnLoggedIn(usedPassword)
+	}
+	if c.cfg.OnRevoked != nil {
+		c.cfg.OnRevoked(resp.Revoked)
 	}
 
 	for {
@@ -355,7 +361,16 @@ func (c *Client) handlePush(stream *quic.Stream) {
 	defer stream.Close()
 	_ = stream.SetDeadline(time.Now().Add(5 * time.Second))
 	var push Push
-	if err := wire.ReadFrame(stream, &push); err != nil || push.Type != PushPunch || push.Addr == "" {
+	if err := wire.ReadFrame(stream, &push); err != nil {
+		return
+	}
+	if push.Type == PushRevoked {
+		if c.cfg.OnRevoked != nil {
+			c.cfg.OnRevoked(push.Revoked)
+		}
+		return
+	}
+	if push.Type != PushPunch || push.Addr == "" {
 		return
 	}
 	// The server rate-limits punches too; this just avoids repeating one

@@ -243,3 +243,26 @@ func TestAcceptContactsOnly(t *testing.T) {
 		t.Fatalf("contact refused: %v", err)
 	}
 }
+
+func TestRevokedPeerRefusedBothWays(t *testing.T) {
+	t.Setenv("TARION_HOME", t.TempDir())
+	alice, aliceAddr := startTestNode(t, &storage.Config{Username: "alice"})
+	bob, bobAddr := startTestNode(t, &storage.Config{Username: "bob"})
+
+	// alice's server banned bob.
+	alice.setRevoked([]string{bob.nm.ID()})
+	if err := alice.deliver("bob", bobAddr, "hi"); !errors.Is(err, errRevoked) {
+		t.Fatalf("sending to a banned key: %v", err)
+	}
+	if err := bob.deliver("alice", aliceAddr, "hi"); err == nil || !strings.Contains(err.Error(), "banned") {
+		t.Fatalf("banned key's message accepted: %v", err)
+	}
+	// Survives a restart: the list is saved.
+	if !storage.LoadRevoked()[strings.ToLower(bob.nm.ID())] {
+		t.Fatal("revocation list not persisted")
+	}
+	alice.setRevoked(nil)
+	if err := alice.deliver("bob", bobAddr, "unbanned"); err != nil {
+		t.Fatalf("after unban: %v", err)
+	}
+}

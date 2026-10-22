@@ -101,6 +101,20 @@ func readBans(path string) (map[string]bool, map[string]bool, error) {
 	return names, keys, scanner.Err()
 }
 
+// snapshot returns copies of the banned name keys and peer IDs.
+func (b *banList) snapshot() (names, keys []string) {
+	b.refresh()
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	for n := range b.names {
+		names = append(names, n)
+	}
+	for k := range b.keys {
+		keys = append(keys, k)
+	}
+	return names, keys
+}
+
 func (b *banList) Banned(name, peerID string) bool {
 	b.refresh()
 	b.mu.Lock()

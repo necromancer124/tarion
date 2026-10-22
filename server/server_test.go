@@ -64,6 +64,7 @@ type testClient struct {
 	cancel context.CancelFunc
 
 	mu       sync.Mutex
+	revoked  [][]string
 	punches  []directory.Push
 	loggedIn []bool
 	serverID string
@@ -89,6 +90,7 @@ func startClientInvite(t *testing.T, server, user, pass, serverID, invite string
 		OnServerID: func(id string) { tc.mu.Lock(); tc.serverID = id; tc.mu.Unlock() },
 		OnLoggedIn: func(used bool) { tc.mu.Lock(); tc.loggedIn = append(tc.loggedIn, used); tc.mu.Unlock() },
 		OnPunch:    func(p directory.Push) { tc.mu.Lock(); tc.punches = append(tc.punches, p); tc.mu.Unlock() },
+		OnRevoked:  func(k []string) { tc.mu.Lock(); tc.revoked = append(tc.revoked, k); tc.mu.Unlock() },
 	})
 	ctx, cancel := context.WithCancel(context.Background())
 	tc.cancel = cancel

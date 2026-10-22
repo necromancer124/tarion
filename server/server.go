@@ -8,6 +8,7 @@ import (
 	"net"
 	"sort"
 	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -137,6 +138,7 @@ func (s *Server) Serve(ln *quic.Listener) error {
 		for range time.Tick(2 * time.Second) {
 			if s.bans.refresh() {
 				s.kickBanned()
+				s.broadcastRevoked()
 			}
 		}
 	}()
@@ -372,7 +374,7 @@ func (s *Server) bind(sess *session, name string, local []string) directory.Resp
 		_ = old.conn.CloseWithError(directory.CodeReplaced, "logged in elsewhere")
 	}
 	log.Printf("online: %s", name)
-	return directory.Response{OK: true, User: name, YourAddr: sess.addr}
+	return directory.Response{OK: true, User: name, YourAddr: sess.addr, Revoked: s.revokedKeys()}
 }
 
 func (s *Server) list(sess *session) directory.Response {
@@ -429,8 +431,47 @@ func (s *Server) lookup(sess *session, req directory.Request) directory.Response
 	return resp
 }
 
-// pushPunch asks target to send a few packets from its chat socket to the
-// requester, opening target's NAT toward the requester's incoming dial.
+// revokedKeys is every banned key: keys listed directly, plus the key
+// linked to each banned username.
+func (s *Server) revokedKeys() []string {
+	names, keys := s.bans.snapshot()
+	set := map[string]bool{}
+	for _, k := range keys {
+		set[k] = true
+	}
+	for _, n := range names {
+		if u, ok := s.accounts.get(n); ok && u.PeerID != "" {
+			set[strings.ToLower(u.PeerID)] = true
+		}
+	}
+	out := make([]string, 0, len(set))
+	for k := range set {
+		out = append(out, k)
+	}
+	sort.Strings(out)
+	if len(out) > directory.MaxRevoked {
+		out = out[:directory.MaxRevoked]
+	}
+	return out
+}
+
+// broadcastRevoked sends the current ban list to every online client.
+func (s *Server) broadcastRevoked() {
+	push := directory.Push{Type: directory.PushRevoked, Revoked: s.revokedKeys()}
+	s.mu.Lock()
+	targets := make([]*session, 0, len(s.sessions))
+	for _, sess := range s.sessions {
+		targets = append(targets, sess)
+	}
+	s.mu.Unlock()
+	for _, t := range targets {
+		go s.pushPunch(t, push)
+	}
+}
+
+// pushPunch sends a push (a punch request, or the ban list) to target on a
+// stream the server opens. For a punch, target then sends a few packets from
+// its chat socket to the requester, opening its NAT for the incoming dial.
 func (s *Server) pushPunch(target *session, push directory.Push) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
