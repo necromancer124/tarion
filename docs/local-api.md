@@ -36,9 +36,11 @@
 {"type":"message","chat":"bob","peer_id":"x5u5zbukqp3ag4djhpylztggu7z3siop","body":"hi","time":"2026-10-21T16:39:02+03:00"}
 {"type":"status","status":"server connected as alice (public address 203.0.113.7:63426)"}
 {"type":"delivered","chat":"bob","body":"queued earlier","time":"..."}
+{"type":"dropped","chat":"bob","body":"never arrived","reason":"gave up after 7 days: bob is offline","time":"..."}
 ```
 
-`delivered`, `failed` and `expired` report what happened to a message that was queued earlier.
+- `delivered`: a queued message finally arrived.
+- `dropped`: a message will never be delivered. If it was yours, `body` holds what was lost; if you refused someone's message, there's no `body`. Every drop is also written to `dropped.log` (`tarion dropped`).
 
 - `chat` is the name the message is filed under. A stranger who claims a name you've already pinned shows up as `name~1a2b3c4d`.
 - `body` is the raw text. Escape it before displaying it in a terminal or as HTML.

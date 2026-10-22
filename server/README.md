@@ -33,7 +33,7 @@ Everything lives in one data folder: `-data`, or the `TARIOND_DATA` environment 
 | `-min-password` | `10` | Minimum password length for new accounts (8 or more) |
 | `-argon-memory` | `64` | argon2id memory per hash, in MiB |
 | `-argon-time` | `3` | argon2id passes |
-| `-relay` | `true` | Relay encrypted packets between peers whose NATs block a direct connection |
+| `-relay` | `false` | Relay encrypted packets between peers whose NATs block a direct connection. Both clients must also turn it on (`tarion -relay on`) |
 | `-relay-kbps` | `256` | Relay bandwidth per session, KiB/s |
 | `-relay-total-kbps` | `8192` | Relay bandwidth for all sessions together, KiB/s |
 
@@ -55,7 +55,7 @@ tariond id                          # print the server ID
 Operator commands take the same `-data` flag (or `TARIOND_DATA`) as the server.
 
 - **Invites:** a user registers once with `tarion start -server HOST:63425 -user NAME -pass PASSWORD -invite CODE`. Each code works exactly once; a failed registration gives the code back.
-- **Bans:** take effect within about 2 seconds, with no restart. A banned user is disconnected, can't log in or register, and doesn't show up in lookups. Banning a key blocks that device under any name. Every logged-in client also receives the list of banned keys (up to 1000) and refuses to exchange messages with them, even over a direct connection or when it already knows their address.
+- **Bans:** take effect within about 2 seconds, with no restart. A banned user is disconnected, can't log in or register, and doesn't show up in lookups. Banning a key blocks that device under any name. Every logged-in client also receives the list of banned keys (up to 1000) and, unless its user set `-server-bans off`, refuses to exchange messages with them, even over a direct connection or when it already knows their address.
 - **Deleting:** `tariond delete NAME` takes effect within about 2 seconds, or at the next start if the server isn't running. Users can also delete their own account with `tarion delete-account`.
 - **Limit:** someone who never logs in to your server never receives its ban list, so two people using Tarion without any server can still talk directly with `-i`.
 
@@ -66,7 +66,8 @@ Operator commands take the same `-data` flag (or `TARIOND_DATA`) as the server.
 - **Presence.** A user is online while their connection is open. Clients send keep-alives every 15 seconds, and the server drops a connection after 45 seconds of silence.
 - **Lookup.** The server returns the target's public chat address and key, and their LAN address only if both users share a public IP. It also tells the target to punch toward the requester, including the requester's LAN address in that case.
 - **List.** The server returns the names of online users (not their addresses), capped at 500.
-- **Relay.** When two peers can't connect directly, one asks for a relay session. The server forwards packets between the two members' known addresses only, without being able to decrypt them (the peers' TLS runs end to end inside). Sessions close after 2 minutes without traffic.
+- **Relay (off by default).** With `-relay`, when two peers can't connect directly, one asks for a relay session. The target must have the relay turned on too, otherwise the server answers `relay_refused`. The server forwards packets between the two members' known addresses only, without being able to decrypt them (the peers' TLS runs end to end inside). Sessions close after 2 minutes without traffic.
+- **Forwarded ports.** A client can advertise an address it made reachable itself (`tarion -public-addr`). The server checks that it's `host:port` and hands it out in lookups.
 - **Accounts can be changed.** Users can change their password (`tarion passwd`) or delete their account (`tarion delete-account`), both with the current password and rate-limited like logins.
 
 ## Abuse limits
