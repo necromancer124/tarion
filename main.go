@@ -626,6 +626,15 @@ func (n *node) probeReachable() (bool, error) {
 	}
 }
 
+// prepareExit undoes what must not outlive the process: the router's port
+// forward (nothing would be listening behind it) and the control token.
+// `tarion stop` ends the process with os.Exit, which skips deferred
+// cleanup, so it calls this first.
+func (n *node) prepareExit() {
+	n.removeMapping(false)
+	_ = os.Remove(storage.GetControlTokenPath())
+}
+
 // removeMapping deletes the current mapping from the router and, when
 // announce is set, withdraws it from the server.
 func (n *node) removeMapping(announce bool) {
@@ -1047,7 +1056,7 @@ func handleControlConn(conn net.Conn, token string, n *node) {
 		reply(nil)
 		go func() {
 			time.Sleep(100 * time.Millisecond)
-			_ = os.Remove(storage.GetControlTokenPath())
+			n.prepareExit()
 			os.Exit(0)
 		}()
 	case "send":

@@ -459,7 +459,10 @@ func (f *fakeMapper) Map(ctx context.Context, localIP net.IP, port int, lease ti
 	if f.err != nil {
 		return nil, f.err
 	}
-	return &portmap.Mapping{Method: f.name, ExternalIP: f.ext, ExternalPort: port, InternalPort: port}, nil
+	return portmap.NewMapping(f.name, f.ext, port, port, lease, nil, func(context.Context) error {
+		f.removed = true
+		return nil
+	}), nil
 }
 
 func TestPortMappingOffReasons(t *testing.T) {
@@ -512,5 +515,30 @@ func TestMapPortWithoutServerIsUntested(t *testing.T) {
 	ok, report := n.mapPort()
 	if !ok || !strings.Contains(report, "203.0.113.7") || !strings.Contains(report, "not announced or tested") {
 		t.Fatalf("ok=%v report=%q", ok, report)
+	}
+}
+
+// The router must not keep forwarding to a port nobody listens on: both a
+// normal close (Ctrl+C, quitting the menu, the one-off portmap test) and
+// `tarion stop` remove the mapping.
+func TestPortForwardIsRemovedOnExit(t *testing.T) {
+	t.Setenv("TARION_HOME", t.TempDir())
+	for name, exit := range map[string]func(*node){
+		"close":       func(n *node) { n.close() },
+		"tarion stop": func(n *node) { n.prepareExit() },
+	} {
+		n, _ := startTestNode(t, &storage.Config{Username: "alice"})
+		router := &fakeMapper{name: "UPnP", ext: net.ParseIP("203.0.113.7")}
+		n.mappers = []portmap.Mapper{router}
+		if ok, report := n.mapPort(); !ok {
+			t.Fatalf("%s: mapping failed: %s", name, report)
+		}
+		if router.removed {
+			t.Fatalf("%s: removed too early", name)
+		}
+		exit(n)
+		if !router.removed {
+			t.Errorf("%s: the router still forwards the port after exit", name)
+		}
 	}
 }

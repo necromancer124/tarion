@@ -25,6 +25,14 @@ type Mapping struct {
 	remove func(ctx context.Context) error
 }
 
+// NewMapping builds a Mapping for a Mapper implemented outside this
+// package. renew and remove may be nil.
+func NewMapping(method string, externalIP net.IP, externalPort, internalPort int, lease time.Duration,
+	renew, remove func(ctx context.Context) error) *Mapping {
+	return &Mapping{Method: method, ExternalIP: externalIP, ExternalPort: externalPort,
+		InternalPort: internalPort, Lease: lease, renew: renew, remove: remove}
+}
+
 // Addr is the public address peers can dial.
 func (m *Mapping) Addr() string {
 	return net.JoinHostPort(m.ExternalIP.String(), fmt.Sprint(m.ExternalPort))
