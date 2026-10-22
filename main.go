@@ -566,7 +566,7 @@ func (n *node) mapPort() (bool, string) {
 	n.removeMapping(true)
 	n.setPort(nil, "port forwarding: asking the router...", "")
 
-	ctx, cancel := context.WithTimeout(n.ctx, 30*time.Second)
+	ctx, cancel := context.WithTimeout(n.ctx, 45*time.Second)
 	defer cancel()
 	fail := func(report string) (bool, string) {
 		n.setPort(nil, "port forwarding failed (run 'tarion portmap' to see why)", report)
@@ -578,6 +578,20 @@ func (n *node) mapPort() (bool, string) {
 		return fail(err.Error())
 	}
 	drop := func() { _ = m.Remove(context.Background()) }
+
+	if m.ExternalIP == nil {
+		// The router forwarded the port but wouldn't say its internet
+		// address: use the one the server sees; the test packet below checks it.
+		seen := net.IP(nil)
+		if n.dir != nil {
+			seen = hostIP(n.dir.SeenAddr())
+		}
+		if seen == nil || seen.IsLoopback() || portmap.NotPublic(seen) != "" {
+			drop()
+			return fail("automatic port forwarding did not work:\n  - " + m.Method + ": the router forwarded the port but wouldn't say its internet address, and there is no server that sees a public one to use instead\n" + portmap.Advice(n.cfg.Port))
+		}
+		m.ExternalIP = seen
+	}
 
 	if n.dir != nil {
 		if seen := hostIP(n.dir.SeenAddr()); seen != nil && !seen.IsLoopback() && !seen.Equal(m.ExternalIP) {
@@ -949,7 +963,7 @@ func backgroundCall(cfg *storage.Config, req controlRequest) (controlResponse, e
 	defer conn.Close()
 	// A send may try a LAN address and then the public one, each waiting
 	// for the peer's ack.
-	_ = conn.SetDeadline(time.Now().Add(30 * time.Second))
+	_ = conn.SetDeadline(time.Now().Add(60 * time.Second))
 	if err := json.NewEncoder(conn).Encode(req); err != nil {
 		return resp, err
 	}
@@ -1030,7 +1044,7 @@ func serveBackgroundControl(token string, n *node) error {
 
 func handleControlConn(conn net.Conn, token string, n *node) {
 	defer conn.Close()
-	_ = conn.SetDeadline(time.Now().Add(30 * time.Second))
+	_ = conn.SetDeadline(time.Now().Add(60 * time.Second))
 	send := func(resp controlResponse) { _ = json.NewEncoder(conn).Encode(resp) }
 	reply := func(err error) {
 		resp := controlResponse{OK: err == nil}
@@ -2319,7 +2333,14 @@ func main() {
 		err = runStart(args)
 	}
 	if err != nil {
-		fmt.Fprintln(os.Stderr, styleError.Render("tarion: "+err.Error()))
+		msg := "tarion: " + err.Error()
+		if strings.Contains(msg, "\n") {
+			// Multi-line explanations: plain text, so the terminal styling
+			// doesn't pad every line to the widest one.
+			fmt.Fprintln(os.Stderr, strings.TrimRight(msg, "\n"))
+		} else {
+			fmt.Fprintln(os.Stderr, styleError.Render(msg))
+		}
 		os.Exit(1)
 	}
 }

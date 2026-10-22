@@ -20,6 +20,8 @@ type Mapping struct {
 	ExternalPort int
 	InternalPort int
 	Lease        time.Duration // 0 = permanent until removed
+	// ExternalIP is nil when the router wouldn't say; set it from what the
+	// server observes before using Addr.
 
 	renew  func(ctx context.Context) error
 	remove func(ctx context.Context) error
@@ -108,12 +110,15 @@ func Open(ctx context.Context, mappers []Mapper, localIP net.IP, port int, lease
 		return nil, f
 	}
 	for _, m := range mappers {
-		mctx, cancel := context.WithTimeout(ctx, 8*time.Second)
+		mctx, cancel := context.WithTimeout(ctx, 15*time.Second) // UPnP discovery alone can take a few seconds
 		mapping, err := m.Map(mctx, localIP, port, lease)
 		cancel()
 		if err != nil {
 			f.Attempts = append(f.Attempts, Attempt{m.Name(), err.Error()})
 			continue
+		}
+		if mapping.ExternalIP == nil {
+			return mapping, nil // address unknown: the caller fills it in and tests it
 		}
 		if problem := NotPublic(mapping.ExternalIP); problem != "" {
 			rctx, rcancel := context.WithTimeout(ctx, 3*time.Second)

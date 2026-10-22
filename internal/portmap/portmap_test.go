@@ -3,6 +3,7 @@ package portmap
 import (
 	"context"
 	"errors"
+	"fmt"
 	"net"
 	"strings"
 	"testing"
@@ -94,6 +95,7 @@ func TestExplainUPnPErrors(t *testing.T) {
 	for code, want := range map[int]string{
 		606: "not port forwarding changes",
 		718: "another device",
+		501: "Allow port mapping",
 		728: "table is full",
 		999: "refused the request",
 	} {
@@ -103,5 +105,36 @@ func TestExplainUPnPErrors(t *testing.T) {
 	}
 	if got := explainUPnP(errors.New("connection reset")); !strings.Contains(got, "did not answer correctly") {
 		t.Errorf("plain error: %q", got)
+	}
+}
+
+func TestExplainNATPMPTimeout(t *testing.T) {
+	gw := net.ParseIP("192.168.1.1")
+	for _, err := range []error{errTimeout, errors.New("Timed out trying to contact gateway")} {
+		if got := explainNATPMP(gw, err); !strings.Contains(got, "probably not supported or turned off") {
+			t.Errorf("%v: %q", err, got)
+		}
+	}
+}
+
+func TestRefusesEverythingExplained(t *testing.T) {
+	f := &soap.SOAPFaultError{}
+	f.Detail.UPnPError.Errorcode = 501
+	if got := explainRefusesEverything(f); !strings.Contains(got, "refuses every request") || !strings.Contains(got, "ISP") {
+		t.Fatalf("%q", got)
+	}
+}
+
+func TestOpenAcceptsUnknownExternalAddress(t *testing.T) {
+	m, err := Open(context.Background(), []Mapper{&fake{name: "UPnP"}}, lan, 63426, time.Hour)
+	if err != nil || m.ExternalIP != nil {
+		t.Fatalf("a mapping with an unknown address goes to the caller to check: %+v %v", m, err)
+	}
+}
+
+func TestExplainUPnPTimeout(t *testing.T) {
+	err := fmt.Errorf("post: %w", context.DeadlineExceeded)
+	if got := explainRefusesEverything(err); !strings.Contains(got, "stopped answering UPnP requests in time") {
+		t.Fatalf("%q", got)
 	}
 }

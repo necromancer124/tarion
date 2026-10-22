@@ -38,7 +38,7 @@ func within[T any](ctx context.Context, f func() (T, error)) (T, error) {
 }
 
 func explainNATPMP(gw net.IP, err error) string {
-	msg := err.Error()
+	msg := strings.ToLower(err.Error())
 	switch {
 	case err == errTimeout || strings.Contains(msg, "timed out") || strings.Contains(msg, "timeout"):
 		return fmt.Sprintf("your router (%s) did not answer; NAT-PMP is probably not supported or turned off", gw)
