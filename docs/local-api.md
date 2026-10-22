@@ -24,6 +24,7 @@
 | `online` | | `{"ok":true,"status":"...","users":["bob",...]}` |
 | `history` | `to`, optional `limit` | `{"ok":true,"lines":["bob: hi","Me: hello"]}` |
 | `subscribe` | | `{"ok":true,"status":"..."}`, then the connection **stays open** and streams events |
+| `portmap` | | Asks the router to forward the chat port again (takes a few seconds): `{"ok":true,"status":"port forwarding: on via UPnP, ..."}`, or `{"ok":false,"error":"<why it failed and what to do>"}` |
 | `change_password` | `pass`, `new_pass` | `{"ok":true}` or an error explaining why |
 | `delete_account` | `pass` | `{"ok":true}`; the server then ends the session |
 | `stop` | | `{"ok":true}`, then the background exits |
@@ -39,6 +40,7 @@
 {"type":"dropped","chat":"bob","body":"never arrived","reason":"gave up after 7 days: bob is offline","time":"..."}
 ```
 
+- `portmap`: automatic port forwarding changed; `status` is one line, and `reason` is the full explanation.
 - `delivered`: a queued message finally arrived.
 - `dropped`: a message will never be delivered. If it was yours, `body` holds what was lost; if you refused someone's message, there's no `body`. Every drop is also written to `dropped.log` (`tarion dropped`).
 

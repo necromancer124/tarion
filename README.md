@@ -138,7 +138,8 @@ The config is saved to:
 - `accept` is `anyone` (default) or `contacts` (see above). Strangers who write to you then get "this user only accepts messages from contacts".
 - `server_bans` is `on` (default) or `off` (`-server-bans`): whether your client refuses keys your server's operator banned.
 - `relay` is `off` (default) or `on` (`-relay`): whether messages may pass through the server when no direct path exists. See [Getting through strict NATs](#getting-through-strict-nats).
-- `public_addr` (`-public-addr`): an address peers can reach you at directly, such as a forwarded port.
+- `public_addr` (`-public-addr`): an address peers can reach you at directly, such as a port you forwarded by hand.
+- `port_mapping` is `auto` (default), `on` or `off` (`-port-mapping`): whether to ask your router to forward the chat port automatically. `auto` does it while the relay is off.
 
 The folder also holds `identity.key` (your private key, keep it secret), `peers.json` (pinned contacts), `outbox.json` (messages waiting to be delivered), `dropped.log` (messages given up on or refused), `revoked.json` (keys your server banned) and, while the background process runs, `control.token`.
 
@@ -172,9 +173,18 @@ The folder also holds `identity.key` (your private key, keep it secret), `peers.
 
 ### Getting through strict NATs
 
-Hole punching works with most home routers. When both sides are behind strict ("symmetric") NATs, there are two options:
+Hole punching works with most home routers. When both sides are behind strict ("symmetric") NATs, Tarion has these options:
 
-- **Forward a port (no server involved).** On your router, forward UDP to your chat port (default 63426), then tell Tarion: `-public-addr YOUR_PUBLIC_IP:63426` (a DNS name works too). The server passes it to people who look you up, and they connect straight to you.
+- **Automatic port forwarding (on by default while the relay is off).** At start, the client asks your router to forward its chat port, with UPnP first, then NAT-PMP. It checks that the router's internet address matches what the server sees, announces the address, and has the server send a test packet from a *different* port, the way a stranger would. Only if that packet arrives is the forward kept and given to people who look you up. The mapping is renewed while Tarion runs and removed when it exits.
+
+  If it doesn't work, Tarion says why: no UPnP/NAT-PMP router answered, the router refused, the port is taken, your ISP shares one address between customers (carrier-grade NAT), there's a second router (double NAT), or a firewall blocked the test packet. It also lists what you can do. You see this in `background.log` and in the menu's status line, and `tarion portmap` retries at any time and prints the full explanation:
+
+  ```powershell
+  .\tarion.exe portmap
+  ```
+
+  `-port-mapping off` turns it off, and `-port-mapping on` uses it even with the relay on.
+- **Forward a port by hand (no server involved).** On your router, forward UDP to your chat port (default 63426), then tell Tarion: `-public-addr YOUR_PUBLIC_IP:63426` (a DNS name works too). The server passes it to people who look you up, and they connect straight to you. Setting this turns the automatic forwarding off.
 - **The relay (opt-in, off by default).** With `-relay on` on both clients and `tariond -relay` on the server, the server forwards the QUIC packets between you. You still run your own encrypted handshake inside it and keys are checked as usual, so the server only sees ciphertext, but your traffic does go through it. A client with the relay off never uses it and refuses relayed connections. After needing it, messages to that contact use the relay right away for 10 minutes.
 
 ### Wire protocol

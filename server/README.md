@@ -67,7 +67,8 @@ Operator commands take the same `-data` flag (or `TARIOND_DATA`) as the server.
 - **Lookup.** The server returns the target's public chat address and key, and their LAN address only if both users share a public IP. It also tells the target to punch toward the requester, including the requester's LAN address in that case.
 - **List.** The server returns the names of online users (not their addresses), capped at 500.
 - **Relay (off by default).** With `-relay`, when two peers can't connect directly, one asks for a relay session. The target must have the relay turned on too, otherwise the server answers `relay_refused`. The server forwards packets between the two members' known addresses only, without being able to decrypt them (the peers' TLS runs end to end inside). Sessions close after 2 minutes without traffic.
-- **Forwarded ports.** A client can advertise an address it made reachable itself (`tarion -public-addr`). The server checks that it's `host:port` and hands it out in lookups.
+- **Forwarded ports.** A client can advertise an address it made reachable itself (`tarion -public-addr`, or a port its router forwards automatically, announced after login). The server checks that it's `host:port` and hands it out in lookups.
+- **Reachability test.** On request, the server sends a 12-byte test packet to a client's advertised address from a second UDP port (opened at start, random), so the client knows whether strangers can really reach it. It only goes to the client's own public IP and is rate-limited, so it can't be aimed at anyone else.
 - **Accounts can be changed.** Users can change their password (`tarion passwd`) or delete their account (`tarion delete-account`), both with the current password and rate-limited like logins.
 
 ## Abuse limits
