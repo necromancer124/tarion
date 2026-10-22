@@ -14,11 +14,40 @@ import (
 	"github.com/necromancer124/tarion/internal/relay"
 )
 
-func TestRelayWhenDirectPathBlocked(t *testing.T) {
-	server, _ := startServer(t)
-	alice := startClient(t, server, "alice", "correct-horse-1", "", nil)
-	bob := startClient(t, server, "bob", "battery-staple-2", "", nil)
+// relayPair starts a relay-enabled server and two clients that opted in.
+func relayPair(t *testing.T, aliceRelay, bobRelay bool) (*testClient, *testClient) {
+	t.Helper()
+	opts := DefaultOptions()
+	opts.Relay = true
+	server, _ := startServerWith(t, opts)
+	alice := startClientCfg(t, directory.ClientConfig{Server: server, User: "alice", Pass: "correct-horse-1", AcceptRelay: aliceRelay}, nil)
+	bob := startClientCfg(t, directory.ClientConfig{Server: server, User: "bob", Pass: "battery-staple-2", AcceptRelay: bobRelay}, nil)
 	waitFor(t, "both online", func() bool { return alice.dir.Connected() && bob.dir.Connected() })
+	return alice, bob
+}
+
+func TestRelayIsOffByDefault(t *testing.T) {
+	if DefaultOptions().Relay {
+		t.Fatal("the server must not relay unless the operator turns it on")
+	}
+}
+
+func TestRelayRefusedWhenTargetOptedOut(t *testing.T) {
+	alice, _ := relayPair(t, true, false)
+	if _, _, err := alice.dir.Relay("bob"); err == nil || !strings.Contains(err.Error(), "relay_refused") {
+		t.Fatalf("expected relay_refused, got %v", err)
+	}
+}
+
+func TestRelayUnavailableWhenRequesterOptedOut(t *testing.T) {
+	alice, _ := relayPair(t, false, true)
+	if _, _, err := alice.dir.Relay("bob"); err == nil || !strings.Contains(err.Error(), "turned off") {
+		t.Fatalf("expected the client to refuse, got %v", err)
+	}
+}
+
+func TestRelayWhenDirectPathBlocked(t *testing.T) {
+	alice, bob := relayPair(t, true, true)
 
 	// bob is behind a "strict NAT": only the server can reach him.
 	bob.nm.Relay().SimulateStrictNAT(true)
@@ -58,8 +87,8 @@ func TestRelayCanBeDisabled(t *testing.T) {
 	opts := DefaultOptions()
 	opts.Relay = false
 	server, _ := startServerWith(t, opts)
-	alice := startClient(t, server, "alice", "correct-horse-1", "", nil)
-	bob := startClient(t, server, "bob", "battery-staple-2", "", nil)
+	alice := startClientCfg(t, directory.ClientConfig{Server: server, User: "alice", Pass: "correct-horse-1", AcceptRelay: true}, nil)
+	bob := startClientCfg(t, directory.ClientConfig{Server: server, User: "bob", Pass: "battery-staple-2", AcceptRelay: true}, nil)
 	waitFor(t, "both online", func() bool { return alice.dir.Connected() && bob.dir.Connected() })
 	if _, _, err := alice.dir.Relay("bob"); err == nil || !strings.Contains(err.Error(), "relay_disabled") {
 		t.Fatalf("expected relay_disabled, got %v", err)

@@ -101,7 +101,7 @@ func serve(args []string) error {
 	minPass := fs.Int("min-password", directory.DefaultMinPassword, "minimum password length for new accounts")
 	argonMem := fs.Int("argon-memory", int(DefaultArgon.MemoryKiB/1024), "argon2id memory per hash, MiB")
 	argonTime := fs.Int("argon-time", int(DefaultArgon.Time), "argon2id passes")
-	relayOn := fs.Bool("relay", true, "relay encrypted packets between peers whose NATs block direct connections")
+	relayOn := fs.Bool("relay", false, "relay encrypted packets between peers whose NATs block direct connections (both peers must also turn it on)")
 	relayKBps := fs.Int("relay-kbps", 256, "relay bandwidth per session, KiB/s")
 	relayTotalKBps := fs.Int("relay-total-kbps", 8192, "relay bandwidth for all sessions, KiB/s")
 	showID := fs.Bool("id", false, "print the server ID and exit (same as `tariond id`)")

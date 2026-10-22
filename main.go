@@ -107,6 +107,9 @@ type node struct {
 
 // isRevoked reports whether the server banned this key.
 func (n *node) isRevoked(peerID string) bool {
+	if !n.cfg.EnforcesServerBans() {
+		return false
+	}
 	n.revokedMu.RLock()
 	defer n.revokedMu.RUnlock()
 	return n.revoked[strings.ToLower(peerID)]
@@ -225,11 +228,13 @@ func startNode(cfg *storage.Config, id *identity.Identity) (*node, error) {
 	go n.runOutbox(ctx)
 	if cfg.ServerAddr != "" && cfg.Username != "" {
 		n.dir = directory.NewClient(nm, directory.ClientConfig{
-			Server:   cfg.ServerAddr,
-			User:     cfg.Username,
-			Pass:     cfg.Password,
-			Invite:   cfg.Invite,
-			ServerID: cfg.ServerID,
+			Server:      cfg.ServerAddr,
+			User:        cfg.Username,
+			Pass:        cfg.Password,
+			Invite:      cfg.Invite,
+			ServerID:    cfg.ServerID,
+			AcceptRelay: cfg.RelayEnabled(),
+			PublicAddr:  cfg.PublicAddr,
 			OnServerID: func(id string) {
 				_ = storage.UpdateConfig(func(c *storage.Config) { c.ServerID = id })
 			},
@@ -468,7 +473,13 @@ func (n *node) deliverMsg(id string, sent time.Time, to, addr, body string) erro
 		switch {
 		case err == nil:
 			dirID = resp.PeerID
-			candidates = append(append(candidates, resp.LocalAddrs...), resp.Addr)
+			// LAN first, then an address they made reachable themselves
+			// (a forwarded port), then the one the server observed.
+			candidates = append(candidates, resp.LocalAddrs...)
+			if resp.PublicAddr != "" && resp.PublicAddr != resp.Addr {
+				candidates = append(candidates, resp.PublicAddr)
+			}
+			candidates = append(candidates, resp.Addr)
 		case errors.Is(err, directory.ErrUserOffline):
 			offline = true
 		}
@@ -511,7 +522,7 @@ func (n *node) deliverMsg(id string, sent time.Time, to, addr, body string) erro
 
 	// When the server knows the contact, it can relay if the direct path
 	// fails (strict NATs). The packets stay end-to-end encrypted.
-	canRelay := dirID != ""
+	canRelay := dirID != "" && n.cfg.RelayEnabled()
 	viaRelay := func() error {
 		// Reuse the contact's relay session while it is alive; the server
 		// caps how many each user may hold open.
@@ -1382,17 +1393,21 @@ func setStopUsage(fs *flag.FlagSet) {
 type clientFlags struct {
 	port, ctrl                         *int
 	server, user, pass, invite, accept *string
+	serverBans, relayMode, publicAddr  *string
 }
 
 func addClientFlags(fs *flag.FlagSet) clientFlags {
 	return clientFlags{
-		port:   fs.Int("p", 0, fmt.Sprintf("local UDP port for chat and server traffic (default %d)", storage.DefaultPort)),
-		ctrl:   fs.Int("cp", 0, "local TCP port of the background control socket (default: -p plus 10000)"),
-		server: fs.String("server", "", fmt.Sprintf("directory server host:port (tariond default port %d)", directory.DefaultServerPort)),
-		user:   fs.String("user", "", "directory username"),
-		pass:   fs.String("pass", "", "directory password (only needed the first time on this device)"),
-		invite: fs.String("invite", "", "one-time invite code, if the server is invite-only"),
-		accept: fs.String("accept", "", "who may message you: anyone or contacts (saved)"),
+		port:       fs.Int("p", 0, fmt.Sprintf("local UDP port for chat and server traffic (default %d)", storage.DefaultPort)),
+		ctrl:       fs.Int("cp", 0, "local TCP port of the background control socket (default: -p plus 10000)"),
+		server:     fs.String("server", "", fmt.Sprintf("directory server host:port (tariond default port %d)", directory.DefaultServerPort)),
+		user:       fs.String("user", "", "directory username"),
+		pass:       fs.String("pass", "", "directory password (only needed the first time on this device)"),
+		invite:     fs.String("invite", "", "one-time invite code, if the server is invite-only"),
+		accept:     fs.String("accept", "", "who may message you: anyone or contacts (saved)"),
+		serverBans: fs.String("server-bans", "", "on (default) or off: refuse keys the server banned (saved)"),
+		relayMode:  fs.String("relay", "", "off (default) or on: allow messages through the server when no direct path exists (saved)"),
+		publicAddr: fs.String("public-addr", "", `address peers can reach you at directly, e.g. a forwarded port "203.0.113.7:63426"; "none" clears it (saved)`),
 	}
 }
 
@@ -1417,6 +1432,26 @@ func (f clientFlags) apply(cfg *storage.Config) error {
 	case "", "anyone", "contacts":
 	default:
 		return errors.New(`-accept must be "anyone" or "contacts"`)
+	}
+	if f.serverBans != nil && *f.serverBans != "" {
+		cfg.ServerBans = *f.serverBans
+	}
+	if f.relayMode != nil && *f.relayMode != "" {
+		cfg.Relay = *f.relayMode
+	}
+	for name, v := range map[string]string{"-server-bans": cfg.ServerBans, "-relay": cfg.Relay} {
+		if v != "" && v != "on" && v != "off" {
+			return fmt.Errorf(`%s must be "on" or "off"`, name)
+		}
+	}
+	if f.publicAddr != nil && *f.publicAddr != "" {
+		cfg.PublicAddr = *f.publicAddr
+		if cfg.PublicAddr == "none" {
+			cfg.PublicAddr = ""
+		}
+	}
+	if cfg.PublicAddr != "" && !directory.ValidPublicAddr(cfg.PublicAddr) {
+		return errors.New(`-public-addr must be "host:port" (an IP or DNS name)`)
 	}
 	if *f.port != 0 {
 		cfg.Port = *f.port

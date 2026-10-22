@@ -80,6 +80,12 @@ func startClient(t *testing.T, server, user, pass, serverID string, id *identity
 
 func startClientInvite(t *testing.T, server, user, pass, serverID, invite string, id *identity.Identity) *testClient {
 	t.Helper()
+	return startClientCfg(t, directory.ClientConfig{Server: server, User: user, Pass: pass, ServerID: serverID, Invite: invite}, id)
+}
+
+// startClientCfg starts a client from cfg (callbacks are filled in).
+func startClientCfg(t *testing.T, cfg directory.ClientConfig, id *identity.Identity) *testClient {
+	t.Helper()
 	if id == nil {
 		id, _ = identity.Generate()
 	}
@@ -88,13 +94,11 @@ func startClientInvite(t *testing.T, server, user, pass, serverID, invite string
 		t.Fatal(err)
 	}
 	tc := &testClient{nm: nm}
-	tc.dir = directory.NewClient(nm, directory.ClientConfig{
-		Server: server, User: user, Pass: pass, ServerID: serverID, Invite: invite,
-		OnServerID: func(id string) { tc.mu.Lock(); tc.serverID = id; tc.mu.Unlock() },
-		OnLoggedIn: func(used bool) { tc.mu.Lock(); tc.loggedIn = append(tc.loggedIn, used); tc.mu.Unlock() },
-		OnPunch:    func(p directory.Push) { tc.mu.Lock(); tc.punches = append(tc.punches, p); tc.mu.Unlock() },
-		OnRevoked:  func(k []string) { tc.mu.Lock(); tc.revoked = append(tc.revoked, k); tc.mu.Unlock() },
-	})
+	cfg.OnServerID = func(id string) { tc.mu.Lock(); tc.serverID = id; tc.mu.Unlock() }
+	cfg.OnLoggedIn = func(used bool) { tc.mu.Lock(); tc.loggedIn = append(tc.loggedIn, used); tc.mu.Unlock() }
+	cfg.OnPunch = func(p directory.Push) { tc.mu.Lock(); tc.punches = append(tc.punches, p); tc.mu.Unlock() }
+	cfg.OnRevoked = func(k []string) { tc.mu.Lock(); tc.revoked = append(tc.revoked, k); tc.mu.Unlock() }
+	tc.dir = directory.NewClient(nm, cfg)
 	ctx, cancel := context.WithCancel(context.Background())
 	tc.cancel = cancel
 	go tc.dir.Run(ctx)
@@ -235,4 +239,20 @@ func TestSecondLoginReplacesFirst(t *testing.T) {
 	b := startClient(t, server, "alice", "", "", id)
 	waitFor(t, "second", b.dir.Connected)
 	waitFor(t, "first closed", func() bool { return strings.Contains(a.dir.Status(), "another device") })
+}
+
+func TestAdvertisedPublicAddress(t *testing.T) {
+	server, _ := startServer(t)
+	alice := startClientCfg(t, directory.ClientConfig{Server: server, User: "alice", Pass: "correct-horse-1", PublicAddr: "203.0.113.9:4000"}, nil)
+	bob := startClientCfg(t, directory.ClientConfig{Server: server, User: "bob", Pass: "battery-staple-2", PublicAddr: "not an address"}, nil)
+	waitFor(t, "both online", func() bool { return alice.dir.Connected() && bob.dir.Connected() })
+
+	resp, err := bob.dir.Lookup("alice")
+	if err != nil || resp.PublicAddr != "203.0.113.9:4000" {
+		t.Fatalf("alice's forwarded port not passed on: %+v %v", resp, err)
+	}
+	resp, err = alice.dir.Lookup("bob")
+	if err != nil || resp.PublicAddr != "" {
+		t.Fatalf("an invalid advertised address must be ignored: %+v %v", resp, err)
+	}
 }

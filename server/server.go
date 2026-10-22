@@ -49,7 +49,7 @@ func DefaultOptions() Options {
 	return Options{
 		Registration:     RegOpen,
 		MinPassword:      directory.DefaultMinPassword,
-		Relay:            true,
+		Relay:            false, // opt-in: by default no message passes through the server
 		RelayRate:        256 * 1024,
 		RelayTotal:       8 * 1024 * 1024,
 		MaxRelaysPerUser: 8,
@@ -100,9 +100,11 @@ type session struct {
 	addr   string   // public address the server observes = the client's chat socket
 	udp    net.Addr // the same, as quic-go reports it; relay packets come from here
 
-	mu         sync.Mutex
-	user       string
-	localAddrs []string
+	mu          sync.Mutex
+	user        string
+	localAddrs  []string
+	publicAddr  string // advertised by the user (e.g. a forwarded port)
+	acceptRelay bool
 }
 
 func (s *session) loggedIn() (string, []string) {
@@ -353,7 +355,7 @@ func (s *Server) register(sess *session, req directory.Request) directory.Respon
 		return fail(directory.ErrServer)
 	}
 	log.Printf("registered: %s (key %s)", name, identity.Short(sess.peerID))
-	return s.bind(sess, name, req.LocalAddrs)
+	return s.bind(sess, name, req)
 }
 
 func (s *Server) login(sess *session, req directory.Request) directory.Response {
@@ -397,14 +399,14 @@ func (s *Server) login(sess *session, req directory.Request) directory.Response 
 		log.Printf("login %q: %v", req.User, err)
 		return fail(directory.ErrServer)
 	}
-	return s.bind(sess, name, req.LocalAddrs)
+	return s.bind(sess, name, req)
 }
 
 // bind makes sess the account's live session. An older session for the same
 // account (another device, or a stale connection) is closed.
-func (s *Server) bind(sess *session, name string, local []string) directory.Response {
+func (s *Server) bind(sess *session, name string, req directory.Request) directory.Response {
 	var clean []string
-	for _, a := range local {
+	for _, a := range req.LocalAddrs {
 		if host, port, err := net.SplitHostPort(a); err == nil && net.ParseIP(host) != nil && port != "" {
 			clean = append(clean, a)
 			if len(clean) == directory.MaxLocalAddrs {
@@ -412,8 +414,13 @@ func (s *Server) bind(sess *session, name string, local []string) directory.Resp
 			}
 		}
 	}
+	public := ""
+	if directory.ValidPublicAddr(req.PublicAddr) {
+		public = req.PublicAddr
+	}
 	sess.mu.Lock()
 	sess.user, sess.localAddrs = name, clean
+	sess.publicAddr, sess.acceptRelay = public, req.AcceptRelay
 	sess.mu.Unlock()
 
 	key := directory.NameKey(name)
@@ -469,6 +476,9 @@ func (s *Server) lookup(sess *session, req directory.Request) directory.Response
 		return fail(directory.ErrOffline)
 	}
 	resp := directory.Response{OK: true, User: targetName, Addr: target.addr, PeerID: target.peerID}
+	target.mu.Lock()
+	resp.PublicAddr = target.publicAddr
+	target.mu.Unlock()
 	// LAN addresses only help (and are only shared) when both are behind the
 	// same public IP, where dialing the public address needs NAT hairpinning.
 	push := directory.Push{Type: directory.PushPunch, From: user, PeerID: sess.peerID, Addr: sess.addr}
@@ -556,6 +566,12 @@ func (s *Server) openRelay(sess *session, req directory.Request) directory.Respo
 	targetName, _ := target.loggedIn()
 	if s.bans.Banned(targetName, target.peerID) || !s.punchLimit.Allow(sess.id+">relay>"+target.id) {
 		return fail(directory.ErrOffline)
+	}
+	target.mu.Lock()
+	accepts := target.acceptRelay
+	target.mu.Unlock()
+	if !accepts {
+		return fail(directory.ErrRelayRefused)
 	}
 
 	id := relay.NewID()

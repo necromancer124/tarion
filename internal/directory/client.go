@@ -28,6 +28,13 @@ type ClientConfig struct {
 	ServerID string // pinned server key; empty means trust on first use
 	Invite   string // one-time code, needed only to register on an invite-only server
 
+	// AcceptRelay lets others reach this client through the server's relay
+	// (and lets it use the relay). Off means no message ever passes through
+	// the server.
+	AcceptRelay bool
+	// PublicAddr is an address the user made reachable (a forwarded port).
+	PublicAddr string
+
 	// OnServerID is called once when an unpinned server key is first seen,
 	// so the caller can persist the pin.
 	OnServerID func(id string)
@@ -245,7 +252,8 @@ func (c *Client) dial(ctx context.Context) (*quic.Conn, error) {
 func (c *Client) login(ctx context.Context, conn *quic.Conn) (Response, bool, error) {
 	local := c.nm.LocalAddrs()
 	usedPassword := c.cfg.Pass != ""
-	resp, err := roundTrip(ctx, conn, Request{Op: OpLogin, User: c.cfg.User, Pass: c.cfg.Pass, LocalAddrs: local})
+	resp, err := roundTrip(ctx, conn, Request{Op: OpLogin, User: c.cfg.User, Pass: c.cfg.Pass, LocalAddrs: local,
+		AcceptRelay: c.cfg.AcceptRelay, PublicAddr: c.cfg.PublicAddr})
 	if err != nil {
 		return resp, false, err
 	}
@@ -257,7 +265,8 @@ func (c *Client) login(ctx context.Context, conn *quic.Conn) (Response, bool, er
 		if c.cfg.Pass == "" {
 			return resp, false, &FatalError{Msg: fmt.Sprintf("account %s does not exist; run once with -pass to create it", c.cfg.User)}
 		}
-		resp, err = roundTrip(ctx, conn, Request{Op: OpRegister, User: c.cfg.User, Pass: c.cfg.Pass, Invite: c.cfg.Invite, LocalAddrs: local})
+		resp, err = roundTrip(ctx, conn, Request{Op: OpRegister, User: c.cfg.User, Pass: c.cfg.Pass, Invite: c.cfg.Invite, LocalAddrs: local,
+			AcceptRelay: c.cfg.AcceptRelay, PublicAddr: c.cfg.PublicAddr})
 		if err != nil {
 			return resp, false, err
 		}
@@ -315,6 +324,9 @@ func (c *Client) List() ([]string, error) {
 // Relay asks the server for a relay session to target, for when a direct
 // connection fails. It returns the address to dial and the target's key.
 func (c *Client) Relay(target string) (addr, peerID string, err error) {
+	if !c.cfg.AcceptRelay {
+		return "", "", errors.New("relay is turned off")
+	}
 	resp, err := c.request(Request{Op: OpRelay, Target: target})
 	if err != nil {
 		return "", "", err
@@ -427,6 +439,9 @@ func (c *Client) handlePush(stream *quic.Stream) {
 		return
 	}
 	if push.Type == PushRelay {
+		if !c.cfg.AcceptRelay {
+			return // relay is off here: its packets stay unknown and are dropped
+		}
 		if id, ok := relay.ParseID(push.Relay); ok && c.nm.Relay() != nil {
 			c.nm.Relay().Allow(id)
 		}

@@ -5,6 +5,8 @@
 package directory
 
 import (
+	"net"
+	"strconv"
 	"strings"
 	"unicode"
 	"unicode/utf8"
@@ -58,6 +60,7 @@ const (
 	ErrBadInvite        = "bad_invite"
 	ErrRegistrationOff  = "registration_closed"
 	ErrRelayOff         = "relay_disabled"
+	ErrRelayRefused     = "relay_refused" // the target turned the relay off
 )
 
 // QUIC application error codes tariond closes a session with.
@@ -75,6 +78,11 @@ type Request struct {
 	Target     string   `json:"target,omitempty"`
 	Invite     string   `json:"invite,omitempty"` // one-time code, for servers in invite mode
 	LocalAddrs []string `json:"local_addrs,omitempty"`
+	// AcceptRelay (login) says whether this client lets others reach it
+	// through the server's relay. PublicAddr (login) is an address the user
+	// made reachable themselves, such as a forwarded port.
+	AcceptRelay bool   `json:"accept_relay,omitempty"`
+	PublicAddr  string `json:"public_addr,omitempty"`
 }
 
 type Response struct {
@@ -93,6 +101,8 @@ type Response struct {
 	Revoked []string `json:"revoked,omitempty"`
 	// Relay is a relay session ID (hex) for op "relay".
 	Relay string `json:"relay,omitempty"`
+	// PublicAddr (lookup) is the address the target advertised itself.
+	PublicAddr string `json:"public_addr,omitempty"`
 }
 
 // Push is sent by the server on a stream it opens to a logged-in client.
@@ -129,6 +139,30 @@ func ValidUsername(name string) bool {
 		case unicode.IsLetter(r) || unicode.IsDigit(r):
 		case i > 0 && (r == '.' || r == '_' || r == '-'):
 		default:
+			return false
+		}
+	}
+	return true
+}
+
+// ValidPublicAddr accepts "host:port" where host is an IP or a DNS name
+// (letters, digits, dots, hyphens) and port is 1-65535.
+func ValidPublicAddr(s string) bool {
+	if len(s) > 255 {
+		return false
+	}
+	host, port, err := net.SplitHostPort(s)
+	if err != nil || host == "" {
+		return false
+	}
+	if p, err := strconv.Atoi(port); err != nil || p < 1 || p > 65535 {
+		return false
+	}
+	if net.ParseIP(host) != nil {
+		return true
+	}
+	for _, r := range host {
+		if !(r >= 'a' && r <= 'z' || r >= 'A' && r <= 'Z' || r >= '0' && r <= '9' || r == '.' || r == '-') {
 			return false
 		}
 	}

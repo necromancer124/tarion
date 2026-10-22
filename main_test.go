@@ -368,3 +368,39 @@ func TestBannedContactIsRefusedNotQueued(t *testing.T) {
 		t.Fatalf("message to a banned contact was queued: %+v", items)
 	}
 }
+
+func TestServerBansCanBeTurnedOff(t *testing.T) {
+	t.Setenv("TARION_HOME", t.TempDir())
+	alice, _ := startTestNode(t, &storage.Config{Username: "alice", ServerBans: "off"})
+	bob, bobAddr := startTestNode(t, &storage.Config{Username: "bob"})
+	alice.setRevoked([]string{bob.nm.ID()})
+	if err := alice.deliver("bob", bobAddr, "my client ignores the ban list"); err != nil {
+		t.Fatalf("with server_bans off the ban list must not apply: %v", err)
+	}
+}
+
+func TestOptionFlagsValidate(t *testing.T) {
+	for _, tc := range []struct {
+		bans, relay, public string
+		ok                  bool
+	}{
+		{"", "", "", true},
+		{"off", "on", "203.0.113.7:63426", true},
+		{"on", "off", "my-home.example.net:63426", true},
+		{"maybe", "", "", false},
+		{"", "yes", "", false},
+		{"", "", "203.0.113.7", false},
+		{"", "", "bad host:1", false},
+	} {
+		empty, port, ctrl := "", 0, 0
+		f := clientFlags{port: &port, ctrl: &ctrl, server: &empty, user: &empty, pass: &empty,
+			serverBans: &tc.bans, relayMode: &tc.relay, publicAddr: &tc.public}
+		cfg := storage.DefaultConfig()
+		if err := f.apply(cfg); (err == nil) != tc.ok {
+			t.Errorf("bans=%q relay=%q public=%q: %v", tc.bans, tc.relay, tc.public, err)
+		}
+	}
+	if (&storage.Config{}).RelayEnabled() || !(&storage.Config{}).EnforcesServerBans() {
+		t.Fatal("defaults: relay must be off and server bans on")
+	}
+}
