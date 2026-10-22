@@ -24,6 +24,7 @@ import (
 	"github.com/necromancer124/tarion/internal/directory"
 	"github.com/necromancer124/tarion/internal/identity"
 	"github.com/necromancer124/tarion/internal/network"
+	"github.com/necromancer124/tarion/internal/relay"
 	"github.com/necromancer124/tarion/internal/storage"
 	"golang.org/x/term"
 )
@@ -95,6 +96,9 @@ type node struct {
 
 	revokedMu sync.RWMutex
 	revoked   map[string]bool // keys banned by the server
+
+	relayedMu sync.Mutex
+	relayed   map[string]time.Time // contacts last reached via the relay
 
 	outboxMu    sync.Mutex    // one outbox pass at a time
 	outboxWake  chan struct{} // nudges the outbox loop
@@ -210,6 +214,11 @@ func startNode(cfg *storage.Config, id *identity.Identity) (*node, error) {
 	nm.Accept = n.accept
 	if err := nm.StartListener(); err != nil {
 		return nil, err
+	}
+	if os.Getenv("TARION_SIMULATE_STRICT_NAT") == "1" {
+		// Testing aid: behave like a strict NAT (only the server gets in),
+		// so messages must take the relay.
+		nm.Relay().SimulateStrictNAT(true)
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	n.cancel = cancel
@@ -470,13 +479,9 @@ func (n *node) deliverMsg(id string, sent time.Time, to, addr, body string) erro
 	}
 
 	configured := configuredID(n.cfg, to)
-	var lastErr, identityErr error
-	for i, cand := range candidates {
-		timeout := n.sendTimeout
-		if i < len(candidates)-1 {
-			timeout = 3 * time.Second // a LAN address either answers fast or is wrong
-		}
+	attempt := func(cand string, timeout time.Duration, wantID string) error {
 		ctx, cancel := context.WithTimeout(context.Background(), timeout)
+		defer cancel()
 		_, err := n.nm.SendMessage(ctx, id, sent, cand, senderName(n.cfg), body, func(peerID string) error {
 			if n.isRevoked(peerID) {
 				return fmt.Errorf("%s is %w", to, errRevoked)
@@ -484,17 +489,55 @@ func (n *node) deliverMsg(id string, sent time.Time, to, addr, body string) erro
 			if configured != "" && !strings.EqualFold(configured, peerID) {
 				return &storage.IdentityMismatchError{Name: to, Expected: configured, Got: peerID}
 			}
-			if dirID != "" && !strings.EqualFold(dirID, peerID) {
-				return &storage.IdentityMismatchError{Name: to, Expected: dirID, Got: peerID}
+			if wantID != "" && !strings.EqualFold(wantID, peerID) {
+				return &storage.IdentityMismatchError{Name: to, Expected: wantID, Got: peerID}
 			}
 			return storage.PinOutgoing(to, peerID, cand)
 		})
-		cancel()
+		return err
+	}
+	isIdentityErr := func(err error) bool {
+		var mismatch *storage.IdentityMismatchError
+		return errors.As(err, &mismatch) || errors.Is(err, errRevoked)
+	}
+
+	// When the server knows the contact, it can relay if the direct path
+	// fails (strict NATs). The packets stay end-to-end encrypted.
+	canRelay := dirID != ""
+	viaRelay := func() error {
+		raddr, relayID, err := n.dir.Relay(to)
+		if err != nil {
+			return err
+		}
+		if err := attempt(raddr, n.sendTimeout, relayID); err != nil {
+			return err
+		}
+		n.setRelayed(to, true)
+		return nil
+	}
+	triedRelay := false
+	if canRelay && n.relayedRecently(to) {
+		triedRelay = true
+		if err := viaRelay(); err == nil || isIdentityErr(err) {
+			return err
+		}
+	}
+
+	var lastErr, identityErr error
+	for i, cand := range candidates {
+		timeout := n.sendTimeout
+		if canRelay {
+			timeout /= 2 // the relay is the fallback, don't wait the full time
+		}
+		if i < len(candidates)-1 {
+			timeout = 3 * time.Second // a LAN address either answers fast or is wrong
+		}
+		err := attempt(cand, timeout, dirID)
 		if err == nil {
+			n.setRelayed(to, false)
 			return nil
 		}
-		var mismatch *storage.IdentityMismatchError
-		if errors.As(err, &mismatch) {
+		if isIdentityErr(err) {
 			identityErr = err
 		}
 		lastErr = err
@@ -502,7 +545,37 @@ func (n *node) deliverMsg(id string, sent time.Time, to, addr, body string) erro
 	if identityErr != nil {
 		return identityErr
 	}
+	if canRelay && !triedRelay {
+		err := viaRelay()
+		if err == nil || isIdentityErr(err) {
+			return err
+		}
+		return fmt.Errorf("%w (relay: %v)", lastErr, err)
+	}
 	return lastErr
+}
+
+const relayMemory = 10 * time.Minute
+
+// relayedRecently reports whether to reached us only through the relay in
+// the last few minutes, so the next message can skip the direct attempts.
+func (n *node) relayedRecently(to string) bool {
+	n.relayedMu.Lock()
+	defer n.relayedMu.Unlock()
+	return time.Since(n.relayed[strings.ToLower(to)]) < relayMemory
+}
+
+func (n *node) setRelayed(to string, on bool) {
+	n.relayedMu.Lock()
+	defer n.relayedMu.Unlock()
+	if n.relayed == nil {
+		n.relayed = map[string]time.Time{}
+	}
+	if on {
+		n.relayed[strings.ToLower(to)] = time.Now()
+	} else {
+		delete(n.relayed, strings.ToLower(to))
+	}
 }
 
 // The local API: one JSON object per line over TCP on 127.0.0.1, each
@@ -1071,7 +1144,11 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		incoming := network.IncomingMessage(msg)
 		name, line := recordIncoming(incoming)
 		viewing := m.state == StateChatView && m.activeContact == name
-		m.upsertContact(Contact{Username: name, Addr: incoming.Addr, Online: true, Unread: !viewing})
+		addr := incoming.Addr
+		if relay.IsAddr(addr) {
+			addr = "" // only valid during that relay session
+		}
+		m.upsertContact(Contact{Username: name, Addr: addr, Online: true, Unread: !viewing})
 		if viewing {
 			m.chatHistory = append(m.chatHistory, line)
 		}

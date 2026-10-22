@@ -156,7 +156,7 @@ func ResolveIncoming(peerID, claimedName, addr string) (string, error) {
 	now := time.Now()
 	for i := range peers {
 		if peers[i].ID == peerID {
-			if addr != "" {
+			if storableAddr(addr) {
 				peers[i].Addr = addr
 			}
 			peers[i].LastSeen = now
@@ -174,8 +174,17 @@ func ResolveIncoming(peerID, claimedName, addr string) (string, error) {
 			break
 		}
 	}
+	if !storableAddr(addr) {
+		addr = ""
+	}
 	peers = append(peers, Peer{ID: peerID, Name: name, Addr: addr, FirstSeen: now, LastSeen: now})
 	return name, savePeers(peers)
+}
+
+// storableAddr is false for relay addresses ("relay:<id>"): they only mean
+// something during one relay session, so they are never remembered.
+func storableAddr(addr string) bool {
+	return addr != "" && !strings.HasPrefix(addr, "relay:")
 }
 
 // PinOutgoing is called after the handshake with the contact the user chose
@@ -194,13 +203,22 @@ func PinOutgoing(name, peerID, addr string) error {
 			if peers[i].ID != peerID {
 				return &IdentityMismatchError{Name: name, Expected: peers[i].ID, Got: peerID}
 			}
-			peers[i].Addr, peers[i].LastSeen = addr, now
+			if storableAddr(addr) {
+				peers[i].Addr = addr
+			}
+			peers[i].LastSeen = now
 			return savePeers(peers)
 		}
 	}
+	if !storableAddr(addr) {
+		addr = ""
+	}
 	for i := range peers {
 		if peers[i].ID == peerID {
-			peers[i].Name, peers[i].Addr, peers[i].LastSeen = name, addr, now
+			peers[i].Name, peers[i].LastSeen = name, now
+			if addr != "" {
+				peers[i].Addr = addr
+			}
 			return savePeers(peers)
 		}
 	}

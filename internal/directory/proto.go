@@ -35,6 +35,7 @@ const (
 	OpList     = "list"     // names of online users
 	OpLookup   = "lookup"   // a user's address and key; also signals a punch
 
+	OpRelay          = "relay"           // open a relay session to Target (direct path failed)
 	OpChangePassword = "change_password" // Pass = current, NewPass = new
 	OpDeleteAccount  = "delete_account"  // Pass = current; the session then closes
 )
@@ -56,6 +57,7 @@ const (
 	ErrInviteRequired   = "invite_required"
 	ErrBadInvite        = "bad_invite"
 	ErrRegistrationOff  = "registration_closed"
+	ErrRelayOff         = "relay_disabled"
 )
 
 // QUIC application error codes tariond closes a session with.
@@ -89,6 +91,8 @@ type Response struct {
 	// Revoked (on login) lists keys the operator banned. Clients refuse to
 	// exchange messages with them even over a direct connection.
 	Revoked []string `json:"revoked,omitempty"`
+	// Relay is a relay session ID (hex) for op "relay".
+	Relay string `json:"relay,omitempty"`
 }
 
 // Push is sent by the server on a stream it opens to a logged-in client.
@@ -103,11 +107,14 @@ type Push struct {
 	LocalAddrs []string `json:"local_addrs,omitempty"`
 	// Revoked is the full, current list of banned keys (type "revoked").
 	Revoked []string `json:"revoked,omitempty"`
+	// Relay is the session the requester will send through (type "relay").
+	Relay string `json:"relay,omitempty"`
 }
 
 const (
 	PushPunch   = "punch"
 	PushRevoked = "revoked"
+	PushRelay   = "relay"
 )
 
 // ValidUsername allows 1-32 letters or digits (any script) plus . _ -,

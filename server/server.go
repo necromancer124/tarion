@@ -15,6 +15,7 @@ import (
 
 	"github.com/necromancer124/tarion/internal/directory"
 	"github.com/necromancer124/tarion/internal/identity"
+	"github.com/necromancer124/tarion/internal/relay"
 	"github.com/necromancer124/tarion/internal/wire"
 	"github.com/quic-go/quic-go"
 )
@@ -35,10 +36,24 @@ type Options struct {
 	DeletionsDir string // operator requests to delete accounts
 	BansPath     string // usernames / peer IDs, re-read when changed
 	MinPassword  int
+
+	// Relay forwards (still end-to-end encrypted) packets between peers
+	// whose NATs block a direct connection.
+	Relay            bool
+	RelayRate        int // bytes per second per session
+	RelayTotal       int // bytes per second for all sessions
+	MaxRelaysPerUser int
 }
 
 func DefaultOptions() Options {
-	return Options{Registration: RegOpen, MinPassword: directory.DefaultMinPassword}
+	return Options{
+		Registration:     RegOpen,
+		MinPassword:      directory.DefaultMinPassword,
+		Relay:            true,
+		RelayRate:        256 * 1024,
+		RelayTotal:       8 * 1024 * 1024,
+		MaxRelaysPerUser: 8,
+	}
 }
 
 // Server is tariond: it tracks who is online and where, and tells peers to
@@ -64,6 +79,17 @@ type Server struct {
 	punchLimit *limiter // punch signals per requester->target pair
 	hashing    chan struct{}
 	nextID     atomic.Uint64
+
+	relayMu    sync.Mutex
+	relays     map[relay.ID]*relaySession
+	relayRate  *limiter // bytes per session
+	relayTotal *limiter // bytes for all sessions
+}
+
+// relaySession joins two logged-in sessions for packet forwarding.
+type relaySession struct {
+	a, b *session
+	last time.Time
 }
 
 type session struct {
@@ -71,7 +97,8 @@ type session struct {
 	conn   *quic.Conn
 	peerID string
 	ip     string
-	addr   string // public address the server observes = the client's chat socket
+	addr   string   // public address the server observes = the client's chat socket
+	udp    net.Addr // the same, as quic-go reports it; relay packets come from here
 
 	mu         sync.Mutex
 	user       string
@@ -91,6 +118,15 @@ func NewServer(id *identity.Identity, accounts *Accounts, opts Options) *Server 
 	if opts.MinPassword < 1 {
 		opts.MinPassword = directory.DefaultMinPassword
 	}
+	if opts.RelayRate < 1 {
+		opts.RelayRate = DefaultOptions().RelayRate
+	}
+	if opts.RelayTotal < 1 {
+		opts.RelayTotal = DefaultOptions().RelayTotal
+	}
+	if opts.MaxRelaysPerUser < 1 {
+		opts.MaxRelaysPerUser = DefaultOptions().MaxRelaysPerUser
+	}
 	return &Server{
 		id:         id,
 		accounts:   accounts,
@@ -107,6 +143,9 @@ func NewServer(id *identity.Identity, accounts *Accounts, opts Options) *Server 
 		reqLimit:   newLimiter(500*time.Millisecond, 30),
 		punchLimit: newLimiter(2*time.Second, 3),
 		hashing:    make(chan struct{}, maxHashingAtOnce),
+		relays:     map[relay.ID]*relaySession{},
+		relayRate:  newByteLimiter(opts.RelayRate),
+		relayTotal: newByteLimiter(opts.RelayTotal),
 	}
 }
 
@@ -132,9 +171,10 @@ func QUICConfig() *quic.Config {
 func (s *Server) Serve(ln *quic.Listener) error {
 	go func() {
 		for range time.Tick(time.Minute) {
-			for _, l := range []*limiter{s.connLimit, s.authLimit, s.userLimit, s.regLimit, s.reqLimit, s.punchLimit} {
+			for _, l := range []*limiter{s.connLimit, s.authLimit, s.userLimit, s.regLimit, s.reqLimit, s.punchLimit, s.relayRate} {
 				l.sweep()
 			}
+			s.sweepRelays()
 		}
 	}()
 	go func() {
@@ -206,6 +246,7 @@ func (s *Server) handleConn(conn *quic.Conn, ip string) {
 		peerID: peerID,
 		ip:     ip,
 		addr:   conn.RemoteAddr().String(),
+		udp:    conn.RemoteAddr(),
 	}
 	defer s.endSession(sess)
 	for {
@@ -258,6 +299,8 @@ func (s *Server) handle(sess *session, req directory.Request) directory.Response
 		return s.list(sess)
 	case directory.OpLookup:
 		return s.lookup(sess, req)
+	case directory.OpRelay:
+		return s.openRelay(sess, req)
 	case directory.OpChangePassword:
 		return s.changePassword(sess, req)
 	case directory.OpDeleteAccount:
@@ -490,6 +533,104 @@ func (s *Server) pushPunch(target *session, push directory.Push) {
 	_ = stream.SetDeadline(time.Now().Add(5 * time.Second))
 	_ = wire.WriteFrame(stream, push)
 	_ = stream.Close()
+}
+
+const relayIdle = 2 * time.Minute
+
+// openRelay creates a relay session from sess to the target user and tells
+// the target before answering, so its client accepts the first packets.
+func (s *Server) openRelay(sess *session, req directory.Request) directory.Response {
+	user, _ := sess.loggedIn()
+	if user == "" {
+		return fail(directory.ErrNotLoggedIn)
+	}
+	if !s.opts.Relay {
+		return fail(directory.ErrRelayOff)
+	}
+	s.mu.Lock()
+	target := s.sessions[directory.NameKey(req.Target)]
+	s.mu.Unlock()
+	if target == nil || target == sess {
+		return fail(directory.ErrOffline)
+	}
+	targetName, _ := target.loggedIn()
+	if s.bans.Banned(targetName, target.peerID) || !s.punchLimit.Allow(sess.id+">relay>"+target.id) {
+		return fail(directory.ErrOffline)
+	}
+
+	id := relay.NewID()
+	s.relayMu.Lock()
+	open := 0
+	for _, r := range s.relays {
+		if r.a == sess {
+			open++
+		}
+	}
+	if open >= s.opts.MaxRelaysPerUser {
+		s.relayMu.Unlock()
+		return fail(directory.ErrRateLimited)
+	}
+	s.relays[id] = &relaySession{a: sess, b: target, last: time.Now()}
+	s.relayMu.Unlock()
+
+	s.pushPunch(target, directory.Push{Type: directory.PushRelay, From: user, PeerID: sess.peerID, Relay: id.String()})
+	log.Printf("relay opened: %s -> %s", user, targetName)
+	return directory.Response{OK: true, User: targetName, PeerID: target.peerID, Relay: id.String()}
+}
+
+// ServeRelay forwards relay packets arriving on the server's UDP socket
+// between the two members of their session. It runs until tr is closed.
+func (s *Server) ServeRelay(tr *quic.Transport) {
+	buf := make([]byte, 2048)
+	for {
+		n, from, err := tr.ReadNonQUICPacket(context.Background(), buf)
+		if err != nil {
+			return
+		}
+		id, _, ok := relay.Unwrap(buf[:n])
+		if !ok {
+			continue
+		}
+		s.relayMu.Lock()
+		r := s.relays[id]
+		var to net.Addr
+		if r != nil {
+			switch {
+			case sameAddr(from, r.a.udp):
+				to = r.b.udp
+			case sameAddr(from, r.b.udp):
+				to = r.a.udp
+			}
+			if to != nil {
+				r.last = time.Now()
+			}
+		}
+		s.relayMu.Unlock()
+		if to == nil || !s.relayRate.AllowN(id.String(), float64(n)) || !s.relayTotal.AllowN("", float64(n)) {
+			continue
+		}
+		_, _ = tr.WriteTo(buf[:n], to)
+	}
+}
+
+func sameAddr(a, b net.Addr) bool {
+	ua, ok1 := a.(*net.UDPAddr)
+	ub, ok2 := b.(*net.UDPAddr)
+	if ok1 && ok2 {
+		return ua.Port == ub.Port && ua.IP.Equal(ub.IP)
+	}
+	return a != nil && b != nil && a.String() == b.String()
+}
+
+// sweepRelays drops idle sessions and ones whose members went offline.
+func (s *Server) sweepRelays() {
+	s.relayMu.Lock()
+	defer s.relayMu.Unlock()
+	for id, r := range s.relays {
+		if time.Since(r.last) > relayIdle || r.a.conn.Context().Err() != nil || r.b.conn.Context().Err() != nil {
+			delete(s.relays, id)
+		}
+	}
 }
 
 // passwordCheck rate-limits and runs a password-verifying account operation.

@@ -101,6 +101,9 @@ func serve(args []string) error {
 	minPass := fs.Int("min-password", directory.DefaultMinPassword, "minimum password length for new accounts")
 	argonMem := fs.Int("argon-memory", int(DefaultArgon.MemoryKiB/1024), "argon2id memory per hash, MiB")
 	argonTime := fs.Int("argon-time", int(DefaultArgon.Time), "argon2id passes")
+	relayOn := fs.Bool("relay", true, "relay encrypted packets between peers whose NATs block direct connections")
+	relayKBps := fs.Int("relay-kbps", 256, "relay bandwidth per session, KiB/s")
+	relayTotalKBps := fs.Int("relay-total-kbps", 8192, "relay bandwidth for all sessions, KiB/s")
 	showID := fs.Bool("id", false, "print the server ID and exit (same as `tariond id`)")
 	getPaths := addPathFlags(fs)
 	_ = fs.Parse(args)
@@ -140,6 +143,9 @@ func serve(args []string) error {
 		Registration: *reg,
 		InvitesDir:   p.invites,
 		DeletionsDir: p.deletions,
+		Relay:        *relayOn,
+		RelayRate:    *relayKBps * 1024,
+		RelayTotal:   *relayTotalKBps * 1024,
 		BansPath:     p.bans,
 		MinPassword:  *minPass,
 	})
@@ -148,7 +154,10 @@ func serve(args []string) error {
 		return fmt.Errorf("listen QUIC: %w", err)
 	}
 
-	log.Printf("tariond listening on UDP/%d, data in %s, registration %s", *port, p.data, *reg)
+	if *relayOn {
+		go srv.ServeRelay(tr)
+	}
+	log.Printf("tariond listening on UDP/%d, data in %s, registration %s, relay %v", *port, p.data, *reg, *relayOn)
 	log.Printf("server ID: %s (clients pin this; give it to users as server_id)", identity.Fingerprint(id.ID))
 
 	stop := make(chan os.Signal, 1)

@@ -54,6 +54,9 @@ func startServerWith(t *testing.T, opts Options) (string, *identity.Identity) {
 		t.Fatal(err)
 	}
 	go srv.Serve(ln)
+	if opts.Relay {
+		go srv.ServeRelay(tr)
+	}
 	t.Cleanup(func() { ln.Close(); tr.Close(); udp.Close() })
 	return fmt.Sprintf("127.0.0.1:%d", port), id
 }

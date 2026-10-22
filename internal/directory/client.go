@@ -13,6 +13,7 @@ import (
 
 	"github.com/necromancer124/tarion/internal/identity"
 	"github.com/necromancer124/tarion/internal/network"
+	"github.com/necromancer124/tarion/internal/relay"
 	"github.com/necromancer124/tarion/internal/wire"
 	"github.com/quic-go/quic-go"
 )
@@ -154,6 +155,9 @@ func (c *Client) session(ctx context.Context) (bool, error) {
 	}
 	if c.cfg.OnRevoked != nil {
 		c.cfg.OnRevoked(resp.Revoked)
+	}
+	if srv, ok := conn.RemoteAddr().(*net.UDPAddr); ok && c.nm.Relay() != nil {
+		c.nm.Relay().SetServer(srv) // relay packets travel this same path
 	}
 
 	for {
@@ -303,6 +307,21 @@ func (c *Client) List() ([]string, error) {
 	return resp.Users, nil
 }
 
+// Relay asks the server for a relay session to target, for when a direct
+// connection fails. It returns the address to dial and the target's key.
+func (c *Client) Relay(target string) (addr, peerID string, err error) {
+	resp, err := c.request(Request{Op: OpRelay, Target: target})
+	if err != nil {
+		return "", "", err
+	}
+	id, ok := relay.ParseID(resp.Relay)
+	if !ok {
+		return "", "", errors.New("server sent a bad relay session")
+	}
+	c.nm.Relay().Allow(id)
+	return relay.Addr{ID: id}.String(), resp.PeerID, nil
+}
+
 // ChangePassword changes the account password. The new password must meet
 // the server's rules; the error says why when it does not.
 func (c *Client) ChangePassword(oldPass, newPass string) error {
@@ -400,6 +419,12 @@ func (c *Client) handlePush(stream *quic.Stream) {
 	_ = stream.SetDeadline(time.Now().Add(5 * time.Second))
 	var push Push
 	if err := wire.ReadFrame(stream, &push); err != nil {
+		return
+	}
+	if push.Type == PushRelay {
+		if id, ok := relay.ParseID(push.Relay); ok && c.nm.Relay() != nil {
+			c.nm.Relay().Allow(id)
+		}
 		return
 	}
 	if push.Type == PushRevoked {
