@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"net"
@@ -12,6 +13,7 @@ import (
 	"github.com/necromancer124/tarion/internal/directory"
 	"github.com/necromancer124/tarion/internal/identity"
 	"github.com/necromancer124/tarion/internal/network"
+	"github.com/necromancer124/tarion/internal/portmap"
 	"github.com/necromancer124/tarion/internal/storage"
 )
 
@@ -441,5 +443,74 @@ func TestOutboxGivesUpAfterSevenDays(t *testing.T) {
 	entries, _ := storage.ReadDropped(0)
 	if len(entries) != 1 || entries[0].Body != "too late" || !strings.Contains(entries[0].Reason, "7 days") {
 		t.Fatalf("dropped log: %+v", entries)
+	}
+}
+
+// fakeMapper stands in for a router in tests; no real router is contacted.
+type fakeMapper struct {
+	name    string
+	ext     net.IP
+	err     error
+	removed bool
+}
+
+func (f *fakeMapper) Name() string { return f.name }
+func (f *fakeMapper) Map(ctx context.Context, localIP net.IP, port int, lease time.Duration) (*portmap.Mapping, error) {
+	if f.err != nil {
+		return nil, f.err
+	}
+	return &portmap.Mapping{Method: f.name, ExternalIP: f.ext, ExternalPort: port, InternalPort: port}, nil
+}
+
+func TestPortMappingOffReasons(t *testing.T) {
+	base := storage.Config{ServerAddr: "198.51.100.5:63425", Username: "alice"}
+	for _, tc := range []struct {
+		mutate func(*storage.Config)
+		want   string
+	}{
+		{func(c *storage.Config) {}, ""},
+		{func(c *storage.Config) { c.PortMapping = "off" }, "turned off"},
+		{func(c *storage.Config) { c.PublicAddr = "203.0.113.7:63426" }, "public_addr yourself"},
+		{func(c *storage.Config) { c.Relay = "on" }, "relay is on"},
+		{func(c *storage.Config) { c.Relay, c.PortMapping = "on", "on" }, ""},
+		{func(c *storage.Config) { c.ServerAddr = "" }, "no server"},
+	} {
+		c := base
+		tc.mutate(&c)
+		got := c.PortMappingOff()
+		if (tc.want == "") != (got == "") || !strings.Contains(got, tc.want) {
+			t.Errorf("%+v: %q, want %q", c, got, tc.want)
+		}
+	}
+}
+
+func TestMapPortExplainsFailure(t *testing.T) {
+	t.Setenv("TARION_HOME", t.TempDir())
+	n, _ := startTestNode(t, &storage.Config{Username: "alice"})
+	n.mappers = []portmap.Mapper{
+		&fakeMapper{name: "UPnP", err: errors.New("no UPnP router answered on your network")},
+		&fakeMapper{name: "NAT-PMP", err: errors.New("your router (192.168.1.1) did not answer")},
+	}
+	ok, report := n.mapPort()
+	if ok {
+		t.Fatal("expected failure")
+	}
+	for _, want := range []string{"UPnP: no UPnP router", "NAT-PMP: your router", "tarion portmap", "-relay on"} {
+		if !strings.Contains(report, want) {
+			t.Errorf("report lacks %q:\n%s", want, report)
+		}
+	}
+	if !strings.Contains(n.portStatus(), "failed") {
+		t.Fatalf("status: %q", n.portStatus())
+	}
+}
+
+func TestMapPortWithoutServerIsUntested(t *testing.T) {
+	t.Setenv("TARION_HOME", t.TempDir())
+	n, _ := startTestNode(t, &storage.Config{Username: "alice"})
+	n.mappers = []portmap.Mapper{&fakeMapper{name: "UPnP", ext: net.ParseIP("203.0.113.7")}}
+	ok, report := n.mapPort()
+	if !ok || !strings.Contains(report, "203.0.113.7") || !strings.Contains(report, "not announced or tested") {
+		t.Fatalf("ok=%v report=%q", ok, report)
 	}
 }
