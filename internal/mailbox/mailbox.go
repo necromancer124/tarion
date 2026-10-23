@@ -9,6 +9,7 @@
 package mailbox
 
 import (
+	"bytes"
 	"crypto/ed25519"
 	"crypto/rand"
 	"crypto/sha512"
@@ -75,11 +76,14 @@ func Seal(sender *identity.Identity, fromName, toPeerID string, toBoxKey *[32]by
 	l := &Letter{V: 1, ID: id, TS: sent.Unix(), From: fromName,
 		FromKey: sender.Key.Public().(ed25519.PublicKey), To: toPeerID, Body: body}
 	l.Sig = ed25519.Sign(sender.Key, l.signed())
-	plain, err := json.Marshal(l)
-	if err != nil {
+	// No HTML escaping: a message full of "<" must not grow sixfold.
+	var plain bytes.Buffer
+	enc := json.NewEncoder(&plain)
+	enc.SetEscapeHTML(false)
+	if err := enc.Encode(l); err != nil {
 		return nil, err
 	}
-	return box.SealAnonymous(nil, plain, toBoxKey, rand.Reader)
+	return box.SealAnonymous(nil, plain.Bytes(), toBoxKey, rand.Reader)
 }
 
 // Open unseals a letter addressed to recipient and checks its signature.

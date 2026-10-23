@@ -28,6 +28,14 @@ const (
 	MaxListedUsers     = 500
 	MaxLocalAddrs      = 4
 	MaxRevoked         = 1000 // banned keys sent to clients
+
+	// MaxSealedLetter caps one mailbox letter, so a put request and a fetch
+	// response carrying it both fit in one frame.
+	MaxSealedLetter = 40 * 1024
+	// MaxFetchBytes caps the encoded size of the letters in one fetch
+	// response (base64 plus fields); the client asks again while More is set.
+	MaxFetchBytes = 56 * 1024
+	MaxAckIDs     = 100
 )
 
 // Request operations.
@@ -42,6 +50,14 @@ const (
 	OpProbe          = "probe"           // ask for a test packet to PublicAddr (Nonce)
 	OpChangePassword = "change_password" // Pass = current, NewPass = new
 	OpDeleteAccount  = "delete_account"  // Pass = current; the session then closes
+
+	// The mailbox (opt-in on the server and for each user) holds letters for
+	// users who are offline. Letters are sealed to the recipient's key and
+	// signed by the sender, so the server can neither read nor forge them.
+	OpMailboxKey   = "mailbox_key"   // Target's box key, to seal a letter to
+	OpMailboxPut   = "mailbox_put"   // leave Sealed for Target
+	OpMailboxFetch = "mailbox_fetch" // letters waiting for you
+	OpMailboxAck   = "mailbox_ack"   // delete IDs: you have them now
 )
 
 // Error codes in Response.Error.
@@ -64,7 +80,11 @@ const (
 	ErrRelayOff         = "relay_disabled"
 	ErrRelayRefused     = "relay_refused" // the target turned the relay off
 	ErrProbeOff         = "probe_unavailable"
-	ErrProbeNotYours    = "probe_not_yours" // only your own public IP can be probed
+	ErrProbeNotYours    = "probe_not_yours"  // only your own public IP can be probed
+	ErrMailboxOff       = "mailbox_disabled" // the server has no mailbox
+	ErrMailboxRefused   = "mailbox_refused"  // the recipient turned theirs off
+	ErrMailboxFull      = "mailbox_full"     // the recipient's mailbox is full
+	ErrTooLarge         = "too_large"
 )
 
 // QUIC application error codes tariond closes a session with.
@@ -88,6 +108,16 @@ type Request struct {
 	AcceptRelay bool   `json:"accept_relay,omitempty"`
 	PublicAddr  string `json:"public_addr,omitempty"`
 	Nonce       string `json:"nonce,omitempty"` // probe: 8 bytes, hex
+
+	// AcceptMailbox (login) asks the server to hold letters while you are
+	// offline. BoxKey is the key letters are sealed to, and BoxSig your
+	// identity key's signature over it, so senders can check it is yours.
+	// Logging in with AcceptMailbox off deletes letters waiting for you.
+	AcceptMailbox bool     `json:"accept_mailbox,omitempty"`
+	BoxKey        []byte   `json:"box_key,omitempty"`
+	BoxSig        []byte   `json:"box_sig,omitempty"`
+	Sealed        []byte   `json:"sealed,omitempty"` // mailbox_put
+	IDs           []string `json:"ids,omitempty"`    // mailbox_ack
 }
 
 type Response struct {
@@ -108,6 +138,27 @@ type Response struct {
 	Relay string `json:"relay,omitempty"`
 	// PublicAddr (lookup) is the address the target advertised itself.
 	PublicAddr string `json:"public_addr,omitempty"`
+
+	// mailbox_key: the target's identity key, box key and the signature
+	// binding them. Clients check all three before sealing anything.
+	PubKey []byte `json:"pub_key,omitempty"`
+	BoxKey []byte `json:"box_key,omitempty"`
+	BoxSig []byte `json:"box_sig,omitempty"`
+	// mailbox_fetch: letters waiting, oldest first; More means ask again.
+	Letters []Letter `json:"letters,omitempty"`
+	More    bool     `json:"more,omitempty"`
+	// Mail (login) is how many letters are waiting for you.
+	Mail int `json:"mail,omitempty"`
+}
+
+// Letter is a sealed message the server holds. From is the account that
+// left it, as the server saw it; the sealed content carries the sender's
+// own signature, which is what clients trust.
+type Letter struct {
+	ID       string `json:"id"`
+	From     string `json:"from"`
+	Received int64  `json:"received"` // unix seconds
+	Sealed   []byte `json:"sealed"`
 }
 
 // Push is sent by the server on a stream it opens to a logged-in client.
@@ -130,6 +181,7 @@ const (
 	PushPunch   = "punch"
 	PushRevoked = "revoked"
 	PushRelay   = "relay"
+	PushMail    = "mail" // a letter was just left for you
 )
 
 // ValidUsername allows 1-32 letters or digits (any script) plus . _ -,

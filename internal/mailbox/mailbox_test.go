@@ -102,3 +102,24 @@ func reseal(t *testing.T, l *Letter, to *[32]byte) []byte {
 	}
 	return sealed
 }
+
+func TestLargestMessagesFitTheMailbox(t *testing.T) {
+	alice, bob, _ := ids(t)
+	bobBox, _ := BoxKeys(bob)
+	const maxBody = 16 * 1024   // network.MaxBodyBytes
+	const maxSealed = 40 * 1024 // directory.MaxSealedLetter
+	for name, body := range map[string]string{
+		"angle brackets": strings.Repeat("<", maxBody),
+		"hebrew":         strings.Repeat("ש", maxBody/2),
+		"emoji":          strings.Repeat("👋", maxBody/4),
+	} {
+		sealed, err := Seal(alice, "alice", bob.ID, bobBox, "id", time.Now(), body)
+		if err != nil || len(sealed) > maxSealed {
+			t.Errorf("%s: %d bytes sealed (max %d), err %v", name, len(sealed), maxSealed, err)
+			continue
+		}
+		if l, _, err := Open(bob, sealed); err != nil || l.Body != body {
+			t.Errorf("%s: round trip failed: %v", name, err)
+		}
+	}
+}

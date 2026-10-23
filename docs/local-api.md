@@ -20,7 +20,7 @@
 | `cmd` | Fields | Reply |
 |---|---|---|
 | `ping` | | `{"ok":true}` |
-| `send` | `to`, `body`, optional `addr` | `{"ok":true}` once the peer acknowledged it; `{"ok":true,"queued":true,"error":"bob is offline"}` if it was queued for automatic retry; `{"ok":false,"error":"..."}` if it can't be sent (wrong or banned key, refused) |
+| `send` | `to`, `body`, optional `addr` | `{"ok":true}` once the peer acknowledged it; `{"ok":true,"queued":true,"error":"bob is offline"}` if it was queued for automatic retry; `{"ok":true,"mailed":true,"error":"bob is offline"}` if it was sealed and left in bob's server mailbox (both of you use `-mailbox on`); `{"ok":false,"error":"..."}` if it can't be sent (wrong or banned key, refused) |
 | `online` | | `{"ok":true,"status":"...","users":["bob",...]}` |
 | `history` | `to`, optional `limit` | `{"ok":true,"lines":["bob: hi","Me: hello"]}` |
 | `subscribe` | | `{"ok":true,"status":"..."}`, then the connection **stays open** and streams events |
@@ -37,11 +37,14 @@
 {"type":"message","chat":"bob","peer_id":"x5u5zbukqp3ag4djhpylztggu7z3siop","body":"hi","time":"2026-10-21T16:39:02+03:00"}
 {"type":"status","status":"server connected as alice (public address 203.0.113.7:63426)"}
 {"type":"delivered","chat":"bob","body":"queued earlier","time":"..."}
+{"type":"mailed","chat":"bob","body":"queued earlier","reason":"bob is offline","time":"..."}
 {"type":"dropped","chat":"bob","body":"never arrived","reason":"gave up after 7 days: bob is offline","time":"..."}
 ```
 
 - `portmap`: automatic port forwarding changed; `status` is one line, and `reason` is the full explanation.
 - `delivered`: a queued message finally arrived.
+- `mailed`: a queued message was sealed and left in the contact's server mailbox; they get it when they next log in.
+- Messages fetched from your own mailbox arrive as ordinary `message` events.
 - `dropped`: a message will never be delivered. If it was yours, `body` holds what was lost; if you refused someone's message, there's no `body`. Every drop is also written to `dropped.log` (`tarion dropped`).
 
 - `chat` is the name the message is filed under. A stranger who claims a name you've already pinned shows up as `name~1a2b3c4d`.

@@ -1,6 +1,6 @@
 # Tarion Server (`tariond`)
 
-`tariond` is Tarion's directory server. It tells peers where to find each other and signals NAT hole punching. It **never sees or relays chat messages**.
+`tariond` is Tarion's directory server. It tells peers where to find each other and signals NAT hole punching. It **never sees chat messages**. Two opt-in features, both off by default, let messages pass through it without it being able to read them: the relay (encrypted packets) and the mailbox (sealed letters for offline users).
 
 ## Quick start
 
@@ -21,6 +21,7 @@ Everything lives in one data folder: `-data`, or the `TARIOND_DATA` environment 
 | `users.json` | Accounts: name, argon2id hash, linked device key | **Yes** |
 | `invites/` | One file per unused invite code | |
 | `bans.txt` | Banned usernames and peer IDs, one per line, `#` for comments | |
+| `mailbox/` | With `-mailbox`: one folder per user with their published mailbox key and the sealed letters waiting for them. Deleted at start when `-mailbox` is off | |
 | `users.db` | Old v1 database; imported once if `users.json` doesn't exist | |
 
 ## Server flags
@@ -36,6 +37,8 @@ Everything lives in one data folder: `-data`, or the `TARIOND_DATA` environment 
 | `-relay` | `false` | Relay encrypted packets between peers whose NATs block a direct connection. Both clients must also turn it on (`tarion -relay on`) |
 | `-relay-kbps` | `256` | Relay bandwidth per session, KiB/s |
 | `-relay-total-kbps` | `8192` | Relay bandwidth for all sessions together, KiB/s |
+| `-mailbox` | `false` | Hold sealed letters for offline users. Both users must also turn it on (`tarion -mailbox on`). The server can't read them |
+| `-mailbox-days` | `7` | Delete letters nobody fetched after this many days (1–90) |
 
 `-users`, `-key`, `-invites`, `-bans` and `-legacy-users` override single file paths.
 
@@ -67,6 +70,7 @@ Operator commands take the same `-data` flag (or `TARIOND_DATA`) as the server.
 - **Lookup.** The server returns the target's public chat address and key, and their LAN address only if both users share a public IP. It also tells the target to punch toward the requester, including the requester's LAN address in that case.
 - **List.** The server returns the names of online users (not their addresses), capped at 500.
 - **Relay (off by default).** With `-relay`, when two peers can't connect directly, one asks for a relay session. The target must have the relay turned on too, otherwise the server answers `relay_refused`. The server forwards packets between the two members' known addresses only, without being able to decrypt them (the peers' TLS runs end to end inside). Sessions close after 2 minutes without traffic.
+- **Mailbox (off by default).** With `-mailbox`, a user who logs in with `-mailbox on` publishes a mailbox key signed by their identity key. Others can then leave letters for them while they're offline (`mailbox_key`, `mailbox_put`). The letters are sealed to that key and signed by the sender, so the server stores only ciphertext and can't forge or redirect them; it does see who wrote to whom, when, and the size. The owner fetches them (`mailbox_fetch`) and they are deleted once acknowledged (`mailbox_ack`). If the recipient is online, the server tells them a letter arrived. A user who logs in with the mailbox off has their letters deleted and gets no new ones (`mailbox_refused`). Deleting an account deletes its mailbox.
 - **Forwarded ports.** A client can advertise an address it made reachable itself (`tarion -public-addr`, or a port its router forwards automatically, announced after login). The server checks that it's `host:port` and hands it out in lookups.
 - **Reachability test.** On request, the server sends a 12-byte test packet to a client's advertised address from a second UDP port (opened at start, random), so the client knows whether strangers can really reach it. It only goes to the client's own public IP and is rate-limited, so it can't be aimed at anyone else.
 - **Accounts can be changed.** Users can change their password (`tarion passwd`) or delete their account (`tarion delete-account`), both with the current password and rate-limited like logins.
@@ -78,6 +82,7 @@ Operator commands take the same `-data` flag (or `TARIOND_DATA`) as the server.
 - Registrations: 3 per IP, then one every 10 minutes.
 - Requests: a burst of 30 per session, then 2 per second. Punch signals are limited per user pair.
 - At most 2 argon2id hashes are computed at once.
+- Mailbox: 200 letters or 4 MiB waiting per user, 50 from any one sender, 40 KiB per letter, and a burst of 20 letters per sender, then one every 6 seconds.
 - Relay: 8 sessions per user, 256 KiB/s per session and 8 MiB/s in total (configurable).
 - QUIC itself checks the sender's address before replying with much data, so the server can't be used to flood a faked address.
 

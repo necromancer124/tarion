@@ -10,9 +10,9 @@ I got tired of hearing about data. Data, data and more data: who collects it, wh
 
 So this is my answer: **no middleman, no doorman. You open your own doors.**
 
-- **No middleman.** Your messages go straight from your device to the other person's. Nobody stores them, nobody forwards them, and nobody can read them on the way, because they're end-to-end encrypted with keys that never leave your device. There's a relay for networks that make a direct connection impossible, but it's off unless you, the other person and the server operator all turn it on, and even then it only passes along encrypted packets it can't read.
+- **No middleman.** Your messages go straight from your device to the other person's. Nobody stores them, nobody forwards them, and nobody can read them on the way, because they're end-to-end encrypted with keys that never leave your device. There's a relay for networks that make a direct connection impossible, and a mailbox for people who are offline, but both are off unless you, the other person and the server operator all turn them on. Even then the relay only passes along encrypted packets it can't read, and the mailbox only holds letters sealed to the recipient's key.
 - **No doorman.** Your identity is a key on your own computer. The server keeps just enough to help people find you (a username linked to that key, and a password hash) and nothing about your conversations. You can run your own (`tariond`), or skip it and connect by address.
-- **You open your own doors.** Tarion asks *your* router to open *your* port, tells you plainly when it can't and why, and lets you do it by hand instead. You decide who may message you (`-accept contacts`), whose bans you respect (`-server-bans`), and whether anything may ever pass through a server (`-relay`).
+- **You open your own doors.** Tarion asks *your* router to open *your* port, tells you plainly when it can't and why, and lets you do it by hand instead. You decide who may message you (`-accept contacts`), whose bans you respect (`-server-bans`), and whether anything may ever pass through a server (`-relay`, `-mailbox`).
 
 Being honest about the one helper that remains: the directory server knows your username, your key, your IP address while you're online, and which usernames you look up. It never sees what you say. If even that is too much, host the server yourself.
 
@@ -152,6 +152,7 @@ The config is saved to:
 - `accept` is `anyone` (default) or `contacts` (see above). Strangers who write to you then get "this user only accepts messages from contacts".
 - `server_bans` is `on` (default) or `off` (`-server-bans`): whether your client refuses keys your server's operator banned.
 - `relay` is `off` (default) or `on` (`-relay`): whether messages may pass through the server when no direct path exists. See [Getting through strict NATs](#getting-through-strict-nats).
+- `mailbox` is `off` (default) or `on` (`-mailbox`): whether the server may hold sealed messages for you while you're offline, and whether you leave them for contacts who are offline. See [The server mailbox](#the-server-mailbox).
 - `public_addr` (`-public-addr`): an address peers can reach you at directly, such as a port you forwarded by hand.
 - `port_mapping` is `auto` (default), `on` or `off` (`-port-mapping`): whether to ask your router to forward the chat port automatically. `auto` does it while the relay is off.
 
@@ -183,7 +184,7 @@ The folder also holds `identity.key` (your private key, keep it secret), `peers.
 2. To message bob, the client asks the server for bob. The server answers with bob's public address, his key, and (only if you're behind the same router) his LAN address.
 3. At the same moment, the server tells bob, over his open connection, to send a few tiny packets toward your address. That opens bob's router for your incoming connection (NAT hole punching).
 4. The client connects to bob directly: LAN address first, then an address bob made reachable himself (a forwarded port), then the public address the server sees.
-5. If none work, the message is queued and retried. **No message passes through the server** unless you, bob and the server operator all turned the relay on (see below).
+5. If none work and you both use the mailbox, the message is sealed and left in bob's server mailbox. Otherwise it's queued on your device and retried. **No message passes through the server** unless you, bob and the server operator all turned the relay or the mailbox on (see below).
 
 ### Getting through strict NATs
 
@@ -200,6 +201,20 @@ Hole punching works with most home routers. When both sides are behind strict ("
   `-port-mapping off` turns it off, and `-port-mapping on` uses it even with the relay on.
 - **Forward a port by hand (no server involved).** On your router, forward UDP to your chat port (default 63426), then tell Tarion: `-public-addr YOUR_PUBLIC_IP:63426` (a DNS name works too). The server passes it to people who look you up, and they connect straight to you. Setting this turns the automatic forwarding off.
 - **The relay (opt-in, off by default).** With `-relay on` on both clients and `tariond -relay` on the server, the server forwards the QUIC packets between you. You still run your own encrypted handshake inside it and keys are checked as usual, so the server only sees ciphertext, but your traffic does go through it. A client with the relay off never uses it and refuses relayed connections. After needing it, messages to that contact use the relay right away for 10 minutes.
+
+### The server mailbox
+
+Without it, a message to someone who is offline waits on *your* device until you're both online at the same time. With it, the server holds the message for them, without being able to read it.
+
+It's **off by default** and only works when all three agree: the operator runs `tariond -mailbox`, the recipient turned theirs on (`-mailbox on`), and so did you.
+
+- **Sealed.** Each device derives a mailbox key from its identity key and publishes it at login, signed by the identity key. To leave a message, your client fetches that key, checks the signature and that the identity key matches the one you pinned for that contact (or the `id` in `config.json`), then seals the message to it (X25519 + XSalsa20-Poly1305, NaCl's anonymous box). Only the recipient's device can open it.
+- **Signed.** Inside the seal, the message is signed with your identity key. The recipient checks the signature, that it was addressed to them, and then applies the same rules as a direct message: banned keys, `-accept contacts`, pinned names, duplicates. The server can't forge, change or redirect a letter.
+- **What the server does see:** who left a letter for whom, when, and how big it is. Not the text.
+- **Delivery.** The recipient's client fetches letters at login, when the server says one arrived, and every 2 minutes. A letter is deleted from the server only after it was received. The sender sees `✉ left in their server mailbox`.
+- **Limits.** Up to 200 letters or 4 MiB waiting per person, 50 from any one sender, 10 per minute per sender. Letters nobody fetches are deleted after 7 days (`tariond -mailbox-days`).
+- **Turning it off** (`-mailbox off`) deletes the letters waiting for you at your next login, and the server refuses new ones. When the operator turns it off, the server deletes everything it held at the next start.
+- Letters are sealed to one device's key. After you move your account to a new device, letters sealed to the old one stay for that device until they expire.
 
 ### Wire protocol
 
@@ -225,7 +240,7 @@ The directory uses ALPN `tarion-dir/1` with the same framing; see [`internal/dir
 ### Known limitations
 
 - Networks that block UDP entirely can't use Tarion yet; a TCP transport is tracked in #13.
-- Queued messages wait on the *sender's* device, so both of you need to be online at the same moment eventually. A server mailbox is tracked in #22.
+- Without the mailbox, queued messages wait on the *sender's* device, so both of you need to be online at the same moment eventually. With it (opt-in), the server holds them sealed.
 - One device per account (#15).
 - `identity.key` and the history are stored unencrypted, protected by file permissions (#16).
 - Trust on first use: on the very first contact you trust the key the server reports. Compare `tarion id` with your contact, or put their `id` in `config.json`, to rule that out.
@@ -236,4 +251,4 @@ Set `TARION_SIMULATE_STRICT_NAT=1` before starting a client. It then drops every
 
 ## Privacy
 
-The server handles login and address lookup. By default it never carries messages: chats go directly between the two people. Only if everyone involved turns the relay on does it forward encrypted packets it can't read. Either way, chats are end-to-end encrypted with mutually authenticated TLS 1.3. The server's user list shows names only, not IP addresses. Local history is stored as plain text in the config folder with owner-only permissions.
+The server handles login and address lookup. By default it never carries messages: chats go directly between the two people. Only if everyone involved turns the relay on does it forward encrypted packets it can't read, and only if everyone turns the mailbox on does it hold letters sealed to the recipient, which it can't read either. Either way, chats are end-to-end encrypted with mutually authenticated TLS 1.3. The server's user list shows names only, not IP addresses. Local history is stored as plain text in the config folder with owner-only permissions.

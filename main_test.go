@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"errors"
+	"flag"
 	"fmt"
 	"net"
 	"strings"
@@ -12,6 +13,7 @@ import (
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/necromancer124/tarion/internal/directory"
 	"github.com/necromancer124/tarion/internal/identity"
+	"github.com/necromancer124/tarion/internal/mailbox"
 	"github.com/necromancer124/tarion/internal/network"
 	"github.com/necromancer124/tarion/internal/portmap"
 	"github.com/necromancer124/tarion/internal/storage"
@@ -278,9 +280,9 @@ func TestOfflineMessageIsQueuedAndDeliveredLater(t *testing.T) {
 	bobPort := freePort(t)
 	bobAddr := fmt.Sprintf("127.0.0.1:%d", bobPort)
 
-	queued, err := alice.send("bob", bobAddr, "while you were away")
-	if !queued || err == nil {
-		t.Fatalf("expected the message to be queued, got queued=%v err=%v", queued, err)
+	how, err := alice.send("bob", bobAddr, "while you were away")
+	if how != sendQueued || err == nil {
+		t.Fatalf("expected the message to be queued, got %v err=%v", how, err)
 	}
 	items, _ := storage.Outbox()
 	if len(items) != 1 {
@@ -362,9 +364,9 @@ func TestBannedContactIsRefusedNotQueued(t *testing.T) {
 		t.Fatal(err)
 	}
 	alice.setRevoked([]string{bobID.ID})
-	queued, err := alice.send("bob", "", "are you there?")
-	if queued || !errors.Is(err, errRevoked) {
-		t.Fatalf("banned contact: queued=%v err=%v", queued, err)
+	how, err := alice.send("bob", "", "are you there?")
+	if how != sendFailed || !errors.Is(err, errRevoked) {
+		t.Fatalf("banned contact: %v err=%v", how, err)
 	}
 	if items, _ := storage.Outbox(); len(items) != 0 {
 		t.Fatalf("message to a banned contact was queued: %+v", items)
@@ -412,9 +414,9 @@ func TestDroppedMessagesAreLogged(t *testing.T) {
 	_, bobAddr := startTestNode(t, &storage.Config{Username: "bob", Accept: "contacts"})
 	alice, _ := startTestNode(t, &storage.Config{Username: "alice"})
 
-	queued, err := alice.send("bob", bobAddr, "let me in")
-	if queued || err == nil {
-		t.Fatalf("a contacts-only refusal is final: queued=%v err=%v", queued, err)
+	how, err := alice.send("bob", bobAddr, "let me in")
+	if how != sendFailed || err == nil {
+		t.Fatalf("a contacts-only refusal is final: %v err=%v", how, err)
 	}
 	entries, _ := storage.ReadDropped(0)
 	var in, out bool
@@ -539,6 +541,91 @@ func TestPortForwardIsRemovedOnExit(t *testing.T) {
 		exit(n)
 		if !router.removed {
 			t.Errorf("%s: the router still forwards the port after exit", name)
+		}
+	}
+}
+
+func TestMailboxLetterArrivesLikeAMessage(t *testing.T) {
+	t.Setenv("TARION_HOME", t.TempDir())
+	bob, _ := startTestNode(t, &storage.Config{Username: "bob"})
+	aliceID, _ := identity.Generate()
+	bobBox, _ := mailbox.BoxKeys(bob.nm.Identity())
+	sent := time.Now().Add(-3 * time.Hour)
+	sealed, err := mailbox.Seal(aliceID, "alice", bob.nm.Identity().ID, bobBox, "m1", sent, "left while you slept")
+	if err != nil {
+		t.Fatal(err)
+	}
+	letter := directory.Letter{ID: "a1", From: "alice", Sealed: sealed}
+
+	if err := bob.openLetter(letter); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case msg := <-bob.nm.MessageChan:
+		if msg.PeerID != aliceID.ID || msg.Body != "left while you slept" || msg.Sent.Unix() != sent.Unix() || msg.Addr != "" {
+			t.Fatalf("message: %+v", msg)
+		}
+		if chat, line := recordIncoming(msg); chat != "alice" || !strings.Contains(line, "(sent ") {
+			t.Fatalf("history: %s %q", chat, line)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("letter was not delivered")
+	}
+	if p, ok := storage.PeerByID(aliceID.ID); !ok || p.Addr != "" {
+		t.Fatalf("sender must be pinned without an address: %+v", p)
+	}
+
+	// The same letter again (an ack was lost) is not shown twice.
+	if err := bob.openLetter(letter); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case msg := <-bob.nm.MessageChan:
+		t.Fatalf("duplicate delivered: %+v", msg)
+	case <-time.After(200 * time.Millisecond):
+	}
+
+	// A letter sealed for someone else can't be opened; it is logged and
+	// counts as handled so it doesn't sit on the server.
+	carolID, _ := identity.Generate()
+	carolBox, _ := mailbox.BoxKeys(carolID)
+	other, _ := mailbox.Seal(aliceID, "alice", carolID.ID, carolBox, "m2", sent, "for carol")
+	if err := bob.openLetter(directory.Letter{ID: "a2", From: "alice", Sealed: other}); err != nil {
+		t.Fatal(err)
+	}
+	entries, _ := storage.ReadDropped(0)
+	if len(entries) == 0 || !strings.Contains(entries[len(entries)-1].Reason, "mailbox letter rejected") {
+		t.Fatalf("dropped log: %+v", entries)
+	}
+}
+
+func TestMailboxLetterFollowsAcceptRules(t *testing.T) {
+	t.Setenv("TARION_HOME", t.TempDir())
+	bob, _ := startTestNode(t, &storage.Config{Username: "bob", Accept: "contacts"})
+	strangerID, _ := identity.Generate()
+	box, _ := mailbox.BoxKeys(bob.nm.Identity())
+	sealed, _ := mailbox.Seal(strangerID, "stranger", bob.nm.Identity().ID, box, "m1", time.Now(), "hi")
+	if err := bob.openLetter(directory.Letter{ID: "a1", From: "stranger", Sealed: sealed}); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case msg := <-bob.nm.MessageChan:
+		t.Fatalf("a stranger's letter got past -accept contacts: %+v", msg)
+	case <-time.After(200 * time.Millisecond):
+	}
+}
+
+func TestMailboxFlagValidates(t *testing.T) {
+	for v, ok := range map[string]bool{"on": true, "off": true, "yes": false} {
+		fs := flag.NewFlagSet("t", flag.ContinueOnError)
+		f := addClientFlags(fs)
+		_ = fs.Parse([]string{"-mailbox", v})
+		cfg := &storage.Config{}
+		if err := f.apply(cfg); (err == nil) != ok {
+			t.Errorf("-mailbox %s: %v", v, err)
+		}
+		if ok && cfg.MailboxEnabled() != (v == "on") {
+			t.Errorf("-mailbox %s saved as %q", v, cfg.Mailbox)
 		}
 	}
 }
