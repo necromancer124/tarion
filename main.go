@@ -346,7 +346,7 @@ func (n *node) send(to, addr, body string) (sendOutcome, error) {
 		n.logDrop(storage.DroppedMessage{Dir: "out", Peer: to, Reason: err.Error(), Body: body})
 		return sendFailed, err
 	}
-	if n.useMailbox(err) {
+	if n.useMailbox(err, now) {
 		merr := n.depositMail(id, now, to, body)
 		if merr == nil {
 			return sendMailed, err
@@ -447,7 +447,7 @@ func (n *node) flushOutbox() {
 			_ = storage.AppendHistory(it.To, "  ! not delivered: "+storage.CleanText(err.Error()))
 			n.logDrop(storage.DroppedMessage{Dir: "out", Peer: it.To, Reason: err.Error(), Body: it.Body})
 		default:
-			if n.useMailbox(err) {
+			if n.useMailbox(err, it.Created) {
 				merr := n.mailItem(it, err)
 				if merr == nil {
 					continue

@@ -24,11 +24,18 @@ const mailboxPoll = 2 * time.Minute // fallback; the server also pushes "mail"
 // mailboxOn reports whether this client uses the server mailbox.
 func (n *node) mailboxOn() bool { return n.dir != nil && n.cfg.MailboxEnabled() }
 
-// useMailbox reports whether a message that failed with err goes to the
-// recipient's mailbox. Only when the server says they're offline: someone
-// who is online but unreachable gets it directly later (or through the
-// relay, if both turned it on), never through the server's storage.
-func (n *node) useMailbox(err error) bool { return n.mailboxOn() && errors.Is(err, errOffline) }
+// mailboxGrace is how long a message to someone online but unreachable is
+// retried directly (and through the relay, if on) before it goes to their
+// mailbox.
+const mailboxGrace = time.Minute
+
+// useMailbox reports whether a message queued at since, whose last attempt
+// failed with err, goes to the recipient's mailbox: right away when the
+// server says they're offline, and after mailboxGrace of failed retries
+// when they're online but can't be reached.
+func (n *node) useMailbox(err error, since time.Time) bool {
+	return n.mailboxOn() && (errors.Is(err, errOffline) || time.Since(since) >= mailboxGrace)
+}
 
 // mailboxLogin returns the box key and its signature to publish at login.
 func mailboxLogin(id *identity.Identity) (key, sig []byte) {

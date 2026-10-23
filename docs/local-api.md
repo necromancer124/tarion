@@ -20,7 +20,7 @@
 | `cmd` | Fields | Reply |
 |---|---|---|
 | `ping` | | `{"ok":true}` |
-| `send` | `to`, `body`, optional `addr` | `{"ok":true}` once the peer acknowledged it; `{"ok":true,"queued":true,"error":"bob is offline"}` if it was queued for automatic retry; `{"ok":true,"mailed":true,"error":"bob is offline"}` if bob is offline and it was sealed and left in his server mailbox (both of you use `-mailbox on`); `{"ok":false,"error":"..."}` if it can't be sent (wrong or banned key, refused) |
+| `send` | `to`, `body`, optional `addr` | `{"ok":true}` once the peer acknowledged it; `{"ok":true,"queued":true,"error":"bob is offline"}` if it was queued for automatic retry; `{"ok":true,"mailed":true,"error":"bob is offline"}` if bob is offline and it was sealed and left in his server mailbox (both of you use `-mailbox on`; a message to someone online but unreachable goes there later, after a minute of retries, as a `mailed` event); `{"ok":false,"error":"..."}` if it can't be sent (wrong or banned key, refused) |
 | `online` | | `{"ok":true,"status":"...","users":["bob",...]}` |
 | `history` | `to`, optional `limit` | `{"ok":true,"lines":["bob: hi","Me: hello"]}` |
 | `subscribe` | | `{"ok":true,"status":"..."}`, then the connection **stays open** and streams events |

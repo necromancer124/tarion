@@ -630,26 +630,26 @@ func TestMailboxFlagValidates(t *testing.T) {
 	}
 }
 
-func TestMailboxOnlyForOfflineContacts(t *testing.T) {
+func TestMailboxForOfflineOrLongUnreachable(t *testing.T) {
 	t.Setenv("TARION_HOME", t.TempDir())
 	cfg := &storage.Config{Username: "alice", Mailbox: "on"}
 	n, _ := startTestNode(t, cfg)
 	n.dir = directory.NewClient(n.nm, directory.ClientConfig{Server: "127.0.0.1:1", User: "alice", AcceptMailbox: true})
 
+	now := time.Now()
 	offline := fmt.Errorf("bob is %w (nothing at their last known address: %w)", errOffline, errors.New("timeout"))
-	if !n.useMailbox(offline) {
-		t.Fatal("a contact the server reports offline should get the mailbox")
+	unreachable := errors.New("dial 203.0.113.7:63426: timeout") // online, but no path
+	if !n.useMailbox(offline, now) {
+		t.Fatal("a contact the server reports offline gets the mailbox right away")
 	}
-	for _, err := range []error{
-		errors.New("dial 203.0.113.7:63426: timeout"), // online but unreachable
-		fmt.Errorf("%w for bob", errNoAddress),
-	} {
-		if n.useMailbox(err) {
-			t.Errorf("%v: only offline contacts get the mailbox", err)
-		}
+	if n.useMailbox(unreachable, now) || n.useMailbox(unreachable, now.Add(-30*time.Second)) {
+		t.Fatal("an online contact is retried directly for a minute first")
+	}
+	if !n.useMailbox(unreachable, now.Add(-mailboxGrace-time.Second)) {
+		t.Fatal("after a minute of failed retries the mailbox takes it")
 	}
 	cfg.Mailbox = "off"
-	if n.useMailbox(offline) {
+	if n.useMailbox(offline, now) || n.useMailbox(unreachable, now.Add(-time.Hour)) {
 		t.Fatal("mailbox used while turned off")
 	}
 }
