@@ -24,6 +24,19 @@ const mailboxPoll = 2 * time.Minute // fallback; the server also pushes "mail"
 // mailboxOn reports whether this client uses the server mailbox.
 func (n *node) mailboxOn() bool { return n.dir != nil && n.cfg.MailboxEnabled() }
 
+// mailboxGrace is how long a message to someone online but unreachable is
+// retried directly (and through the relay, if on) before it goes to their
+// mailbox.
+const mailboxGrace = time.Minute
+
+// useMailbox reports whether a message queued at since, whose last attempt
+// failed with err, goes to the recipient's mailbox: right away when the
+// server says they're offline, and after mailboxGrace of failed retries
+// when they're online but can't be reached.
+func (n *node) useMailbox(err error, since time.Time) bool {
+	return n.mailboxOn() && (errors.Is(err, errOffline) || time.Since(since) >= mailboxGrace)
+}
+
 // mailboxLogin returns the box key and its signature to publish at login.
 func mailboxLogin(id *identity.Identity) (key, sig []byte) {
 	pub, _ := mailbox.BoxKeys(id)
@@ -68,6 +81,32 @@ func (n *node) depositMail(id string, sent time.Time, to, body string) error {
 		return errors.New("message too large for the mailbox")
 	}
 	return n.dir.MailboxPut(to, sealed)
+}
+
+// mailWhenOffline moves a queued message to the contact's mailbox if the
+// server confirms they are offline. It checks each message at most once a
+// minute. Called with outboxMu held.
+func (n *node) mailWhenOffline(it storage.OutboxItem, now time.Time) bool {
+	if n.mailTried == nil {
+		n.mailTried = map[string]time.Time{}
+	}
+	if now.Sub(n.mailTried[it.ID]) < time.Minute || !n.dir.Connected() || !directory.ValidUsername(it.To) {
+		return false
+	}
+	n.mailTried[it.ID] = now
+	if len(n.mailTried) > 1000 {
+		n.mailTried = map[string]time.Time{it.ID: now}
+	}
+	// A lookup of someone offline signals nobody; of someone online it
+	// asks them to punch, which a retry would do anyway.
+	if _, err := n.dir.Lookup(it.To); !errors.Is(err, directory.ErrUserOffline) {
+		return false
+	}
+	if n.mailItem(it, fmt.Errorf("%s is %w", it.To, errOffline)) != nil {
+		return false
+	}
+	delete(n.mailTried, it.ID)
+	return true
 }
 
 // wakeMail asks the mailbox loop to fetch now.
