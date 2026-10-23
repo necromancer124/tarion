@@ -184,7 +184,7 @@ The folder also holds `identity.key` (your private key, keep it secret), `peers.
 2. To message bob, the client asks the server for bob. The server answers with bob's public address, his key, and (only if you're behind the same router) his LAN address.
 3. At the same moment, the server tells bob, over his open connection, to send a few tiny packets toward your address. That opens bob's router for your incoming connection (NAT hole punching).
 4. The client connects to bob directly: LAN address first, then an address bob made reachable himself (a forwarded port), then the public address the server sees.
-5. If none work and you both use the mailbox, the message is sealed and left in bob's server mailbox. Otherwise it's queued on your device and retried. **No message passes through the server** unless you, bob and the server operator all turned the relay or the mailbox on (see below).
+5. If none work, the message is queued on your device and retried. Only if the server says bob is **offline**, and you both use the mailbox, is it sealed and left in his server mailbox instead. If bob is online but can't be reached, it is never stored on the server. **No message passes through the server** unless you, bob and the server operator all turned the relay or the mailbox on (see below).
 
 ### Getting through strict NATs
 
@@ -207,6 +207,8 @@ Hole punching works with most home routers. When both sides are behind strict ("
 Without it, a message to someone who is offline waits on *your* device until you're both online at the same time. With it, the server holds the message for them, without being able to read it.
 
 It's **off by default** and only works when all three agree: the operator runs `tariond -mailbox`, the recipient turned theirs on (`-mailbox on`), and so did you.
+
+Even then it's only used when the server reports the recipient **offline**. If they're online but your message can't reach them (a strict NAT, a firewall), it waits in your outbox and is retried directly, or goes through the relay if you both turned that on. A queued message moves to the mailbox only once the recipient goes offline.
 
 - **Sealed.** Each device derives a mailbox key from its identity key and publishes it at login, signed by the identity key. To leave a message, your client fetches that key, checks the signature and that the identity key matches the one you pinned for that contact (or the `id` in `config.json`), then seals the message to it (X25519 + XSalsa20-Poly1305, NaCl's anonymous box). Only the recipient's device can open it.
 - **Signed.** Inside the seal, the message is signed with your identity key. The recipient checks the signature, that it was addressed to them, and then applies the same rules as a direct message: banned keys, `-accept contacts`, pinned names, duplicates. The server can't forge, change or redirect a letter.

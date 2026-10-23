@@ -629,3 +629,27 @@ func TestMailboxFlagValidates(t *testing.T) {
 		}
 	}
 }
+
+func TestMailboxOnlyForOfflineContacts(t *testing.T) {
+	t.Setenv("TARION_HOME", t.TempDir())
+	cfg := &storage.Config{Username: "alice", Mailbox: "on"}
+	n, _ := startTestNode(t, cfg)
+	n.dir = directory.NewClient(n.nm, directory.ClientConfig{Server: "127.0.0.1:1", User: "alice", AcceptMailbox: true})
+
+	offline := fmt.Errorf("bob is %w (nothing at their last known address: %w)", errOffline, errors.New("timeout"))
+	if !n.useMailbox(offline) {
+		t.Fatal("a contact the server reports offline should get the mailbox")
+	}
+	for _, err := range []error{
+		errors.New("dial 203.0.113.7:63426: timeout"), // online but unreachable
+		fmt.Errorf("%w for bob", errNoAddress),
+	} {
+		if n.useMailbox(err) {
+			t.Errorf("%v: only offline contacts get the mailbox", err)
+		}
+	}
+	cfg.Mailbox = "off"
+	if n.useMailbox(offline) {
+		t.Fatal("mailbox used while turned off")
+	}
+}

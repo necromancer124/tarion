@@ -108,8 +108,9 @@ type node struct {
 	mappers []portmap.Mapper // UPnP, NAT-PMP; tests use fakes
 	port    portState
 
-	mailMu   sync.Mutex    // one mailbox fetch at a time
-	mailWake chan struct{} // nudges the mailbox loop
+	mailMu    sync.Mutex           // one mailbox fetch at a time
+	mailWake  chan struct{}        // nudges the mailbox loop
+	mailTried map[string]time.Time // outbox ID -> last offline check; under outboxMu
 
 	outboxMu    sync.Mutex    // one outbox pass at a time
 	outboxWake  chan struct{} // nudges the outbox loop
@@ -345,7 +346,7 @@ func (n *node) send(to, addr, body string) (sendOutcome, error) {
 		n.logDrop(storage.DroppedMessage{Dir: "out", Peer: to, Reason: err.Error(), Body: body})
 		return sendFailed, err
 	}
-	if n.mailboxOn() {
+	if n.useMailbox(err) {
 		merr := n.depositMail(id, now, to, body)
 		if merr == nil {
 			return sendMailed, err
@@ -427,6 +428,11 @@ func (n *node) flushOutbox() {
 			continue
 		}
 		if now.Before(it.NextTry) && !online[key] {
+			// Not due yet, but if they have gone offline their mailbox can
+			// take it now instead of after the retry wait.
+			if n.mailboxOn() && n.mailWhenOffline(it, now) {
+				continue
+			}
 			blocked[key] = true
 			continue
 		}
@@ -441,7 +447,7 @@ func (n *node) flushOutbox() {
 			_ = storage.AppendHistory(it.To, "  ! not delivered: "+storage.CleanText(err.Error()))
 			n.logDrop(storage.DroppedMessage{Dir: "out", Peer: it.To, Reason: err.Error(), Body: it.Body})
 		default:
-			if n.mailboxOn() {
+			if n.useMailbox(err) {
 				merr := n.mailItem(it, err)
 				if merr == nil {
 					continue
@@ -883,6 +889,10 @@ func (n *node) deliverMsg(id string, sent time.Time, to, addr, body string) erro
 			return err
 		}
 		return fmt.Errorf("%w (relay: %v)", lastErr, err)
+	}
+	if offline {
+		// The server says they're offline; we only tried an old address.
+		return fmt.Errorf("%s is %w (nothing at their last known address: %w)", to, errOffline, lastErr)
 	}
 	return lastErr
 }
