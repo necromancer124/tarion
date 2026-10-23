@@ -34,6 +34,12 @@ type ClientConfig struct {
 	AcceptRelay bool
 	// PublicAddr is an address the user made reachable (a forwarded port).
 	PublicAddr string
+	// AcceptMailbox asks the server to hold letters sealed to BoxKey while
+	// this client is offline. BoxSig is the identity key's signature over
+	// BoxKey (see package mailbox). Off deletes letters waiting on the server.
+	AcceptMailbox bool
+	BoxKey        []byte
+	BoxSig        []byte
 
 	// OnServerID is called once when an unpinned server key is first seen,
 	// so the caller can persist the pin.
@@ -47,6 +53,9 @@ type ClientConfig struct {
 	// OnRevoked receives the server's full list of banned keys at every
 	// login and whenever it changes. Callers enforce and persist it.
 	OnRevoked func(keys []string)
+	// OnMail is called when letters may be waiting: after a login that
+	// reports some, and when the server says one just arrived.
+	OnMail func()
 }
 
 // Client keeps one QUIC connection to tariond open from the chat socket.
@@ -167,6 +176,9 @@ func (c *Client) session(ctx context.Context) (bool, error) {
 	if c.cfg.OnRevoked != nil {
 		c.cfg.OnRevoked(resp.Revoked)
 	}
+	if resp.Mail > 0 && c.cfg.AcceptMailbox && c.cfg.OnMail != nil {
+		go c.cfg.OnMail()
+	}
 	if srv, ok := conn.RemoteAddr().(*net.UDPAddr); ok && c.nm.Relay() != nil {
 		c.nm.Relay().SetServer(srv) // relay packets travel this same path
 	}
@@ -260,7 +272,8 @@ func (c *Client) login(ctx context.Context, conn *quic.Conn) (Response, bool, er
 	public := c.publicAddr
 	c.mu.Unlock()
 	resp, err := roundTrip(ctx, conn, Request{Op: OpLogin, User: c.cfg.User, Pass: c.cfg.Pass, LocalAddrs: local,
-		AcceptRelay: c.cfg.AcceptRelay, PublicAddr: public})
+		AcceptRelay: c.cfg.AcceptRelay, PublicAddr: public,
+		AcceptMailbox: c.cfg.AcceptMailbox, BoxKey: c.cfg.BoxKey, BoxSig: c.cfg.BoxSig})
 	if err != nil {
 		return resp, false, err
 	}
@@ -273,7 +286,8 @@ func (c *Client) login(ctx context.Context, conn *quic.Conn) (Response, bool, er
 			return resp, false, &FatalError{Msg: fmt.Sprintf("account %s does not exist; run once with -pass to create it", c.cfg.User)}
 		}
 		resp, err = roundTrip(ctx, conn, Request{Op: OpRegister, User: c.cfg.User, Pass: c.cfg.Pass, Invite: c.cfg.Invite, LocalAddrs: local,
-			AcceptRelay: c.cfg.AcceptRelay, PublicAddr: public})
+			AcceptRelay: c.cfg.AcceptRelay, PublicAddr: public,
+			AcceptMailbox: c.cfg.AcceptMailbox, BoxKey: c.cfg.BoxKey, BoxSig: c.cfg.BoxSig})
 		if err != nil {
 			return resp, false, err
 		}
@@ -422,6 +436,76 @@ func (c *Client) Lookup(target string) (Response, error) {
 	return resp, nil
 }
 
+// Mailbox errors.
+var (
+	ErrNoServerMailbox      = errors.New("this server has no mailbox")
+	ErrRecipientNoMailbox   = errors.New("their mailbox is off")
+	ErrRecipientMailboxFull = errors.New("their mailbox is full")
+)
+
+// MailboxKey returns what is needed to seal a letter to target: their
+// identity key, box key and the signature binding the two. Check all of
+// them (mailbox.VerifyBoxKey, and the key against your pin) before sealing.
+func (c *Client) MailboxKey(target string) (Response, error) {
+	return c.mailboxRequest(Request{Op: OpMailboxKey, Target: target})
+}
+
+// MailboxPut leaves a sealed letter for target.
+func (c *Client) MailboxPut(target string, sealed []byte) error {
+	_, err := c.mailboxRequest(Request{Op: OpMailboxPut, Target: target, Sealed: sealed})
+	return err
+}
+
+// MailboxFetch returns letters waiting for this device, oldest first. More
+// means another fetch returns the rest (after acknowledging these).
+func (c *Client) MailboxFetch() (letters []Letter, more bool, err error) {
+	resp, err := c.mailboxRequest(Request{Op: OpMailboxFetch})
+	return resp.Letters, resp.More, err
+}
+
+// MailboxAck deletes letters from the server once they are safely received.
+func (c *Client) MailboxAck(ids []string) error {
+	for len(ids) > 0 {
+		n := min(len(ids), MaxAckIDs)
+		if _, err := c.mailboxRequest(Request{Op: OpMailboxAck, IDs: ids[:n]}); err != nil {
+			return err
+		}
+		ids = ids[n:]
+	}
+	return nil
+}
+
+func (c *Client) mailboxRequest(req Request) (Response, error) {
+	if !c.cfg.AcceptMailbox {
+		return Response{}, errors.New("your mailbox is turned off")
+	}
+	conn := c.current()
+	if conn == nil {
+		return Response{}, errors.New("not connected to server")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), requestTimeout)
+	defer cancel()
+	resp, err := roundTrip(ctx, conn, req)
+	if err != nil || resp.OK {
+		return resp, err
+	}
+	switch resp.Error {
+	case ErrMailboxOff:
+		return resp, ErrNoServerMailbox
+	case ErrMailboxRefused:
+		return resp, ErrRecipientNoMailbox
+	case ErrMailboxFull:
+		return resp, ErrRecipientMailboxFull
+	case ErrNoSuchUser:
+		return resp, errors.New("no such user on the server")
+	case ErrTooLarge:
+		return resp, errors.New("message too large for the mailbox")
+	case ErrRateLimited:
+		return resp, errors.New("too many letters; try again later")
+	}
+	return resp, fmt.Errorf("server: %s", resp.Error)
+}
+
 func (c *Client) request(req Request) (Response, error) {
 	conn := c.current()
 	if conn == nil {
@@ -478,6 +562,12 @@ func (c *Client) handlePush(stream *quic.Stream) {
 		}
 		if id, ok := relay.ParseID(push.Relay); ok && c.nm.Relay() != nil {
 			c.nm.Relay().Allow(id)
+		}
+		return
+	}
+	if push.Type == PushMail {
+		if c.cfg.AcceptMailbox && c.cfg.OnMail != nil {
+			c.cfg.OnMail()
 		}
 		return
 	}

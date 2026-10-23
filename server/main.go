@@ -1,6 +1,8 @@
 // tariond is Tarion's directory server. Clients log in over QUIC from their
 // chat socket; tariond tells them each other's public address and peer key
-// and signals NAT hole punching. It never sees or relays chat messages.
+// and signals NAT hole punching. It never sees chat messages: the relay
+// (-relay) forwards packets it can't decrypt, and the mailbox (-mailbox)
+// stores letters sealed to their recipient. Both are off by default.
 //
 //	tariond [serve flags]          run the server
 //	tariond invite [-n 5]          create one-time invite codes
@@ -30,7 +32,7 @@ import (
 // TARIOND_DATA environment variable) so Docker needs a single volume and
 // operator commands find the same files as the running server.
 type paths struct {
-	data, users, legacy, key, invites, bans, deletions string
+	data, users, legacy, key, invites, bans, deletions, mailbox string
 }
 
 func addPathFlags(fs *flag.FlagSet) func() paths {
@@ -59,6 +61,7 @@ func addPathFlags(fs *flag.FlagSet) func() paths {
 			invites:   or(*inv, "invites"),
 			bans:      or(*bans, "bans.txt"),
 			deletions: filepath.Join(*data, "deletions"),
+			mailbox:   filepath.Join(*data, "mailbox"),
 		}
 	}
 }
@@ -104,6 +107,8 @@ func serve(args []string) error {
 	relayOn := fs.Bool("relay", false, "relay encrypted packets between peers whose NATs block direct connections (both peers must also turn it on)")
 	relayKBps := fs.Int("relay-kbps", 256, "relay bandwidth per session, KiB/s")
 	relayTotalKBps := fs.Int("relay-total-kbps", 8192, "relay bandwidth for all sessions, KiB/s")
+	mailboxOn := fs.Bool("mailbox", false, "hold sealed letters for offline users who turn their mailbox on (the server can't read them)")
+	mailboxDays := fs.Int("mailbox-days", 7, "delete letters nobody fetched after this many days")
 	showID := fs.Bool("id", false, "print the server ID and exit (same as `tariond id`)")
 	getPaths := addPathFlags(fs)
 	_ = fs.Parse(args)
@@ -113,6 +118,9 @@ func serve(args []string) error {
 	case RegOpen, RegInvite, RegClosed:
 	default:
 		return fmt.Errorf("-registration must be open, invite or closed")
+	}
+	if *mailboxDays < 1 || *mailboxDays > 90 {
+		return fmt.Errorf("-mailbox-days must be 1-90")
 	}
 	if *minPass < 8 || *argonMem < 8 || *argonTime < 1 {
 		return fmt.Errorf("refusing weak settings: -min-password >= 8, -argon-memory >= 8, -argon-time >= 1")
@@ -127,6 +135,15 @@ func serve(args []string) error {
 	if *showID {
 		fmt.Println(identity.Fingerprint(id.ID))
 		return nil
+	}
+	if !*mailboxOn {
+		// Turning the mailbox off deletes whatever it still held.
+		if _, err := os.Stat(p.mailbox); err == nil {
+			if err := os.RemoveAll(p.mailbox); err != nil {
+				return fmt.Errorf("mailbox is off but its old letters could not be deleted: %w", err)
+			}
+			log.Printf("mailbox is off: deleted the letters it still held")
+		}
 	}
 	accounts, err := LoadAccounts(p.users, p.legacy)
 	if err != nil {
@@ -148,6 +165,9 @@ func serve(args []string) error {
 		RelayTotal:   *relayTotalKBps * 1024,
 		BansPath:     p.bans,
 		MinPassword:  *minPass,
+		Mailbox:      *mailboxOn,
+		MailboxDir:   p.mailbox,
+		MailboxDays:  *mailboxDays,
 	})
 	ln, err := tr.Listen(srv.TLSConfig(), QUICConfig())
 	if err != nil {
@@ -165,7 +185,7 @@ func serve(args []string) error {
 		srv.SetProbeConn(probe)
 		defer probe.Close()
 	}
-	log.Printf("tariond listening on UDP/%d, data in %s, registration %s, relay %v", *port, p.data, *reg, *relayOn)
+	log.Printf("tariond listening on UDP/%d, data in %s, registration %s, relay %v, mailbox %v", *port, p.data, *reg, *relayOn, *mailboxOn)
 	log.Printf("server ID: %s (clients pin this; give it to users as server_id)", identity.Fingerprint(id.ID))
 
 	stop := make(chan os.Signal, 1)

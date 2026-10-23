@@ -59,14 +59,24 @@ func Fingerprint(id string) string {
 // PeerIDFromCerts extracts the peer ID from the leaf certificate a peer
 // presented. TLS 1.3 already proved the peer owns the matching private key.
 func PeerIDFromCerts(certs []*x509.Certificate) (string, error) {
+	pub, err := PubKeyFromCerts(certs)
+	if err != nil {
+		return "", err
+	}
+	return PeerID(pub), nil
+}
+
+// PubKeyFromCerts extracts the Ed25519 identity key from a peer's leaf
+// certificate.
+func PubKeyFromCerts(certs []*x509.Certificate) (ed25519.PublicKey, error) {
 	if len(certs) == 0 {
-		return "", errors.New("peer presented no certificate")
+		return nil, errors.New("peer presented no certificate")
 	}
 	pub, ok := certs[0].PublicKey.(ed25519.PublicKey)
 	if !ok {
-		return "", errors.New("peer certificate is not an Ed25519 Tarion identity")
+		return nil, errors.New("peer certificate is not an Ed25519 Tarion identity")
 	}
-	return PeerID(pub), nil
+	return pub, nil
 }
 
 // VerifyPeerCertificate is a tls.Config hook that only accepts a peer whose

@@ -42,6 +42,10 @@ type Config struct {
 	// Relay is "off" (default) or "on": whether messages may travel through
 	// the server when a direct connection is impossible.
 	Relay string `json:"relay,omitempty"`
+	// Mailbox is "off" (default) or "on": whether the server may hold
+	// sealed messages for you while you are offline, and whether you leave
+	// them for contacts who are offline. The server can't read them.
+	Mailbox string `json:"mailbox,omitempty"`
 	// PublicAddr is an address peers can reach directly, for example a port
 	// you forwarded on your router. The server passes it on in lookups.
 	PublicAddr string `json:"public_addr,omitempty"`
@@ -72,6 +76,9 @@ func (c *Config) EnforcesServerBans() bool { return c.ServerBans != "off" }
 
 // RelayEnabled reports whether messages may go through the server's relay.
 func (c *Config) RelayEnabled() bool { return c.Relay == "on" }
+
+// MailboxEnabled reports whether sealed messages may wait on the server.
+func (c *Config) MailboxEnabled() bool { return c.Mailbox == "on" }
 
 // DefaultPort is the client's UDP port. It differs from the server's default
 // (63425) so a client and tariond can run on the same machine.

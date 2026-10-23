@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"crypto/ed25519"
 	"crypto/tls"
 	"errors"
 	"log"
@@ -15,6 +16,7 @@ import (
 
 	"github.com/necromancer124/tarion/internal/directory"
 	"github.com/necromancer124/tarion/internal/identity"
+	"github.com/necromancer124/tarion/internal/mailbox"
 	"github.com/necromancer124/tarion/internal/relay"
 	"github.com/necromancer124/tarion/internal/wire"
 	"github.com/quic-go/quic-go"
@@ -43,6 +45,12 @@ type Options struct {
 	RelayRate        int // bytes per second per session
 	RelayTotal       int // bytes per second for all sessions
 	MaxRelaysPerUser int
+
+	// Mailbox holds sealed letters for offline users who turned it on.
+	// The server can't read them; it only stores them for MailboxDays.
+	Mailbox     bool
+	MailboxDir  string
+	MailboxDays int
 }
 
 func DefaultOptions() Options {
@@ -53,11 +61,14 @@ func DefaultOptions() Options {
 		RelayRate:        256 * 1024,
 		RelayTotal:       8 * 1024 * 1024,
 		MaxRelaysPerUser: 8,
+		Mailbox:          false, // opt-in, like the relay
+		MailboxDays:      7,
 	}
 }
 
 // Server is tariond: it tracks who is online and where, and tells peers to
-// punch toward each other. It never relays chat messages.
+// punch toward each other. Chat messages never pass through it in a form
+// it can read.
 type Server struct {
 	id        *identity.Identity
 	accounts  *Accounts
@@ -87,6 +98,9 @@ type Server struct {
 	relays     map[relay.ID]*relaySession
 	relayRate  *limiter // bytes per session
 	relayTotal *limiter // bytes for all sessions
+
+	mailbox   *mailboxStore // nil when the operator left it off
+	mailLimit *limiter      // letters left per sender
 }
 
 // relaySession joins two logged-in sessions for packet forwarding.
@@ -99,6 +113,7 @@ type session struct {
 	id     string
 	conn   *quic.Conn
 	peerID string
+	pubKey ed25519.PublicKey
 	ip     string
 	addr   string   // public address the server observes = the client's chat socket
 	udp    net.Addr // the same, as quic-go reports it; relay packets come from here
@@ -132,6 +147,14 @@ func NewServer(id *identity.Identity, accounts *Accounts, opts Options) *Server 
 	if opts.MaxRelaysPerUser < 1 {
 		opts.MaxRelaysPerUser = DefaultOptions().MaxRelaysPerUser
 	}
+	if opts.MailboxDays < 1 {
+		opts.MailboxDays = DefaultOptions().MailboxDays
+	}
+	var box *mailboxStore
+	if opts.Mailbox && opts.MailboxDir != "" {
+		box = &mailboxStore{dir: opts.MailboxDir, maxItems: 200, maxBytes: 4 << 20, perPeer: 50,
+			keep: time.Duration(opts.MailboxDays) * 24 * time.Hour}
+	}
 	return &Server{
 		id:         id,
 		accounts:   accounts,
@@ -152,6 +175,8 @@ func NewServer(id *identity.Identity, accounts *Accounts, opts Options) *Server 
 		relayRate:  newByteLimiter(opts.RelayRate),
 		relayTotal: newByteLimiter(opts.RelayTotal),
 		probeLimit: newLimiter(10*time.Second, 3),
+		mailbox:    box,
+		mailLimit:  newLimiter(6*time.Second, 20),
 	}
 }
 
@@ -177,10 +202,15 @@ func QUICConfig() *quic.Config {
 func (s *Server) Serve(ln *quic.Listener) error {
 	go func() {
 		for range time.Tick(time.Minute) {
-			for _, l := range []*limiter{s.connLimit, s.authLimit, s.userLimit, s.regLimit, s.reqLimit, s.punchLimit, s.relayRate} {
+			for _, l := range []*limiter{s.connLimit, s.authLimit, s.userLimit, s.regLimit, s.reqLimit, s.punchLimit, s.relayRate, s.mailLimit} {
 				l.sweep()
 			}
 			s.sweepRelays()
+			if s.mailbox != nil {
+				if n := s.mailbox.Expire(time.Now()); n > 0 {
+					log.Printf("mailbox: %d letters expired unread", n)
+				}
+			}
 		}
 	}()
 	go func() {
@@ -241,7 +271,7 @@ func hostOf(addr string) string {
 }
 
 func (s *Server) handleConn(conn *quic.Conn, ip string) {
-	peerID, err := identity.PeerIDFromCerts(conn.ConnectionState().TLS.PeerCertificates)
+	pub, err := identity.PubKeyFromCerts(conn.ConnectionState().TLS.PeerCertificates)
 	if err != nil {
 		_ = conn.CloseWithError(codeIdentity, err.Error())
 		return
@@ -249,7 +279,8 @@ func (s *Server) handleConn(conn *quic.Conn, ip string) {
 	sess := &session{
 		id:     strconv.FormatUint(s.nextID.Add(1), 10),
 		conn:   conn,
-		peerID: peerID,
+		peerID: identity.PeerID(pub),
+		pubKey: pub,
 		ip:     ip,
 		addr:   conn.RemoteAddr().String(),
 		udp:    conn.RemoteAddr(),
@@ -315,6 +346,14 @@ func (s *Server) handle(sess *session, req directory.Request) directory.Response
 		return s.changePassword(sess, req)
 	case directory.OpDeleteAccount:
 		return s.deleteAccount(sess, req)
+	case directory.OpMailboxKey:
+		return s.mailboxKey(sess, req)
+	case directory.OpMailboxPut:
+		return s.mailboxPut(sess, req)
+	case directory.OpMailboxFetch:
+		return s.mailboxFetch(sess)
+	case directory.OpMailboxAck:
+		return s.mailboxAck(sess, req)
 	}
 	return fail(directory.ErrBadRequest)
 }
@@ -440,7 +479,31 @@ func (s *Server) bind(sess *session, name string, req directory.Request) directo
 		_ = old.conn.CloseWithError(directory.CodeReplaced, "logged in elsewhere")
 	}
 	log.Printf("online: %s", name)
-	return directory.Response{OK: true, User: name, YourAddr: sess.addr, Revoked: s.revokedKeys()}
+	return directory.Response{OK: true, User: name, YourAddr: sess.addr, Revoked: s.revokedKeys(), Mail: s.updateMailbox(sess, name, req)}
+}
+
+// updateMailbox publishes the user's box key when they turned the mailbox
+// on, or deletes their mailbox when they turned it off. It returns how many
+// letters are waiting for this device.
+func (s *Server) updateMailbox(sess *session, name string, req directory.Request) int {
+	if s.mailbox == nil {
+		return 0
+	}
+	if !req.AcceptMailbox {
+		if err := s.mailbox.Remove(name); err != nil {
+			log.Printf("mailbox for %s: %v", name, err)
+		}
+		return 0
+	}
+	if !mailbox.VerifyBoxKey(sess.pubKey, req.BoxKey, req.BoxSig) {
+		return 0 // not signed by this device: leave things as they were
+	}
+	rec := boxRecord{PeerID: sess.peerID, PubKey: sess.pubKey, BoxKey: req.BoxKey, BoxSig: req.BoxSig}
+	if err := s.mailbox.SetKey(name, rec); err != nil {
+		log.Printf("mailbox for %s: %v", name, err)
+		return 0
+	}
+	return s.mailbox.Count(name, sess.peerID)
 }
 
 func (s *Server) list(sess *session) directory.Response {
@@ -757,6 +820,7 @@ func (s *Server) deleteAccount(sess *session, req directory.Request) directory.R
 		return err
 	})
 	if resp.OK {
+		s.removeMailbox(user)
 		log.Printf("account deleted by its owner: %s", user)
 		s.endAccount(user, 300*time.Millisecond) // let the reply go out first
 	}
@@ -770,6 +834,7 @@ func (s *Server) processDeletions() {
 			log.Printf("delete %q: %v", name, err)
 			continue
 		} else if existed {
+			s.removeMailbox(name)
 			log.Printf("account deleted by the operator: %s", name)
 			s.endAccount(name, 0)
 		}
@@ -806,4 +871,104 @@ func (s *Server) kickBanned() {
 		log.Printf("banned: disconnecting %s", name)
 		_ = sess.conn.CloseWithError(directory.CodeBanned, "banned")
 	}
+}
+
+func (s *Server) removeMailbox(name string) {
+	if s.mailbox != nil {
+		if err := s.mailbox.Remove(name); err != nil {
+			log.Printf("mailbox for %s: %v", name, err)
+		}
+	}
+}
+
+// mailboxTarget finds the recipient's account and its published box key.
+// A key published by a device the account no longer uses is refused.
+func (s *Server) mailboxTarget(sess *session, target string) (account, boxRecord, directory.Response) {
+	user, _ := sess.loggedIn()
+	switch {
+	case user == "":
+		return account{}, boxRecord{}, fail(directory.ErrNotLoggedIn)
+	case s.mailbox == nil:
+		return account{}, boxRecord{}, fail(directory.ErrMailboxOff)
+	case !directory.ValidUsername(target) || directory.NameKey(target) == directory.NameKey(user):
+		return account{}, boxRecord{}, fail(directory.ErrNoSuchUser)
+	}
+	acct, ok := s.accounts.get(target)
+	if !ok {
+		return account{}, boxRecord{}, fail(directory.ErrNoSuchUser)
+	}
+	rec, err := s.mailbox.Key(acct.Name)
+	if err != nil || s.bans.Banned(acct.Name, acct.PeerID) || !strings.EqualFold(rec.PeerID, acct.PeerID) {
+		return account{}, boxRecord{}, fail(directory.ErrMailboxRefused)
+	}
+	return acct, rec, directory.Response{OK: true}
+}
+
+// mailboxKey returns what a sender needs to seal a letter to target.
+func (s *Server) mailboxKey(sess *session, req directory.Request) directory.Response {
+	acct, rec, resp := s.mailboxTarget(sess, req.Target)
+	if !resp.OK {
+		return resp
+	}
+	return directory.Response{OK: true, User: acct.Name, PeerID: rec.PeerID, PubKey: rec.PubKey, BoxKey: rec.BoxKey, BoxSig: rec.BoxSig}
+}
+
+// mailboxPut stores a sealed letter for an offline user and, if they are
+// online after all, tells them to fetch it.
+func (s *Server) mailboxPut(sess *session, req directory.Request) directory.Response {
+	acct, rec, resp := s.mailboxTarget(sess, req.Target)
+	if !resp.OK {
+		return resp
+	}
+	if len(req.Sealed) == 0 {
+		return fail(directory.ErrBadRequest)
+	}
+	if len(req.Sealed) > directory.MaxSealedLetter {
+		return fail(directory.ErrTooLarge)
+	}
+	user, _ := sess.loggedIn()
+	if !s.mailLimit.Allow(directory.NameKey(user)) {
+		return fail(directory.ErrRateLimited)
+	}
+	if _, err := s.mailbox.Put(acct.Name, user, rec.PeerID, req.Sealed, time.Now()); errors.Is(err, errMailboxFull) {
+		return fail(directory.ErrMailboxFull)
+	} else if errors.Is(err, errNoBox) {
+		return fail(directory.ErrMailboxRefused)
+	} else if err != nil {
+		log.Printf("mailbox put: %v", err)
+		return fail(directory.ErrServer)
+	}
+	s.mu.Lock()
+	target := s.sessions[directory.NameKey(acct.Name)]
+	s.mu.Unlock()
+	if target != nil && target.peerID == rec.PeerID {
+		go s.pushPunch(target, directory.Push{Type: directory.PushMail})
+	}
+	return directory.Response{OK: true, User: acct.Name}
+}
+
+func (s *Server) mailboxFetch(sess *session) directory.Response {
+	user, _ := sess.loggedIn()
+	switch {
+	case user == "":
+		return fail(directory.ErrNotLoggedIn)
+	case s.mailbox == nil:
+		return fail(directory.ErrMailboxOff)
+	}
+	letters, more := s.mailbox.Fetch(user, sess.peerID)
+	return directory.Response{OK: true, Letters: letters, More: more}
+}
+
+func (s *Server) mailboxAck(sess *session, req directory.Request) directory.Response {
+	user, _ := sess.loggedIn()
+	switch {
+	case user == "":
+		return fail(directory.ErrNotLoggedIn)
+	case s.mailbox == nil:
+		return fail(directory.ErrMailboxOff)
+	case len(req.IDs) > directory.MaxAckIDs:
+		return fail(directory.ErrBadRequest)
+	}
+	s.mailbox.Ack(user, req.IDs)
+	return directory.Response{OK: true}
 }

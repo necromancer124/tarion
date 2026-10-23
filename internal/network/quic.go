@@ -261,6 +261,32 @@ func (nm *NetworkManager) handleStream(conn *quic.Conn, peerID string, stream *q
 	_ = wire.WriteFrame(stream, reply)
 }
 
+// Deliver hands a message that arrived some other way (the server mailbox)
+// to MessageChan, after the same checks and duplicate filter as a direct
+// message. msg.PeerID must already be proven. It waits up to wait for the
+// reader; a duplicate is dropped and reported as delivered.
+func (nm *NetworkManager) Deliver(msg IncomingMessage, wait time.Duration) error {
+	env := envelope{V: ProtocolVersion, Type: "msg", ID: msg.ID, From: msg.Name, Body: msg.Body}
+	if err := validateIncoming(env); err != nil {
+		return err
+	}
+	msg.Name = strings.TrimSpace(msg.Name)
+	key := msg.PeerID + "/" + msg.ID
+	if !nm.markSeen(key) {
+		return nil
+	}
+	select {
+	case nm.MessageChan <- msg:
+		return nil
+	case <-time.After(wait):
+		nm.unmarkSeen(key)
+		return ErrReceiverBusy
+	}
+}
+
+// ErrReceiverBusy means nobody is reading MessageChan fast enough.
+var ErrReceiverBusy = errors.New("receiver busy")
+
 func validateIncoming(env envelope) error {
 	switch {
 	case env.V != ProtocolVersion:
