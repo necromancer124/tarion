@@ -1,0 +1,19 @@
+name: Feature request
+description: Suggest an idea or improvement
+labels: [enhancement]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: What problem would this solve?
+    validations:
+      required: true
+  - type: textarea
+    id: idea
+    attributes:
+      label: What would you like to happen?
+  - type: textarea
+    id: privacy
+    attributes:
+      label: Privacy impact
+      description: Would this make the server see, store or relay anything new? Tarion's rule is that it shouldn't, unless every person involved opts in.
