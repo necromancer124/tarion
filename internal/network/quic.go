@@ -56,7 +56,7 @@ type NetworkManager struct {
 	MessageChan chan IncomingMessage
 	// Accept, if set before StartListener, is asked about every incoming
 	// message's sender key; an error refuses the message (the sender sees it).
-	Accept func(peerID string) error
+	Accept func(peerID, claimedName string) error
 
 	id       *identity.Identity
 	udp      *net.UDPConn
@@ -233,7 +233,7 @@ func (nm *NetworkManager) handleStream(conn *quic.Conn, peerID string, stream *q
 	}
 
 	if nm.Accept != nil {
-		if err := nm.Accept(peerID); err != nil {
+		if err := nm.Accept(peerID, strings.TrimSpace(env.From)); err != nil {
 			reply.Type, reply.Error = "nack", err.Error()
 			_ = wire.WriteFrame(stream, reply)
 			return

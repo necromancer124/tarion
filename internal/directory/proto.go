@@ -11,6 +11,7 @@ import (
 	"unicode"
 	"unicode/utf8"
 
+	"github.com/necromancer124/tarion/internal/devices"
 	"github.com/quic-go/quic-go"
 )
 
@@ -58,6 +59,14 @@ const (
 	OpMailboxPut   = "mailbox_put"   // leave Sealed for Target
 	OpMailboxFetch = "mailbox_fetch" // letters waiting for you
 	OpMailboxAck   = "mailbox_ack"   // delete IDs: you have them now
+
+	// Devices (package devices). A password login from a device the account
+	// doesn't know yet fails with ErrNotApproved and a pairing code in
+	// Detail; a device already on the account approves it with that code.
+	OpDevices       = "devices"        // the device chain of Target, or of your own account
+	OpDevicePending = "device_pending" // the device waiting with Code
+	OpDeviceApprove = "device_approve" // add Cert (signed by this device) for Code
+	OpDeviceRemove  = "device_remove"  // remove your device Target (a peer ID)
 )
 
 // Error codes in Response.Error.
@@ -85,6 +94,9 @@ const (
 	ErrMailboxRefused   = "mailbox_refused"  // the recipient turned theirs off
 	ErrMailboxFull      = "mailbox_full"     // the recipient's mailbox is full
 	ErrTooLarge         = "too_large"
+	ErrNotApproved      = "device_not_approved" // Detail: the pairing code to approve it with
+	ErrNoSuchCode       = "no_such_code"        // no device is waiting with that code
+	ErrDevice           = "device_refused"      // Detail says why (limit, last device, bad signature)
 )
 
 // QUIC application error codes tariond closes a session with.
@@ -92,6 +104,7 @@ const (
 	CodeReplaced quic.ApplicationErrorCode = 3 // a newer login took over
 	CodeBanned   quic.ApplicationErrorCode = 4 // the operator banned the account or key
 	CodeDeleted  quic.ApplicationErrorCode = 5 // the account was deleted
+	CodeRemoved  quic.ApplicationErrorCode = 6 // this device was removed from the account
 )
 
 type Request struct {
@@ -118,6 +131,36 @@ type Request struct {
 	BoxSig        []byte   `json:"box_sig,omitempty"`
 	Sealed        []byte   `json:"sealed,omitempty"` // mailbox_put
 	IDs           []string `json:"ids,omitempty"`    // mailbox_ack
+
+	// DeviceName (login, register) names this device for the device list.
+	DeviceName string `json:"device_name,omitempty"`
+	// Device picks one of Target's devices (relay, mailbox_put).
+	Device string        `json:"device,omitempty"`
+	Code   string        `json:"code,omitempty"` // device_pending, device_approve
+	Cert   *devices.Cert `json:"cert,omitempty"` // device_approve
+}
+
+// Device is one online device of a user (lookup).
+type Device struct {
+	PeerID     string   `json:"peer_id"`
+	Addr       string   `json:"addr"`
+	PublicAddr string   `json:"public_addr,omitempty"`
+	LocalAddrs []string `json:"local_addrs,omitempty"` // only when you share a public IP
+}
+
+// Box is one device's mailbox key (mailbox_key).
+type Box struct {
+	PeerID string `json:"peer_id"`
+	PubKey []byte `json:"pub_key"`
+	BoxKey []byte `json:"box_key"`
+	BoxSig []byte `json:"box_sig"`
+}
+
+// Pending is a device waiting for approval (device_pending).
+type Pending struct {
+	PeerID string `json:"peer_id"`
+	PubKey []byte `json:"pub_key"`
+	Name   string `json:"name"`
 }
 
 type Response struct {
@@ -139,11 +182,16 @@ type Response struct {
 	// PublicAddr (lookup) is the address the target advertised itself.
 	PublicAddr string `json:"public_addr,omitempty"`
 
-	// mailbox_key: the target's identity key, box key and the signature
-	// binding them. Clients check all three before sealing anything.
-	PubKey []byte `json:"pub_key,omitempty"`
-	BoxKey []byte `json:"box_key,omitempty"`
-	BoxSig []byte `json:"box_sig,omitempty"`
+	// mailbox_key: each device's identity key, box key and the signature
+	// binding them. Clients check them, and the devices against Certs,
+	// before sealing anything.
+	Boxes []Box `json:"boxes,omitempty"`
+	// Devices (lookup) are the target's online devices; Addr, PeerID and the
+	// rest above describe the one that logged in last. Certs (lookup,
+	// devices, mailbox_key) is the account's device chain.
+	Devices []Device       `json:"devices,omitempty"`
+	Certs   []devices.Cert `json:"certs,omitempty"`
+	Pending *Pending       `json:"pending,omitempty"`
 	// mailbox_fetch: letters waiting, oldest first; More means ask again.
 	Letters []Letter `json:"letters,omitempty"`
 	More    bool     `json:"more,omitempty"`

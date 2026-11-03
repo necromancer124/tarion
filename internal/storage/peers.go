@@ -15,8 +15,11 @@ import (
 // (trust on first use). After that, a different key using the same name is
 // treated as a different person.
 type Peer struct {
-	ID        string    `json:"id"`
-	Name      string    `json:"name"`
+	ID   string `json:"id"`
+	Name string `json:"name"`
+	// Devices are the contact's other device keys, verified through their
+	// account's device chain back to ID (package devices).
+	Devices   []string  `json:"devices,omitempty"`
 	Addr      string    `json:"addr,omitempty"`
 	FirstSeen time.Time `json:"first_seen"`
 	LastSeen  time.Time `json:"last_seen"`
@@ -135,11 +138,54 @@ func PeerByID(id string) (Peer, bool) {
 		return Peer{}, false
 	}
 	for _, p := range peers {
-		if strings.EqualFold(p.ID, id) {
+		if p.has(id) {
 			return p, true
 		}
 	}
 	return Peer{}, false
+}
+
+// has reports whether id is this contact's pinned key or a verified device.
+func (p *Peer) has(id string) bool {
+	if strings.EqualFold(p.ID, id) {
+		return true
+	}
+	for _, d := range p.Devices {
+		if strings.EqualFold(d, id) {
+			return true
+		}
+	}
+	return false
+}
+
+// PinDevices records a contact's verified devices. anchor is the key the
+// devices were verified from: the contact's pinned key, or on first contact
+// the root of their account, which becomes the pin.
+func PinDevices(name, anchor string, devices []string) error {
+	peersMu.Lock()
+	defer peersMu.Unlock()
+	peers, err := loadPeers()
+	if err != nil {
+		return err
+	}
+	others := make([]string, 0, len(devices))
+	for _, d := range devices {
+		if !strings.EqualFold(d, anchor) {
+			others = append(others, d)
+		}
+	}
+	for i := range peers {
+		if strings.EqualFold(peers[i].Name, name) {
+			if !strings.EqualFold(peers[i].ID, anchor) {
+				return &IdentityMismatchError{Name: name, Expected: peers[i].ID, Got: anchor}
+			}
+			peers[i].Devices = others
+			return savePeers(peers)
+		}
+	}
+	now := time.Now()
+	peers = append(peers, Peer{ID: anchor, Name: name, Devices: others, FirstSeen: now, LastSeen: now})
+	return savePeers(peers)
 }
 
 // ResolveIncoming picks the chat name for a message whose sender key was
@@ -155,8 +201,8 @@ func ResolveIncoming(peerID, claimedName, addr string) (string, error) {
 	}
 	now := time.Now()
 	for i := range peers {
-		if peers[i].ID == peerID {
-			if storableAddr(addr) {
+		if peers[i].has(peerID) {
+			if storableAddr(addr) && peers[i].ID == peerID {
 				peers[i].Addr = addr
 			}
 			peers[i].LastSeen = now
@@ -200,10 +246,10 @@ func PinOutgoing(name, peerID, addr string) error {
 	now := time.Now()
 	for i := range peers {
 		if strings.EqualFold(peers[i].Name, name) {
-			if peers[i].ID != peerID {
+			if !peers[i].has(peerID) {
 				return &IdentityMismatchError{Name: name, Expected: peers[i].ID, Got: peerID}
 			}
-			if storableAddr(addr) {
+			if storableAddr(addr) && peers[i].ID == peerID {
 				peers[i].Addr = addr
 			}
 			peers[i].LastSeen = now

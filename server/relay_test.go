@@ -34,14 +34,14 @@ func TestRelayIsOffByDefault(t *testing.T) {
 
 func TestRelayRefusedWhenTargetOptedOut(t *testing.T) {
 	alice, _ := relayPair(t, true, false)
-	if _, _, err := alice.dir.Relay("bob"); err == nil || !strings.Contains(err.Error(), "relay_refused") {
+	if _, _, err := alice.dir.Relay("bob", ""); err == nil || !strings.Contains(err.Error(), "relay_refused") {
 		t.Fatalf("expected relay_refused, got %v", err)
 	}
 }
 
 func TestRelayUnavailableWhenRequesterOptedOut(t *testing.T) {
 	alice, _ := relayPair(t, false, true)
-	if _, _, err := alice.dir.Relay("bob"); err == nil || !strings.Contains(err.Error(), "turned off") {
+	if _, _, err := alice.dir.Relay("bob", ""); err == nil || !strings.Contains(err.Error(), "turned off") {
 		t.Fatalf("expected the client to refuse, got %v", err)
 	}
 }
@@ -57,7 +57,7 @@ func TestRelayWhenDirectPathBlocked(t *testing.T) {
 		t.Fatal("direct send should fail behind the simulated strict NAT")
 	}
 
-	addr, peerID, err := alice.dir.Relay("bob")
+	addr, peerID, err := alice.dir.Relay("bob", "")
 	if err != nil || !relay.IsAddr(addr) || peerID != bob.nm.ID() {
 		t.Fatalf("relay: %q %q %v", addr, peerID, err)
 	}
@@ -90,7 +90,7 @@ func TestRelayCanBeDisabled(t *testing.T) {
 	alice := startClientCfg(t, directory.ClientConfig{Server: server, User: "alice", Pass: "correct-horse-1", AcceptRelay: true}, nil)
 	bob := startClientCfg(t, directory.ClientConfig{Server: server, User: "bob", Pass: "battery-staple-2", AcceptRelay: true}, nil)
 	waitFor(t, "both online", func() bool { return alice.dir.Connected() && bob.dir.Connected() })
-	if _, _, err := alice.dir.Relay("bob"); err == nil || !strings.Contains(err.Error(), "relay_disabled") {
+	if _, _, err := alice.dir.Relay("bob", ""); err == nil || !strings.Contains(err.Error(), "relay_disabled") {
 		t.Fatalf("expected relay_disabled, got %v", err)
 	}
 }
