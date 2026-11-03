@@ -34,7 +34,7 @@ var (
 func GetOutboxPath() string { return filepath.Join(GetBaseConfigDir(), "outbox.json") }
 
 func loadOutbox() ([]OutboxItem, error) {
-	data, err := os.ReadFile(GetOutboxPath())
+	data, err := readSealed(GetOutboxPath(), kindOutbox)
 	if os.IsNotExist(err) {
 		return nil, nil
 	}
@@ -53,7 +53,7 @@ func saveOutbox(items []OutboxItem) error {
 	if err != nil {
 		return err
 	}
-	return writeFileAtomic(GetOutboxPath(), data)
+	return writeSealed(GetOutboxPath(), kindOutbox, data)
 }
 
 // Outbox returns the queued messages, oldest first.

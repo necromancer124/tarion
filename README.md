@@ -202,7 +202,23 @@ The config is saved to:
 - `public_addr` (`-public-addr`): an address peers can reach you at directly, such as a port you forwarded by hand.
 - `port_mapping` is `auto` (default), `on` or `off` (`-port-mapping`): whether to ask your router to forward the chat port automatically. `auto` does it while the relay is off.
 
-The folder also holds `identity.key` (your private key, keep it secret), `peers.json` (pinned contacts), `outbox.json` (messages waiting to be delivered), `dropped.log` (messages given up on or refused), `revoked.json` (keys your server banned) and, while the background process runs, `control.token`.
+The folder also holds `identity.key` (your private key, keep it secret), `peers.json` (pinned contacts), `outbox.json` (messages waiting to be delivered), `dropped.log` (messages given up on or refused), `revoked.json` (keys your server banned), `vault.json` (see below) and, while the background process runs, `control.token`.
+
+### Your data on this computer
+
+Your identity key, chat history, contacts, queued messages and dropped-message log are **encrypted on disk** (XChaCha20-Poly1305 with a random data key), so someone who copies the folder, from a backup, a synced folder or a stolen laptop, can't read them or pose as you. `vault.json` holds the data key, protected one of two ways:
+
+- **Windows login (DPAPI), the default on Windows.** Turned on automatically, with nothing to type: Windows only unlocks it for your user account on this PC. Data from an older version is encrypted at the next start.
+- **A passphrase, on any OS.** `tarion protect passphrase` sets one (argon2id). Tarion asks for it at every start; `tarion background --detach` asks once and hands the unlocked key to the background process. If you forget it, the data can't be recovered: you'd log in again with your password (which links a new key) and start a new history.
+
+```powershell
+.\tarion.exe protect              # how is my data protected?
+.\tarion.exe protect passphrase   # use a passphrase instead
+.\tarion.exe protect windows      # back to the Windows login
+.\tarion.exe protect off          # store it unencrypted again
+```
+
+Stop the background process before changing this. Not encrypted: `config.json` (server, username, settings; the password only until your first login), `revoked.json`, and the names of history files, which are your contacts' names. On Linux and macOS, data stays unencrypted (file permissions only) unless you set a passphrase. A Windows password *reset* by an administrator, unlike a normal password change, makes DPAPI-protected data unreadable; set a passphrase if that's a risk for you.
 
 ## Controls
 
@@ -301,7 +317,7 @@ The directory uses ALPN `tarion-dir/1` with the same framing; see [`internal/dir
 - Networks that block UDP entirely can't use Tarion yet; a TCP transport is tracked in #13.
 - Without the mailbox, queued messages wait on the *sender's* device, so both of you need to be online at the same moment eventually. With it (opt-in), the server holds them sealed.
 - One device per account (#15).
-- `identity.key` and the history are stored unencrypted, protected by file permissions (#16).
+- On Linux and macOS, local data is only encrypted if you set a passphrase (`tarion protect passphrase`); the system keychain isn't used yet. History file names show your contacts' names.
 - Trust on first use: on the very first contact you trust the key the server reports. Compare `tarion id` with your contact, or put their `id` in `config.json`, to rule that out.
 
 ### Testing strict NATs

@@ -106,19 +106,11 @@ func Generate() (*Identity, error) {
 func LoadOrCreate(path string) (*Identity, error) {
 	data, err := os.ReadFile(path)
 	if err == nil {
-		block, _ := pem.Decode(data)
-		if block == nil {
-			return nil, fmt.Errorf("identity file %s is not PEM", path)
-		}
-		parsed, err := x509.ParsePKCS8PrivateKey(block.Bytes)
+		id, err := FromPEM(data)
 		if err != nil {
-			return nil, fmt.Errorf("parse identity %s: %w", path, err)
+			return nil, fmt.Errorf("identity %s: %w", path, err)
 		}
-		key, ok := parsed.(ed25519.PrivateKey)
-		if !ok {
-			return nil, fmt.Errorf("identity %s is not an Ed25519 key", path)
-		}
-		return fromKey(key)
+		return id, nil
 	}
 	if !os.IsNotExist(err) {
 		return nil, err
@@ -128,18 +120,43 @@ func LoadOrCreate(path string) (*Identity, error) {
 	if err != nil {
 		return nil, err
 	}
-	der, err := x509.MarshalPKCS8PrivateKey(id.Key)
+	pemData, err := id.PEM()
 	if err != nil {
 		return nil, err
 	}
 	if err := os.MkdirAll(filepath.Dir(path), 0700); err != nil {
 		return nil, err
 	}
-	pemData := pem.EncodeToMemory(&pem.Block{Type: "PRIVATE KEY", Bytes: der})
 	if err := os.WriteFile(path, pemData, 0600); err != nil {
 		return nil, err
 	}
 	return id, nil
+}
+
+// FromPEM parses an identity key written by PEM.
+func FromPEM(data []byte) (*Identity, error) {
+	block, _ := pem.Decode(data)
+	if block == nil {
+		return nil, errors.New("not PEM")
+	}
+	parsed, err := x509.ParsePKCS8PrivateKey(block.Bytes)
+	if err != nil {
+		return nil, fmt.Errorf("parse: %w", err)
+	}
+	key, ok := parsed.(ed25519.PrivateKey)
+	if !ok {
+		return nil, errors.New("not an Ed25519 key")
+	}
+	return fromKey(key)
+}
+
+// PEM encodes the private key (PKCS#8).
+func (id *Identity) PEM() ([]byte, error) {
+	der, err := x509.MarshalPKCS8PrivateKey(id.Key)
+	if err != nil {
+		return nil, err
+	}
+	return pem.EncodeToMemory(&pem.Block{Type: "PRIVATE KEY", Bytes: der}), nil
 }
 
 func fromKey(key ed25519.PrivateKey) (*Identity, error) {

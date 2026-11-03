@@ -47,7 +47,7 @@ func short(id string) string {
 }
 
 func loadPeers() ([]Peer, error) {
-	data, err := os.ReadFile(GetPeersPath())
+	data, err := readSealed(GetPeersPath(), kindPeers)
 	if os.IsNotExist(err) {
 		return nil, nil
 	}
@@ -63,7 +63,7 @@ func savePeers(peers []Peer) error {
 	if err != nil {
 		return err
 	}
-	return writeFileAtomic(GetPeersPath(), data)
+	return writeSealed(GetPeersPath(), kindPeers, data)
 }
 
 func writeFileAtomic(path string, data []byte) error {
