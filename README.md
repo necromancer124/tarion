@@ -238,7 +238,7 @@ Hole punching works with most home routers. When both sides are behind strict ("
 
 - **Automatic port forwarding (on by default while the relay is off).** At start, the client asks your router to forward its chat port, with UPnP first, then NAT-PMP. It checks that the router's internet address matches what the server sees, announces the address, and has the server send a test packet from a *different* port, the way a stranger would. Only if that packet arrives is the forward kept and given to people who look you up. The mapping is renewed while Tarion runs and removed when it exits (quitting the menu, Ctrl+C or `tarion stop`). If Tarion is killed instead, the router drops it by itself within an hour, because it is requested with a one-hour lease. The exception is routers that only allow permanent forwards: those keep it until Tarion's next start replaces it, or you delete it in the router's settings.
 
-  If it doesn't work, Tarion says why: no UPnP/NAT-PMP router answered, the router refused, the port is taken, your ISP shares one address between customers (carrier-grade NAT), there's a second router (double NAT), or a firewall blocked the test packet. It also lists what you can do. You see this in `background.log` and in the menu's status line, and `tarion portmap` retries at any time and prints the full explanation:
+  If it doesn't work, Tarion says why: no UPnP/NAT-PMP router answered, the router refused, the port is taken, your ISP shares one address between customers (carrier-grade NAT), there's a second router (double NAT), or a firewall blocked the test packet (on Windows it checks whether it was Windows Firewall, and `tarion firewall allow` fixes that; see [Firewalls](#firewalls)). It also lists what you can do. You see this in `background.log` and in the menu's status line, and `tarion portmap` retries at any time and prints the full explanation:
 
   ```powershell
   .\tarion.exe portmap
@@ -285,7 +285,15 @@ The directory uses ALPN `tarion-dir/1` with the same framing; see [`internal/dir
 - **What it can't see:** messages, usernames, passwords, or the server's password hashes (those never leave the server). There is nothing in the traffic to "crack".
 - **TLS-inspecting firewalls** (company proxies with their own root certificate) can't read Tarion either. Peers and the server are pinned by key, not trusted through certificate authorities, so an interception attempt makes the connection fail instead of being decrypted.
 - **Blocking:** a firewall can still block Tarion, either by ALPN or by blocking UDP altogether (common on company and school networks). Strict NATs can be handled by a forwarded port or the opt-in relay, but a network that blocks UDP stops Tarion completely; a TCP transport is tracked in #13.
-- **Your own PC's firewall** (Windows Defender may ask the first time): allowing it is best. If you decline, connections still work, because Tarion punches outward first, which opens a temporary opening for that peer.
+- **Your own PC's firewall.** Windows Firewall blocks incoming connections by default. Its "Allow access" prompt only appears for a program running in a window, never for the background process, and clicking "Cancel" on it creates a rule that *blocks* Tarion. Without an allow rule you can still message people and they can answer, because Tarion sends outward first and that opens a temporary path for that peer. But a forwarded port won't work, and people can't connect to you first. Tarion checks this:
+
+  ```powershell
+  .\tarion.exe firewall          # does Windows Firewall let people reach you?
+  .\tarion.exe firewall allow    # add a rule (Windows asks for administrator permission once)
+  .\tarion.exe firewall remove   # delete it again
+  ```
+
+  The rule covers only incoming UDP to `tarion.exe` on its chat port, and `allow` first removes old rules for the program, including a block rule from a "Cancel" click. The background process warns at startup when the firewall is in the way. When port forwarding fails because of it, `tarion portmap` says so and gives the fix, including the `netsh` command if you'd rather add the rule yourself. Linux and macOS firewalls aren't checked; allow the port yourself there, for example `sudo ufw allow 63426/udp`.
 - **Server:** open UDP 63425 inbound. Clients need no inbound rules or port forwarding.
 
 ### Known limitations
