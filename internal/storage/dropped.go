@@ -44,7 +44,7 @@ func LogDropped(d DroppedMessage) error {
 	if err != nil {
 		return err
 	}
-	_, err = f.Write(append(line, '\n'))
+	_, err = f.WriteString(sealLine(kindDropped, string(line)) + "\n")
 	_ = f.Close()
 	if err != nil {
 		return err
@@ -73,6 +73,10 @@ func ReadDropped(n int) ([]DroppedMessage, error) {
 	}
 	var out []DroppedMessage
 	for _, l := range lines {
+		l, err := openLine(kindDropped, l)
+		if err != nil {
+			return nil, err
+		}
 		var d DroppedMessage
 		if json.Unmarshal([]byte(l), &d) == nil {
 			out = append(out, d)

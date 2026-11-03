@@ -18,7 +18,7 @@ Anything that breaks the promises in the [security model](README.md#security-mod
 - logging in to someone else's account, or bypassing bans, invites or rate limits;
 - crashing or exhausting a client or `tariond` remotely.
 
-Known limitations listed in the README (for example, local files protected only by file permissions, #16) are tracked as normal issues.
+Known limitations listed in the README (for example, contact names visible in history file names) are tracked as normal issues. A way to read encrypted local data without the Windows login or the passphrase does count.
 
 ## Supported versions
 

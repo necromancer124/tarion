@@ -1,7 +1,6 @@
 package storage
 
 import (
-	"bufio"
 	"encoding/json"
 	"os"
 	"path/filepath"
@@ -191,30 +190,30 @@ func AppendHistory(username, message string) error {
 		return err
 	}
 	defer f.Close()
-	_, err = f.WriteString(message + "\n")
+	_, err = f.WriteString(sealLine(kindHistory, message) + "\n")
 	return err
 }
 
 func ReadHistory(username string) ([]string, error) {
-	f, err := os.Open(GetHistoryPath(username))
+	raw, err := readRawLines(GetHistoryPath(username))
 	if err != nil {
 		if os.IsNotExist(err) {
 			return []string{}, nil
 		}
 		return nil, err
 	}
-	defer f.Close()
-
-	var lines []string
-	scanner := bufio.NewScanner(f)
-	for scanner.Scan() {
-		line := scanner.Text()
+	lines := make([]string, 0, len(raw))
+	for _, l := range raw {
+		line, err := openLine(kindHistory, l)
+		if err != nil {
+			return nil, err
+		}
 		if strings.HasPrefix(line, peerAddrPrefix) {
 			continue
 		}
 		lines = append(lines, line)
 	}
-	return lines, scanner.Err()
+	return lines, nil
 }
 
 func ListHistoryContacts() ([]Contact, error) {

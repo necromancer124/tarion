@@ -1223,7 +1223,7 @@ func recordIncoming(msg network.IncomingMessage) (chat, line string) {
 }
 
 func loadIdentity() (*identity.Identity, error) {
-	return identity.LoadOrCreate(storage.GetIdentityPath())
+	return storage.LoadOrCreateIdentity()
 }
 
 // knownAddr is a contact's fixed address from config, else the address it
@@ -1874,6 +1874,9 @@ func runBackground(args []string) error {
 		// Settings were saved above; the child reads them from config so the
 		// password never appears in its command line.
 		detachedArgs := append([]string{"background"}, fs.Args()...)
+		// The child has no terminal to ask for a passphrase: hand it the
+		// unlocked data key.
+		defer passDataKey(storage.DataKey())()
 		if err := startDetached(detachedArgs, backgroundLogPath()); err != nil {
 			return err
 		}
@@ -2348,6 +2351,7 @@ func printGeneralHelp() {
 		"  listen      Print incoming messages as JSON lines (for scripts and apps)",
 		"  history     Print a chat's recent history",
 		"  portmap     Ask the router to forward your port again, and explain the result",
+		"  protect     Show or change how your local data is encrypted (passphrase, windows, off)",
 		"  outbox      List messages waiting to be delivered",
 		"  dropped     List messages that were given up on or refused",
 		"  passwd      Change your account password",
@@ -2387,13 +2391,28 @@ func main() {
 	cmd := "start"
 	if len(args) > 0 {
 		switch args[0] {
-		case "start", "menu", "background", "stop", "send", "listen", "history", "portmap", "outbox", "dropped", "passwd", "delete-account", "id", "peers", "forget":
+		case "start", "menu", "background", "stop", "send", "listen", "history", "portmap", "outbox", "dropped", "passwd", "delete-account", "id", "peers", "forget", "protect":
 			cmd, args = args[0], args[1:]
 		}
 	}
 
 	var err error
 	switch cmd {
+	case "stop", "send", "listen", "protect":
+		// These only talk to the background process, or unlock by themselves.
+	default:
+		if os.Getenv("TARION_BACKGROUND_CHILD") == "1" && os.Getenv(dataKeyEnv) == "" {
+			break // the child of an unprotected background: nothing to unlock
+		}
+		err = unlockData()
+	}
+	if err != nil {
+		err = fmt.Errorf("could not unlock your Tarion data: %w", err)
+		cmd = ""
+	}
+	switch cmd {
+	case "protect":
+		err = runProtect(args)
 	case "background":
 		err = runBackground(args)
 	case "stop":
