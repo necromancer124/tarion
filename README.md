@@ -10,6 +10,7 @@ Peer-to-peer, end-to-end encrypted chat for the terminal, over QUIC.
 [![Release](https://img.shields.io/github/v/release/necromancer124/tarion?include_prereleases&sort=semver)](https://github.com/necromancer124/tarion/releases)
 [![Go](https://img.shields.io/github/go-mod/go-version/necromancer124/tarion)](go.mod)
 ![Platforms](https://img.shields.io/badge/platforms-Windows%20%7C%20Linux%20%7C%20macOS-informational)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue)](LICENSE)
 
 [Quick start](#quick-start) · [Features](#features) · [Commands](#commands) · [Security model](#security-model) · [Run a server](server/README.md) · [Local API](docs/local-api.md)
 
@@ -302,3 +303,7 @@ Set `TARION_SIMULATE_STRICT_NAT=1` before starting a client. It then drops every
 ## Privacy
 
 The server handles login and address lookup. By default it never carries messages: chats go directly between the two people. Only if everyone involved turns the relay on does it forward encrypted packets it can't read, and only if everyone turns the mailbox on does it hold letters sealed to the recipient, which it can't read either. Either way, chats are end-to-end encrypted with mutually authenticated TLS 1.3. The server's user list shows names only, not IP addresses. Local history is stored as plain text in the config folder with owner-only permissions.
+
+## License
+
+MIT. See [LICENSE](LICENSE).
