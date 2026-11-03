@@ -1,0 +1,45 @@
+name: Bug report
+description: Something doesn't work as described
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for reporting! **Security problems go through a private report instead** (see SECURITY.md), not here.
+        Never paste `identity.key`, a `config.json` with a password in it, or `control.token`.
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened?
+      description: What you did, what you expected, and what you got instead.
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to reproduce
+      placeholder: |
+        1. tarion start -server ... -user alice
+        2. send a message to bob
+        3. ...
+  - type: textarea
+    id: logs
+    attributes:
+      label: Output or logs
+      description: Relevant lines from the terminal, background.log, `tarion dropped` or the server log.
+      render: text
+  - type: input
+    id: version
+    attributes:
+      label: Version
+      description: Release tag or commit (`git rev-parse --short HEAD`).
+  - type: dropdown
+    id: os
+    attributes:
+      label: Operating system
+      options: [Windows, Linux, macOS, Docker, Other]
+  - type: dropdown
+    id: part
+    attributes:
+      label: Which part?
+      options: [Client (tarion), Server (tariond), Both / not sure]

@@ -1,8 +1,53 @@
+<div align="center">
+
 # Tarion
 
 **No middleman. No doorman. You open your own doors.**
 
+Peer-to-peer, end-to-end encrypted chat for the terminal, over QUIC.
+
+[![CI](https://github.com/necromancer124/tarion/actions/workflows/ci.yml/badge.svg?branch=master)](https://github.com/necromancer124/tarion/actions/workflows/ci.yml)
+[![Release](https://img.shields.io/github/v/release/necromancer124/tarion?include_prereleases&sort=semver)](https://github.com/necromancer124/tarion/releases)
+[![Go](https://img.shields.io/github/go-mod/go-version/necromancer124/tarion)](go.mod)
+![Platforms](https://img.shields.io/badge/platforms-Windows%20%7C%20Linux%20%7C%20macOS-informational)
+
+[Quick start](#quick-start) · [Features](#features) · [Commands](#commands) · [Security model](#security-model) · [Run a server](server/README.md) · [Local API](docs/local-api.md)
+
+</div>
+
 Tarion is a hybrid peer-to-peer CLI chat over QUIC. Chats go directly between peers. A small directory server, `tariond` in [`server/`](server/README.md), tells peers where to find each other and helps them through home routers (NAT). Every install has its own Ed25519 identity key, and peers authenticate each other with it (see [Security model](#security-model)).
+
+## Features
+
+- **Direct, end-to-end encrypted.** Mutually authenticated TLS 1.3 over QUIC between the two people, with keys pinned on first contact.
+- **Gets through home routers.** NAT hole punching, automatic UPnP / NAT-PMP port forwarding with a real reachability test, or a port you forward yourself.
+- **Opt-in fallbacks.** A relay for strict NATs and a mailbox for offline contacts. Both are off unless you, the other person and the server operator all turn them on, and neither can read your messages.
+- **Nothing gets lost quietly.** Undeliverable messages are queued and retried for 7 days; anything given up on or refused is logged.
+- **You decide.** Who may message you (`-accept contacts`), whose bans you honor (`-server-bans`), and whether anything may pass through a server (`-relay`, `-mailbox`).
+- **Run your own server.** `tariond` is one small binary or a Docker image: invite-only mode, bans, argon2id passwords, rate limits.
+- **Scriptable.** A background process with a local JSON API for bots and apps.
+
+## Quick start
+
+1. **Get the binaries.** Download `tarion` (and `tariond` if you host a server) from [Releases](https://github.com/necromancer124/tarion/releases), or build them with Go:
+
+   ```bash
+   go build -o out/ . ./server
+   ```
+
+2. **Start a server**, or use one a friend runs ([details](server/README.md)):
+
+   ```bash
+   ./tariond -data ./tariond-data        # open UDP 63425 in your firewall
+   ```
+
+3. **Log in and chat.** The first login creates your account and links this device's key to it:
+
+   ```powershell
+   .\tarion.exe start -server SERVER:63425 -user alice -pass "a long passphrase"
+   ```
+
+   After that, `tarion start` is enough. Pick a contact from the list and type.
 
 ## Why I built Tarion
 
