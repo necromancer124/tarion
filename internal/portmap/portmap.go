@@ -165,7 +165,7 @@ func DoubleNAT(routerIP, seenIP string) string {
 
 // Unreachable explains a mapping that a test packet could not get through.
 func Unreachable(addr string, port int) string {
-	return fmt.Sprintf("the router says UDP port %d is forwarded, but a test packet the server sent to %s from another port did not arrive. Usually a firewall blocks it: allow tarion (UDP %d) in Windows Firewall or your router's firewall, then run: tarion portmap", port, addr, port)
+	return fmt.Sprintf("the router says UDP port %d is forwarded, but a test packet the server sent to %s from another port did not arrive. Usually a firewall blocks it: allow UDP %d in your router's firewall or this computer's (on Windows: tarion firewall allow), then run: tarion portmap", port, addr, port)
 }
 
 var errTimeout = errors.New("timed out")

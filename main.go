@@ -22,6 +22,7 @@ import (
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
 	"github.com/necromancer124/tarion/internal/directory"
+	"github.com/necromancer124/tarion/internal/firewall"
 	"github.com/necromancer124/tarion/internal/identity"
 	"github.com/necromancer124/tarion/internal/network"
 	"github.com/necromancer124/tarion/internal/portmap"
@@ -115,6 +116,8 @@ type node struct {
 	outboxMu    sync.Mutex    // one outbox pass at a time
 	outboxWake  chan struct{} // nudges the outbox loop
 	sendTimeout time.Duration // per public-address attempt; tests shorten it
+
+	firewall func(port int) firewall.Status // nil: check the real firewall
 }
 
 // isRevoked reports whether the server banned this key.
@@ -668,6 +671,9 @@ func (n *node) mapPort() (bool, string) {
 		case !reachable:
 			_ = n.dir.SetPublicAddr("")
 			drop()
+			if why := n.firewallBlocked(fmt.Sprintf("UDP %d (%s via %s)", n.cfg.Port, m.Addr(), m.Method)); why != "" {
+				return fail(why)
+			}
 			return fail("automatic port forwarding did not work:\n  - " + m.Method + ": " + portmap.Unreachable(m.Addr(), n.cfg.Port) + "\n" + portmap.Advice(n.cfg.Port))
 		}
 	}
@@ -1914,6 +1920,7 @@ func runBackground(args []string) error {
 	})
 	go n.watchStatus(func(s string) { fmt.Println(s) })
 	n.setLogger(func(s string) { fmt.Println(s) })
+	go n.warnFirewall()
 	n.startPortMapping()
 
 	stop := make(chan os.Signal, 1)
@@ -2351,6 +2358,7 @@ func printGeneralHelp() {
 		"  listen      Print incoming messages as JSON lines (for scripts and apps)",
 		"  history     Print a chat's recent history",
 		"  portmap     Ask the router to forward your port again, and explain the result",
+		"  firewall    Check Windows Firewall; 'firewall allow' lets people reach you",
 		"  protect     Show or change how your local data is encrypted (passphrase, windows, off)",
 		"  outbox      List messages waiting to be delivered",
 		"  dropped     List messages that were given up on or refused",
@@ -2391,14 +2399,14 @@ func main() {
 	cmd := "start"
 	if len(args) > 0 {
 		switch args[0] {
-		case "start", "menu", "background", "stop", "send", "listen", "history", "portmap", "outbox", "dropped", "passwd", "delete-account", "id", "peers", "forget", "protect":
+		case "start", "menu", "background", "stop", "send", "listen", "history", "portmap", "firewall", "outbox", "dropped", "passwd", "delete-account", "id", "peers", "forget", "protect":
 			cmd, args = args[0], args[1:]
 		}
 	}
 
 	var err error
 	switch cmd {
-	case "stop", "send", "listen", "protect":
+	case "stop", "send", "listen", "protect", "firewall":
 		// These only talk to the background process, or unlock by themselves.
 	default:
 		if os.Getenv("TARION_BACKGROUND_CHILD") == "1" && os.Getenv(dataKeyEnv) == "" {
@@ -2425,6 +2433,8 @@ func main() {
 		err = runHistory(args)
 	case "portmap":
 		err = runPortmap(args)
+	case "firewall":
+		err = runFirewall(args)
 	case "outbox":
 		err = runOutbox(args)
 	case "dropped":
