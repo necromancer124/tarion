@@ -99,6 +99,9 @@ type node struct {
 	revokedMu sync.RWMutex
 	revoked   map[string]bool // keys banned by the server
 
+	learnMu    sync.Mutex
+	learnTried map[string]time.Time // keys recently checked against a contact's device chain
+
 	relayedMu sync.Mutex
 	relayed   map[string]relaySession // contacts last reached via the relay
 
@@ -145,8 +148,13 @@ func (n *node) setRevoked(keys []string) {
 var errRevoked = errors.New("banned on your server")
 
 // accept filters incoming messages: never from banned keys, and only from
-// contacts when cfg.Accept is "contacts".
-func (n *node) accept(peerID string) error {
+// contacts when cfg.Accept is "contacts". A key you don't know yet that
+// claims a contact's name is first checked against that contact's device
+// chain: if it is one of their devices, it is pinned as theirs.
+func (n *node) accept(peerID, claimedName string) error {
+	if _, known := storage.PeerByID(peerID); !known {
+		n.learnDevice(storage.CleanName(claimedName), peerID)
+	}
 	err := n.acceptRule(peerID)
 	if err != nil {
 		from := "peer-" + identity.Short(peerID)
@@ -293,6 +301,7 @@ func startNode(cfg *storage.Config, id *identity.Identity) (*node, error) {
 			ServerID:      cfg.ServerID,
 			AcceptRelay:   cfg.RelayEnabled(),
 			PublicAddr:    cfg.PublicAddr,
+			DeviceName:    deviceName(),
 			AcceptMailbox: cfg.MailboxEnabled(),
 			BoxKey:        boxKey,
 			BoxSig:        boxSig,
@@ -768,6 +777,12 @@ var (
 	errNoAddress = errors.New("no address")
 )
 
+// deviceTarget is one device of a contact to deliver to.
+type deviceTarget struct {
+	peerID     string   // "" when the key isn't known in advance (address only)
+	candidates []string // addresses, best first
+}
+
 func (n *node) deliverMsg(id string, sent time.Time, to, addr, body string) error {
 	// Refuse a banned contact up front: once the ban disconnects them they
 	// look merely offline, and the message would sit in the outbox.
@@ -777,26 +792,43 @@ func (n *node) deliverMsg(id string, sent time.Time, to, addr, body string) erro
 	if id := configuredID(n.cfg, to); id != "" && n.isRevoked(id) {
 		return fmt.Errorf("%s is %w", to, errRevoked)
 	}
-	var candidates []string
-	dirID := ""
+	var targets []deviceTarget
 	offline := false
 	if n.dir != nil && n.dir.Connected() && directory.ValidUsername(to) {
 		resp, err := n.dir.Lookup(to)
 		switch {
 		case err == nil:
-			dirID = resp.PeerID
-			// LAN first, then an address they made reachable themselves
-			// (a forwarded port), then the one the server observed.
-			candidates = append(candidates, resp.LocalAddrs...)
-			if resp.PublicAddr != "" && resp.PublicAddr != resp.Addr {
-				candidates = append(candidates, resp.PublicAddr)
+			devs := resp.Devices
+			if len(devs) == 0 { // a server from before multi-device support
+				devs = []directory.Device{{PeerID: resp.PeerID, Addr: resp.Addr, PublicAddr: resp.PublicAddr, LocalAddrs: resp.LocalAddrs}}
 			}
-			candidates = append(candidates, resp.Addr)
+			verified, err := n.verifiedDevices(to, resp.Certs)
+			if err != nil {
+				return err
+			}
+			var unverified string
+			for _, d := range devs {
+				if verified != nil && !verified[d.PeerID] {
+					unverified = d.PeerID // not part of their account's chain: skip it
+					continue
+				}
+				// LAN first, then an address they made reachable themselves
+				// (a forwarded port), then the one the server observed.
+				t := deviceTarget{peerID: d.PeerID, candidates: append([]string(nil), d.LocalAddrs...)}
+				if d.PublicAddr != "" && d.PublicAddr != d.Addr {
+					t.candidates = append(t.candidates, d.PublicAddr)
+				}
+				targets = append(targets, deviceTarget{peerID: t.peerID, candidates: append(t.candidates, d.Addr)})
+			}
+			if len(targets) == 0 && unverified != "" {
+				p, _ := storage.PeerByName(to)
+				return &storage.IdentityMismatchError{Name: to, Expected: p.ID, Got: unverified}
+			}
 		case errors.Is(err, directory.ErrUserOffline):
 			offline = true
 		}
 	}
-	if len(candidates) == 0 {
+	if len(targets) == 0 {
 		if addr == "" {
 			addr = knownAddr(n.cfg, to)
 		}
@@ -806,9 +838,52 @@ func (n *node) deliverMsg(id string, sent time.Time, to, addr, body string) erro
 			}
 			return fmt.Errorf("%w for %s", errNoAddress, to)
 		}
-		candidates = []string{addr}
+		targets = []deviceTarget{{candidates: []string{addr}}}
 	}
 
+	// Every online device gets the message, at the same time; one is
+	// enough for it to count as delivered. They all get the same ID, so
+	// none shows it twice.
+	results := make(chan error, len(targets))
+	for _, t := range targets {
+		go func() { results <- n.deliverToDevice(id, sent, to, body, t) }()
+	}
+	var firstErr, identityErr error
+	delivered := false
+	for range targets {
+		err := <-results
+		switch {
+		case err == nil:
+			delivered = true
+		case isIdentityErr(err) && identityErr == nil:
+			identityErr = err
+		case firstErr == nil:
+			firstErr = err
+		}
+	}
+	switch {
+	case delivered:
+		return nil
+	case identityErr != nil:
+		return identityErr
+	case offline:
+		// The server says they're offline; we only tried an old address.
+		return fmt.Errorf("%s is %w (nothing at their last known address: %w)", to, errOffline, firstErr)
+	}
+	return firstErr
+}
+
+// isIdentityErr: errors that end an attempt: a wrong or banned key, or the
+// peer was reached and refused. Trying their other addresses (or the
+// relay) would only repeat the same answer.
+func isIdentityErr(err error) bool {
+	var mismatch *storage.IdentityMismatchError
+	var rejected *network.RejectedError
+	return errors.As(err, &mismatch) || errors.Is(err, errRevoked) || errors.As(err, &rejected)
+}
+
+// deliverToDevice tries one device's addresses, then the relay.
+func (n *node) deliverToDevice(id string, sent time.Time, to, body string, t deviceTarget) error {
 	configured := configuredID(n.cfg, to)
 	attempt := func(cand string, timeout time.Duration, wantID string) error {
 		ctx, cancel := context.WithTimeout(context.Background(), timeout)
@@ -817,7 +892,7 @@ func (n *node) deliverMsg(id string, sent time.Time, to, addr, body string) erro
 			if n.isRevoked(peerID) {
 				return fmt.Errorf("%s is %w", to, errRevoked)
 			}
-			if configured != "" && !strings.EqualFold(configured, peerID) {
+			if configured != "" && !strings.EqualFold(configured, peerID) && wantID == "" {
 				return &storage.IdentityMismatchError{Name: to, Expected: configured, Got: peerID}
 			}
 			if wantID != "" && !strings.EqualFold(wantID, peerID) {
@@ -827,43 +902,36 @@ func (n *node) deliverMsg(id string, sent time.Time, to, addr, body string) erro
 		})
 		return err
 	}
-	// final errors end the attempt: a wrong or banned key, or the peer was
-	// reached and refused. Trying their other addresses (or the relay)
-	// would only repeat the same answer.
-	isIdentityErr := func(err error) bool {
-		var mismatch *storage.IdentityMismatchError
-		var rejected *network.RejectedError
-		return errors.As(err, &mismatch) || errors.Is(err, errRevoked) || errors.As(err, &rejected)
-	}
 
-	// When the server knows the contact, it can relay if the direct path
+	// When the server knows the device, it can relay if the direct path
 	// fails (strict NATs). The packets stay end-to-end encrypted.
-	canRelay := dirID != "" && n.cfg.RelayEnabled()
+	relayKey := to + "/" + t.peerID
+	canRelay := t.peerID != "" && n.cfg.RelayEnabled()
 	viaRelay := func() error {
-		// Reuse the contact's relay session while it is alive; the server
+		// Reuse the device's relay session while it is alive; the server
 		// caps how many each user may hold open.
-		if s, ok := n.relaySession(to); ok {
+		if s, ok := n.relaySession(relayKey); ok {
 			err := attempt(s.addr, 3*time.Second, s.peerID)
 			if err == nil {
-				n.setRelaySession(to, s)
+				n.setRelaySession(relayKey, s)
 				return nil
 			}
 			if isIdentityErr(err) {
 				return err
 			}
 		}
-		raddr, relayID, err := n.dir.Relay(to)
+		raddr, relayID, err := n.dir.Relay(to, t.peerID)
 		if err != nil {
 			return err
 		}
 		if err := attempt(raddr, n.sendTimeout, relayID); err != nil {
 			return err
 		}
-		n.setRelaySession(to, relaySession{addr: raddr, peerID: relayID})
+		n.setRelaySession(relayKey, relaySession{addr: raddr, peerID: relayID})
 		return nil
 	}
 	triedRelay := false
-	if canRelay && n.relayedRecently(to) {
+	if canRelay && n.relayedRecently(relayKey) {
 		triedRelay = true
 		if err := viaRelay(); err == nil || isIdentityErr(err) {
 			return err
@@ -871,17 +939,17 @@ func (n *node) deliverMsg(id string, sent time.Time, to, addr, body string) erro
 	}
 
 	var lastErr error
-	for i, cand := range candidates {
+	for i, cand := range t.candidates {
 		timeout := n.sendTimeout
 		if canRelay {
 			timeout /= 2 // the relay is the fallback, don't wait the full time
 		}
-		if i < len(candidates)-1 {
+		if i < len(t.candidates)-1 {
 			timeout = 3 * time.Second // a LAN address either answers fast or is wrong
 		}
-		err := attempt(cand, timeout, dirID)
+		err := attempt(cand, timeout, t.peerID)
 		if err == nil {
-			n.clearRelay(to)
+			n.clearRelay(relayKey)
 			return nil
 		}
 		if isIdentityErr(err) {
@@ -895,10 +963,6 @@ func (n *node) deliverMsg(id string, sent time.Time, to, addr, body string) erro
 			return err
 		}
 		return fmt.Errorf("%w (relay: %v)", lastErr, err)
-	}
-	if offline {
-		// The server says they're offline; we only tried an old address.
-		return fmt.Errorf("%s is %w (nothing at their last known address: %w)", to, errOffline, lastErr)
 	}
 	return lastErr
 }
@@ -1168,6 +1232,13 @@ func handleControlConn(conn net.Conn, token string, n *node) {
 		} else {
 			reply(errors.New(report))
 		}
+	case "devices":
+		lines, err := n.deviceControl(req)
+		if err != nil {
+			reply(err)
+			return
+		}
+		send(controlResponse{OK: true, Lines: lines})
 	case "change_password", "delete_account":
 		if n.dir == nil || !n.dir.Connected() {
 			reply(errors.New("not connected to a server"))
@@ -2322,7 +2393,11 @@ func runPeers() error {
 		return nil
 	}
 	for _, p := range peers {
-		fmt.Printf("%-20s %s  last %s  %s\n", p.Name, identity.Fingerprint(p.ID), p.LastSeen.Format("2006-01-02 15:04"), p.Addr)
+		devs := ""
+		if len(p.Devices) > 0 {
+			devs = fmt.Sprintf("  +%d verified device(s)", len(p.Devices))
+		}
+		fmt.Printf("%-20s %s  last %s  %s%s\n", p.Name, identity.Fingerprint(p.ID), p.LastSeen.Format("2006-01-02 15:04"), p.Addr, devs)
 	}
 	return nil
 }
@@ -2362,6 +2437,7 @@ func printGeneralHelp() {
 		"  protect     Show or change how your local data is encrypted (passphrase, windows, off)",
 		"  outbox      List messages waiting to be delivered",
 		"  dropped     List messages that were given up on or refused",
+		"  devices     List your devices; 'devices approve CODE' adds one, 'devices remove' takes one off",
 		"  passwd      Change your account password",
 		"  delete-account  Delete your account on the server",
 		"  id          Show your peer ID so contacts can verify you",
@@ -2399,7 +2475,7 @@ func main() {
 	cmd := "start"
 	if len(args) > 0 {
 		switch args[0] {
-		case "start", "menu", "background", "stop", "send", "listen", "history", "portmap", "firewall", "outbox", "dropped", "passwd", "delete-account", "id", "peers", "forget", "protect":
+		case "start", "menu", "background", "stop", "send", "listen", "history", "portmap", "firewall", "outbox", "dropped", "passwd", "delete-account", "id", "peers", "forget", "protect", "devices":
 			cmd, args = args[0], args[1:]
 		}
 	}
@@ -2435,6 +2511,8 @@ func main() {
 		err = runPortmap(args)
 	case "firewall":
 		err = runFirewall(args)
+	case "devices":
+		err = runDevices(args)
 	case "outbox":
 		err = runOutbox(args)
 	case "dropped":

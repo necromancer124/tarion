@@ -10,6 +10,8 @@
 //	tariond ban <name|peer-id>     ban (takes effect within seconds)
 //	tariond unban <name|peer-id>
 //	tariond delete <name>          delete an account (frees the name)
+//	tariond devices <name>         list an account's devices
+//	tariond devices reset <name>   forget them all (the user lost every device)
 //	tariond id                     print the server ID
 package main
 
@@ -22,6 +24,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"syscall"
+	"time"
 
 	"github.com/necromancer124/tarion/internal/directory"
 	"github.com/necromancer124/tarion/internal/identity"
@@ -32,7 +35,7 @@ import (
 // TARIOND_DATA environment variable) so Docker needs a single volume and
 // operator commands find the same files as the running server.
 type paths struct {
-	data, users, legacy, key, invites, bans, deletions, mailbox string
+	data, users, legacy, key, invites, bans, deletions, resets, mailbox string
 }
 
 func addPathFlags(fs *flag.FlagSet) func() paths {
@@ -61,6 +64,7 @@ func addPathFlags(fs *flag.FlagSet) func() paths {
 			invites:   or(*inv, "invites"),
 			bans:      or(*bans, "bans.txt"),
 			deletions: filepath.Join(*data, "deletions"),
+			resets:    filepath.Join(*data, "device-resets"),
 			mailbox:   filepath.Join(*data, "mailbox"),
 		}
 	}
@@ -72,7 +76,7 @@ func main() {
 	cmd := "serve"
 	if len(args) > 0 {
 		switch args[0] {
-		case "serve", "invite", "accounts", "ban", "unban", "delete", "id":
+		case "serve", "invite", "accounts", "ban", "unban", "delete", "devices", "id":
 			cmd, args = args[0], args[1:]
 		}
 	}
@@ -88,6 +92,8 @@ func main() {
 		err = runBan(args, cmd == "ban")
 	case "delete":
 		err = runDelete(args)
+	case "devices":
+		err = runDevices(args)
 	case "id":
 		err = runID(args)
 	}
@@ -160,6 +166,7 @@ func serve(args []string) error {
 		Registration: *reg,
 		InvitesDir:   p.invites,
 		DeletionsDir: p.deletions,
+		ResetsDir:    p.resets,
 		Relay:        *relayOn,
 		RelayRate:    *relayKBps * 1024,
 		RelayTotal:   *relayTotalKBps * 1024,
@@ -237,12 +244,15 @@ func runAccounts(args []string) error {
 		return nil
 	}
 	for _, u := range list {
-		key, note := "(not linked yet)", ""
+		key, note := "(no device yet)", ""
 		if u.PeerID != "" {
 			key = identity.Fingerprint(u.PeerID)
 		}
+		if n := u.activeCount(); n > 1 {
+			note = fmt.Sprintf("  %d devices (tariond devices %s)", n, u.Name)
+		}
 		if bans.Banned(u.Name, u.PeerID) {
-			note = "  BANNED"
+			note += "  BANNED"
 		}
 		fmt.Printf("%-20s %s  created %s%s\n", u.Name, key, u.Created.Format("2006-01-02"), note)
 	}
@@ -306,6 +316,52 @@ func runDelete(args []string) error {
 		return err
 	}
 	fmt.Printf("deletion of %s requested; a running server applies it within a few seconds (otherwise at its next start)\n", rest[0])
+	return nil
+}
+
+// runDevices lists an account's devices, or resets them (recovery when the
+// user lost every device; their next password login becomes the first).
+func runDevices(args []string) error {
+	fs := flag.NewFlagSet("devices", flag.ExitOnError)
+	getPaths := addPathFlags(fs)
+	rest := parseInterspersed(fs, args)
+	reset := len(rest) == 2 && rest[0] == "reset"
+	if reset {
+		rest = rest[1:]
+	}
+	if len(rest) != 1 || !directory.ValidUsername(rest[0]) {
+		return fmt.Errorf("usage: tariond devices <username>   or   tariond devices reset <username>")
+	}
+	p := getPaths()
+	if reset {
+		if err := (deletions{dir: p.resets}).Request(rest[0]); err != nil {
+			return err
+		}
+		fmt.Printf("reset of %s's devices requested; a running server applies it within a few seconds (otherwise at its next start).\n", rest[0])
+		fmt.Println("Their next password login becomes the account's first device. Their contacts will see a key change.")
+		return nil
+	}
+	a, err := LoadAccounts(p.users, "")
+	if err != nil {
+		return err
+	}
+	certs, ok := a.Devices(rest[0])
+	if !ok {
+		return fmt.Errorf("no account %q", rest[0])
+	}
+	if len(certs) == 0 {
+		fmt.Println("No devices: the next password login becomes the first.")
+	}
+	for _, c := range certs {
+		state, by := "", "first device"
+		if c.Removed {
+			state = "  (removed)"
+		}
+		if c.By != "" {
+			by = "approved by " + identity.Short(c.By)
+		}
+		fmt.Printf("%-20s %s  added %s, %s%s\n", c.Name, identity.Fingerprint(c.PeerID), time.Unix(c.Added, 0).Format("2006-01-02"), by, state)
+	}
 	return nil
 }
 

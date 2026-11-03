@@ -91,7 +91,7 @@ func TestAcceptHookRefusesSender(t *testing.T) {
 	bobID, _ := identity.Generate()
 	port := freeUDPPort(t)
 	bob := NewNetworkManager(port, bobID)
-	bob.Accept = func(peerID string) error {
+	bob.Accept = func(peerID, _ string) error {
 		if peerID == alice.ID() {
 			return errors.New("not accepting messages from unknown senders")
 		}

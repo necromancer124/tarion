@@ -53,8 +53,24 @@ func (m *mailboxStore) userDir(name string) string {
 	return filepath.Join(m.dir, hex.EncodeToString([]byte(directory.NameKey(name))))
 }
 
-// SetKey publishes name's box key.
+// validPeerID keeps a peer ID (base32) safe to use in a file name.
+func validPeerID(id string) bool {
+	if id == "" || len(id) > 64 {
+		return false
+	}
+	for _, r := range id {
+		if !(r >= 'a' && r <= 'z' || r >= '2' && r <= '7') {
+			return false
+		}
+	}
+	return true
+}
+
+// SetKey publishes one device's box key (one file per device).
 func (m *mailboxStore) SetKey(name string, rec boxRecord) error {
+	if !validPeerID(rec.PeerID) {
+		return errors.New("bad peer ID")
+	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	dir := m.userDir(name)
@@ -65,26 +81,67 @@ func (m *mailboxStore) SetKey(name string, rec boxRecord) error {
 	if err != nil {
 		return err
 	}
-	return writeAtomic(filepath.Join(dir, "key.json"), data)
+	return writeAtomic(filepath.Join(dir, "key-"+rec.PeerID+".json"), data)
 }
 
-// Key returns name's published box key.
-func (m *mailboxStore) Key(name string) (boxRecord, error) {
+// Keys returns the box keys name's devices published.
+func (m *mailboxStore) Keys(name string) []boxRecord {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	return m.key(name)
+	return m.keys(name)
 }
 
-func (m *mailboxStore) key(name string) (boxRecord, error) {
-	var rec boxRecord
-	data, err := os.ReadFile(filepath.Join(m.userDir(name), "key.json"))
-	if errors.Is(err, os.ErrNotExist) {
-		return rec, errNoBox
+func (m *mailboxStore) keys(name string) []boxRecord {
+	entries, _ := os.ReadDir(m.userDir(name))
+	var out []boxRecord
+	for _, e := range entries {
+		// key.json is the single key of a server from before multi-device.
+		if !isKeyFile(e.Name()) {
+			continue
+		}
+		data, err := os.ReadFile(filepath.Join(m.userDir(name), e.Name()))
+		var rec boxRecord
+		if err == nil && json.Unmarshal(data, &rec) == nil && rec.PeerID != "" {
+			out = append(out, rec)
+		}
 	}
-	if err != nil {
-		return rec, err
+	return out
+}
+
+func isKeyFile(name string) bool {
+	return name == "key.json" || strings.HasPrefix(name, "key-") && strings.HasSuffix(name, ".json")
+}
+
+// key returns the box key of one device.
+func (m *mailboxStore) key(name, peerID string) (boxRecord, error) {
+	for _, rec := range m.keys(name) {
+		if rec.PeerID == peerID {
+			return rec, nil
+		}
 	}
-	return rec, json.Unmarshal(data, &rec)
+	return boxRecord{}, errNoBox
+}
+
+// RemoveDevice deletes one device's box key and the letters sealed to it.
+func (m *mailboxStore) RemoveDevice(name, peerID string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	dir := m.userDir(name)
+	for _, rec := range m.keys(name) {
+		if rec.PeerID != peerID {
+			continue
+		}
+		_ = os.Remove(filepath.Join(dir, "key-"+peerID+".json"))
+		if legacy, err := os.ReadFile(filepath.Join(dir, "key.json")); err == nil && strings.Contains(string(legacy), `"`+peerID+`"`) {
+			_ = os.Remove(filepath.Join(dir, "key.json"))
+		}
+	}
+	for _, l := range m.letters(name) {
+		if l.PeerID == peerID {
+			_ = os.Remove(filepath.Join(dir, l.ID+".json"))
+		}
+	}
+	return nil
 }
 
 // Remove deletes name's mailbox: its key and every letter waiting.
@@ -99,7 +156,7 @@ func (m *mailboxStore) letters(name string) []storedLetter {
 	entries, _ := os.ReadDir(m.userDir(name))
 	var out []storedLetter
 	for _, e := range entries {
-		if e.IsDir() || e.Name() == "key.json" || !strings.HasSuffix(e.Name(), ".json") {
+		if e.IsDir() || isKeyFile(e.Name()) || !strings.HasSuffix(e.Name(), ".json") {
 			continue
 		}
 		data, err := os.ReadFile(filepath.Join(m.userDir(name), e.Name()))
@@ -120,22 +177,27 @@ func (m *mailboxStore) letters(name string) []storedLetter {
 	return out
 }
 
-// Put leaves a sealed letter from sender for name, sealed to peerID.
+// Put leaves a sealed letter from sender for name's device peerID. The
+// limits count per device: a message to someone with three devices is
+// three letters.
 func (m *mailboxStore) Put(name, sender, peerID string, sealed []byte, now time.Time) (string, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	if _, err := m.key(name); err != nil {
+	if _, err := m.key(name, peerID); err != nil {
 		return "", err
 	}
-	total, fromSender := len(sealed), 0
-	waiting := m.letters(name)
-	for _, l := range waiting {
+	total, waiting, fromSender := len(sealed), 0, 0
+	for _, l := range m.letters(name) {
+		if l.PeerID != peerID {
+			continue
+		}
+		waiting++
 		total += len(l.Sealed)
 		if directory.NameKey(l.From) == directory.NameKey(sender) {
 			fromSender++
 		}
 	}
-	if len(waiting) >= m.maxItems || total > m.maxBytes || fromSender >= m.perPeer {
+	if waiting >= m.maxItems || total > m.maxBytes || fromSender >= m.perPeer {
 		return "", errMailboxFull
 	}
 	var b [12]byte

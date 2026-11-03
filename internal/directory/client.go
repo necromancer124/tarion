@@ -11,6 +11,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/necromancer124/tarion/internal/devices"
 	"github.com/necromancer124/tarion/internal/identity"
 	"github.com/necromancer124/tarion/internal/network"
 	"github.com/necromancer124/tarion/internal/relay"
@@ -56,6 +57,8 @@ type ClientConfig struct {
 	// OnMail is called when letters may be waiting: after a login that
 	// reports some, and when the server says one just arrived.
 	OnMail func()
+	// DeviceName names this device in the account's device list.
+	DeviceName string
 }
 
 // Client keeps one QUIC connection to tariond open from the chat socket.
@@ -129,6 +132,17 @@ func (c *Client) Run(ctx context.Context) {
 			c.setStatus("server: " + fatal.Msg)
 			return
 		}
+		var waiting *ApprovalError
+		if errors.As(err, &waiting) {
+			// Not an outage: check again soon, without backing off.
+			c.setStatus("server: " + waiting.Error())
+			select {
+			case <-ctx.Done():
+				return
+			case <-time.After(ApprovalRetry):
+			}
+			continue
+		}
 		if loggedIn {
 			backoff = 2 * time.Second
 		}
@@ -190,7 +204,9 @@ func (c *Client) session(ctx context.Context) (bool, error) {
 			if errors.As(err, &appErr) && appErr.Remote {
 				switch appErr.ErrorCode {
 				case CodeReplaced:
-					return true, &FatalError{Msg: "logged in from another device; this session was closed"}
+					return true, &FatalError{Msg: "this device logged in again from another Tarion; this session was closed"}
+				case CodeRemoved:
+					return true, &FatalError{Msg: "this device was removed from the account; run once with -pass to ask for approval again"}
 				case CodeBanned:
 					return true, &FatalError{Msg: "banned from this server"}
 				case CodeDeleted:
@@ -273,7 +289,7 @@ func (c *Client) login(ctx context.Context, conn *quic.Conn) (Response, bool, er
 	c.mu.Unlock()
 	resp, err := roundTrip(ctx, conn, Request{Op: OpLogin, User: c.cfg.User, Pass: c.cfg.Pass, LocalAddrs: local,
 		AcceptRelay: c.cfg.AcceptRelay, PublicAddr: public,
-		AcceptMailbox: c.cfg.AcceptMailbox, BoxKey: c.cfg.BoxKey, BoxSig: c.cfg.BoxSig})
+		AcceptMailbox: c.cfg.AcceptMailbox, BoxKey: c.cfg.BoxKey, BoxSig: c.cfg.BoxSig, DeviceName: c.cfg.DeviceName})
 	if err != nil {
 		return resp, false, err
 	}
@@ -281,13 +297,15 @@ func (c *Client) login(ctx context.Context, conn *quic.Conn) (Response, bool, er
 		return resp, usedPassword, nil
 	}
 	switch resp.Error {
+	case ErrNotApproved:
+		return resp, false, &ApprovalError{User: c.cfg.User, Code: resp.Detail}
 	case ErrNoSuchUser:
 		if c.cfg.Pass == "" {
 			return resp, false, &FatalError{Msg: fmt.Sprintf("account %s does not exist; run once with -pass to create it", c.cfg.User)}
 		}
 		resp, err = roundTrip(ctx, conn, Request{Op: OpRegister, User: c.cfg.User, Pass: c.cfg.Pass, Invite: c.cfg.Invite, LocalAddrs: local,
 			AcceptRelay: c.cfg.AcceptRelay, PublicAddr: public,
-			AcceptMailbox: c.cfg.AcceptMailbox, BoxKey: c.cfg.BoxKey, BoxSig: c.cfg.BoxSig})
+			AcceptMailbox: c.cfg.AcceptMailbox, BoxKey: c.cfg.BoxKey, BoxSig: c.cfg.BoxSig, DeviceName: c.cfg.DeviceName})
 		if err != nil {
 			return resp, false, err
 		}
@@ -305,12 +323,23 @@ func (c *Client) login(ctx context.Context, conn *quic.Conn) (Response, bool, er
 	}
 }
 
+// ApprovalRetry is how often a device waiting for approval checks again.
+var ApprovalRetry = 10 * time.Second
+
+// ApprovalError: the password was right, but this device isn't on the
+// account yet. One of the account's devices approves it with Code.
+type ApprovalError struct{ User, Code string }
+
+func (e *ApprovalError) Error() string {
+	return fmt.Sprintf("this device is waiting to be added to %s. On a device already signed in, run: tarion devices approve %s", e.User, e.Code)
+}
+
 func loginError(resp Response) error {
 	switch resp.Error {
 	case ErrAuthFailed:
 		return &FatalError{Msg: "wrong password"}
 	case ErrPasswordRequired:
-		return &FatalError{Msg: "this device is not linked to the account yet; run once with -pass"}
+		return &FatalError{Msg: "this device is not on the account yet; run once with -pass, then approve it from a device that is"}
 	case ErrInvalidName:
 		return &FatalError{Msg: "invalid username (1-32 letters/digits, may contain . _ -)"}
 	case ErrWeakPassword:
@@ -344,11 +373,11 @@ func (c *Client) List() ([]string, error) {
 
 // Relay asks the server for a relay session to target, for when a direct
 // connection fails. It returns the address to dial and the target's key.
-func (c *Client) Relay(target string) (addr, peerID string, err error) {
+func (c *Client) Relay(target, device string) (addr, peerID string, err error) {
 	if !c.cfg.AcceptRelay {
 		return "", "", errors.New("relay is turned off")
 	}
-	resp, err := c.request(Request{Op: OpRelay, Target: target})
+	resp, err := c.request(Request{Op: OpRelay, Target: target, Device: device})
 	if err != nil {
 		return "", "", err
 	}
@@ -451,8 +480,8 @@ func (c *Client) MailboxKey(target string) (Response, error) {
 }
 
 // MailboxPut leaves a sealed letter for target.
-func (c *Client) MailboxPut(target string, sealed []byte) error {
-	_, err := c.mailboxRequest(Request{Op: OpMailboxPut, Target: target, Sealed: sealed})
+func (c *Client) MailboxPut(target, device string, sealed []byte) error {
+	_, err := c.mailboxRequest(Request{Op: OpMailboxPut, Target: target, Device: device, Sealed: sealed})
 	return err
 }
 
@@ -520,6 +549,9 @@ func (c *Client) request(req Request) (Response, error) {
 	if !resp.OK {
 		if resp.Error == ErrOffline || resp.Error == ErrNoSuchUser {
 			return resp, ErrUserOffline
+		}
+		if resp.Detail != "" {
+			return resp, errors.New(resp.Detail)
 		}
 		return resp, fmt.Errorf("server: %s", resp.Error)
 	}
@@ -606,4 +638,35 @@ func (c *Client) handlePush(stream *quic.Stream) {
 	if c.cfg.OnPunch != nil {
 		c.cfg.OnPunch(push)
 	}
+}
+
+// Devices returns the device chain of target's account, or of your own
+// when target is "" (then Devices lists your devices that are online).
+func (c *Client) Devices(target string) (Response, error) {
+	return c.request(Request{Op: OpDevices, Target: target})
+}
+
+// PendingDevice returns the device waiting to join your account with code.
+func (c *Client) PendingDevice(code string) (*Pending, error) {
+	resp, err := c.request(Request{Op: OpDevicePending, Code: code})
+	if err == nil && resp.Pending == nil {
+		err = errors.New("server sent no device")
+	}
+	if resp.Error == ErrNoSuchCode {
+		err = errors.New("no device is waiting with that code (codes last 15 minutes; check it, or log in on the new device again)")
+	}
+	return resp.Pending, err
+}
+
+// ApproveDevice adds the waiting device with code, using cert signed by
+// this device (see devices.Sign).
+func (c *Client) ApproveDevice(code string, cert devices.Cert) error {
+	_, err := c.request(Request{Op: OpDeviceApprove, Code: code, Cert: &cert})
+	return err
+}
+
+// RemoveDevice takes one of your devices (by peer ID) off the account.
+func (c *Client) RemoveDevice(peerID string) error {
+	_, err := c.request(Request{Op: OpDeviceRemove, Target: peerID})
+	return err
 }

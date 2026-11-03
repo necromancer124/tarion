@@ -23,13 +23,13 @@ func TestCreateLoginAndKeyLogin(t *testing.T) {
 		t.Fatal(err)
 	}
 	a.SetArgon(testArgon)
-	if _, err := a.Create("Alice", "secret1", "key1"); err != nil {
+	if _, err := a.Create("Alice", "secret1", "key1", nil, "laptop"); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := a.Create("alice", "other12", "key2"); !errors.Is(err, errNameTaken) {
+	if _, err := a.Create("alice", "other12", "key2", nil, ""); !errors.Is(err, errNameTaken) {
 		t.Fatalf("case-insensitive duplicate allowed: %v", err)
 	}
-	if _, _, err := a.LoginWithPassword("alice", "wrong!!", "key1"); !errors.Is(err, errAuthFailed) {
+	if _, _, err := a.LoginWithPassword("alice", "wrong!!", "key1", nil, ""); !errors.Is(err, errAuthFailed) {
 		t.Fatalf("wrong password: %v", err)
 	}
 	if name, err := a.LoginWithKey("ALICE", "key1"); err != nil || name != "Alice" {
@@ -38,12 +38,12 @@ func TestCreateLoginAndKeyLogin(t *testing.T) {
 	if _, err := a.LoginWithKey("alice", "key2"); !errors.Is(err, errPasswordRequired) {
 		t.Fatalf("other key should need the password: %v", err)
 	}
-	// Password login from a new device rebinds the key.
-	if _, changed, err := a.LoginWithPassword("alice", "secret1", "key2"); err != nil || !changed {
-		t.Fatalf("rebind: changed=%v err=%v", changed, err)
+	// The password alone doesn't add a new device: it must be approved.
+	if _, _, err := a.LoginWithPassword("alice", "secret1", "key2", nil, ""); !errors.Is(err, errNotApproved) {
+		t.Fatalf("new device with the password: %v", err)
 	}
-	if _, err := a.LoginWithKey("alice", "key1"); !errors.Is(err, errPasswordRequired) {
-		t.Fatal("old key still accepted after rebind")
+	if _, err := a.LoginWithKey("alice", "key1"); err != nil {
+		t.Fatal("the first device must keep working")
 	}
 
 	data, _ := os.ReadFile(filepath.Join(dir, "users.json"))
@@ -55,7 +55,7 @@ func TestCreateLoginAndKeyLogin(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := b.LoginWithKey("alice", "key2"); err != nil {
+	if _, err := b.LoginWithKey("alice", "key1"); err != nil {
 		t.Fatalf("after reload: %v", err)
 	}
 }
@@ -79,13 +79,13 @@ func TestLegacyImportDropsInjectedDuplicatesAndUpgrades(t *testing.T) {
 		t.Fatal(err)
 	}
 	a.SetArgon(testArgon)
-	if _, _, err := a.LoginWithPassword("bob", "evilpw", "k"); !errors.Is(err, errNoSuchUser) {
+	if _, _, err := a.LoginWithPassword("bob", "evilpw", "k", nil, ""); !errors.Is(err, errNoSuchUser) {
 		t.Fatalf("injected bob must be dropped, got %v", err)
 	}
-	if _, _, err := a.LoginWithPassword("bob", "bobpw", "k"); !errors.Is(err, errNoSuchUser) {
+	if _, _, err := a.LoginWithPassword("bob", "bobpw", "k", nil, ""); !errors.Is(err, errNoSuchUser) {
 		t.Fatalf("ambiguous bob must be dropped entirely, got %v", err)
 	}
-	if _, _, err := a.LoginWithPassword("alice", "alicepw", "alicekey"); err != nil {
+	if _, _, err := a.LoginWithPassword("alice", "alicepw", "alicekey", nil, ""); err != nil {
 		t.Fatalf("legacy alice: %v", err)
 	}
 	u, _ := a.get("alice")
@@ -131,12 +131,12 @@ func TestHashUpgradesWhenCostChanges(t *testing.T) {
 		t.Fatal(err)
 	}
 	a.SetArgon(testArgon)
-	if _, err := a.Create("alice", "correct-horse-1", "k"); err != nil {
+	if _, err := a.Create("alice", "correct-horse-1", "k", nil, ""); err != nil {
 		t.Fatal(err)
 	}
 	stronger := argonParams{MemoryKiB: 2048, Time: 2, Threads: 1}
 	a.SetArgon(stronger)
-	if _, _, err := a.LoginWithPassword("alice", "correct-horse-1", "k"); err != nil {
+	if _, _, err := a.LoginWithPassword("alice", "correct-horse-1", "k", nil, ""); err != nil {
 		t.Fatal(err)
 	}
 	u, _ := a.get("alice")

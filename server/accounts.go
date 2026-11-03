@@ -18,6 +18,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/necromancer124/tarion/internal/devices"
 	"github.com/necromancer124/tarion/internal/directory"
 	"golang.org/x/crypto/argon2"
 )
@@ -27,15 +28,57 @@ var (
 	errAuthFailed       = errors.New("wrong password")
 	errNameTaken        = errors.New("name taken")
 	errPasswordRequired = errors.New("password required")
+	// errNotApproved: the password is right, but this device isn't one of
+	// the account's yet; another device has to approve it.
+	errNotApproved = errors.New("device not approved")
 )
 
 // account is one user. Hash is "argon2id$..." or, for accounts imported from
 // the old users.db, "sha256$salt$hex" until the next password login upgrades it.
+// Devices is the account's device chain (package devices); PeerID is its
+// root, kept for older tools.
 type account struct {
-	Name    string    `json:"name"`
-	Hash    string    `json:"hash"`
-	PeerID  string    `json:"peer_id,omitempty"`
-	Created time.Time `json:"created"`
+	Name    string         `json:"name"`
+	Hash    string         `json:"hash"`
+	PeerID  string         `json:"peer_id,omitempty"`
+	Created time.Time      `json:"created"`
+	Devices []devices.Cert `json:"devices,omitempty"`
+}
+
+// active reports whether peerID is one of the account's active devices.
+func (u *account) active(peerID string) bool {
+	for _, d := range u.Devices {
+		if !d.Removed && subtle.ConstantTimeCompare([]byte(d.PeerID), []byte(peerID)) == 1 {
+			return true
+		}
+	}
+	return false
+}
+
+// activeCount is how many devices the account has.
+func (u *account) activeCount() int {
+	n := 0
+	for _, d := range u.Devices {
+		if !d.Removed {
+			n++
+		}
+	}
+	return n
+}
+
+// migrate gives an account from before multi-device support its device
+// chain: the one key it had becomes the root.
+func (u *account) migrate() {
+	if len(u.Devices) == 0 && u.PeerID != "" {
+		u.Devices = []devices.Cert{{Account: directory.NameKey(u.Name), PeerID: u.PeerID, Name: "first device", Added: u.Created.Unix()}}
+	}
+}
+
+func rootCert(name, peerID string, pub []byte, deviceName string) devices.Cert {
+	if deviceName == "" {
+		deviceName = "first device"
+	}
+	return devices.Cert{Account: directory.NameKey(name), PeerID: peerID, PubKey: pub, Name: deviceName, Added: time.Now().Unix()}
 }
 
 type accountsFile struct {
@@ -108,6 +151,7 @@ func LoadAccounts(path, legacyPath string) (*Accounts, error) {
 				log.Printf("accounts: skipping invalid or duplicate account %q", u.Name)
 				continue
 			}
+			u.migrate()
 			a.byKey[key] = &u
 		}
 		return a, nil
@@ -216,8 +260,9 @@ func (a *Accounts) get(name string) (account, bool) {
 	return *u, true
 }
 
-// Create registers a new account bound to peerID and returns its name.
-func (a *Accounts) Create(name, pass, peerID string) (string, error) {
+// Create registers a new account whose first device is peerID (key pub)
+// and returns its name.
+func (a *Accounts) Create(name, pass, peerID string, pub []byte, deviceName string) (string, error) {
 	if _, ok := a.get(name); ok {
 		return "", errNameTaken
 	}
@@ -231,14 +276,17 @@ func (a *Accounts) Create(name, pass, peerID string) (string, error) {
 	if a.byKey[key] != nil {
 		return "", errNameTaken
 	}
-	a.byKey[key] = &account{Name: name, Hash: hash, PeerID: peerID, Created: time.Now()}
+	a.byKey[key] = &account{Name: name, Hash: hash, PeerID: peerID, Created: time.Now(),
+		Devices: []devices.Cert{rootCert(name, peerID, pub, deviceName)}}
 	return name, a.saveLocked()
 }
 
-// LoginWithPassword checks the password, upgrades a legacy hash, and binds
-// peerID to the account (a new device or reinstall). It returns the
-// canonical name and whether the bound key changed.
-func (a *Accounts) LoginWithPassword(name, pass, peerID string) (string, bool, error) {
+// LoginWithPassword checks the password and upgrades a legacy hash. An
+// account without devices (imported, or reset by the operator) takes
+// peerID as its first device; otherwise peerID must already be one of its
+// devices, or errNotApproved is returned: a password alone doesn't add a
+// device. It returns the canonical name and whether peerID became the root.
+func (a *Accounts) LoginWithPassword(name, pass, peerID string, pub []byte, deviceName string) (string, bool, error) {
 	u, ok := a.get(name)
 	if !ok {
 		return "", false, errNoSuchUser
@@ -262,17 +310,112 @@ func (a *Accounts) LoginWithPassword(name, pass, peerID string) (string, bool, e
 	if cur == nil || cur.Hash != u.Hash {
 		return "", false, errAuthFailed // changed underneath us; make the client retry
 	}
-	changed := cur.PeerID != peerID
 	if newHash != "" {
 		cur.Hash = newHash
 	}
-	if changed || newHash != "" {
-		cur.PeerID = peerID
+	becameRoot := false
+	switch {
+	case cur.activeCount() == 0:
+		cur.Devices = []devices.Cert{rootCert(cur.Name, peerID, pub, deviceName)}
+		cur.PeerID, becameRoot = peerID, true
+	case !cur.active(peerID):
+		if newHash != "" {
+			_ = a.saveLocked()
+		}
+		return cur.Name, false, errNotApproved
+	}
+	if newHash != "" || becameRoot {
 		if err := a.saveLocked(); err != nil {
 			return "", false, err
 		}
 	}
-	return cur.Name, changed && u.PeerID != "", nil
+	return cur.Name, becameRoot, nil
+}
+
+// Devices returns the account's device chain.
+func (a *Accounts) Devices(name string) ([]devices.Cert, bool) {
+	u, ok := a.get(name)
+	if !ok {
+		return nil, false
+	}
+	return append([]devices.Cert(nil), u.Devices...), true
+}
+
+// NotePubKey records a device's public key the first time it logs in after
+// a migration (old accounts only stored its ID). It is needed before that
+// device can approve others.
+func (a *Accounts) NotePubKey(name, peerID string, pub []byte) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	u := a.byKey[directory.NameKey(name)]
+	if u == nil {
+		return
+	}
+	for i := range u.Devices {
+		if u.Devices[i].PeerID == peerID && len(u.Devices[i].PubKey) == 0 {
+			u.Devices[i].PubKey = pub
+			_ = a.saveLocked()
+		}
+	}
+}
+
+// AddDevice adds a device that an active device approved (signed).
+func (a *Accounts) AddDevice(name string, c devices.Cert) error {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	u := a.byKey[directory.NameKey(name)]
+	if u == nil {
+		return errNoSuchUser
+	}
+	if c.Account != directory.NameKey(u.Name) {
+		return errors.New("the approval is for another account")
+	}
+	if err := devices.Check(u.Devices, c); err != nil {
+		return err
+	}
+	c.Removed = false
+	u.Devices = append(u.Devices, c)
+	return a.saveLocked()
+}
+
+// errLastDevice: removing it would leave the account without a device.
+var errLastDevice = errors.New("that is the account's only device")
+
+// RemoveDevice marks a device removed. Its record stays in the chain so the
+// devices it approved remain valid.
+func (a *Accounts) RemoveDevice(name, peerID string) error {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	u := a.byKey[directory.NameKey(name)]
+	if u == nil {
+		return errNoSuchUser
+	}
+	if !u.active(peerID) {
+		return errors.New("no such device on this account")
+	}
+	if u.activeCount() == 1 {
+		return errLastDevice
+	}
+	for i := range u.Devices {
+		if u.Devices[i].PeerID == peerID {
+			u.Devices[i].Removed = true
+		}
+	}
+	return a.saveLocked()
+}
+
+// ResetDevices forgets every device (operator recovery after all of them
+// were lost). The next password login becomes the new first device, and
+// contacts see a key change.
+func (a *Accounts) ResetDevices(name string) (bool, error) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	u := a.byKey[directory.NameKey(name)]
+	if u == nil {
+		return false, nil
+	}
+	u.Devices, u.PeerID = nil, ""
+	return true, a.saveLocked()
 }
 
 // ChangePassword replaces the password after checking the current one. The
@@ -324,13 +467,13 @@ func (a *Accounts) Delete(name string) (bool, error) {
 	return true, a.saveLocked()
 }
 
-// LoginWithKey succeeds when peerID is the key bound to the account.
+// LoginWithKey succeeds when peerID is one of the account's devices.
 func (a *Accounts) LoginWithKey(name, peerID string) (string, error) {
 	u, ok := a.get(name)
 	if !ok {
 		return "", errNoSuchUser
 	}
-	if u.PeerID == "" || subtle.ConstantTimeCompare([]byte(u.PeerID), []byte(peerID)) != 1 {
+	if !u.active(peerID) {
 		return "", errPasswordRequired
 	}
 	return u.Name, nil

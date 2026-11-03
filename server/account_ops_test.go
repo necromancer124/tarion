@@ -20,11 +20,11 @@ func TestChangePassword(t *testing.T) {
 	if err := alice.dir.ChangePassword("correct-horse-1", "violet-moon-88"); err != nil {
 		t.Fatal(err)
 	}
-	// A new device must now use the new password.
+	// A new device must now use the new password (and then be approved).
 	old := startClient(t, server, "alice", "correct-horse-1", "", nil)
 	waitFor(t, "old password refused", func() bool { return strings.Contains(old.dir.Status(), "wrong password") })
 	fresh := startClient(t, server, "alice", "violet-moon-88", "", nil)
-	waitFor(t, "new password works", fresh.dir.Connected)
+	waitFor(t, "new password accepted", func() bool { return strings.Contains(fresh.dir.Status(), "waiting to be added") })
 }
 
 func TestDeleteOwnAccount(t *testing.T) {
