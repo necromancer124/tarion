@@ -60,7 +60,8 @@ func loadTopics() []topic {
 		if err != nil {
 			continue
 		}
-		first, rest, _ := strings.Cut(string(data), "\n")
+		// A Windows checkout may have turned line endings into CRLF.
+		first, rest, _ := strings.Cut(strings.ReplaceAll(string(data), "\r\n", "\n"), "\n")
 		name, summary, _ := strings.Cut(strings.TrimPrefix(first, "# "), ": ")
 		out = append(out, topic{name: name, summary: summary, body: strings.TrimLeft(rest, "\n")})
 	}
