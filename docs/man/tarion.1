@@ -1,0 +1,217 @@
+.TH TARION 1 "" "tarion" "User Commands"
+.SH NAME
+tarion \- peer\-to\-peer, end\-to\-end encrypted terminal chat
+.SH SYNOPSIS
+.B tarion
+[\fIcommand\fR] [\fIoptions\fR]
+.SH DESCRIPTION
+Tarion sends chat messages directly between devices over QUIC with mutually authenticated TLS 1.3.
+A directory server (\fBtariond\fR(8)) tells peers where to find each other and helps them through home routers.
+Each device has its own Ed25519 identity key; contacts pin it on first contact.
+Without a command, \fBtarion\fR runs \fBstart\fR.
+.SH COMMANDS
+.TP
+\fBstart\fR [options]
+open the menu and chat; listens itself if no background process runs
+.TP
+\fBmenu\fR
+open the menu (same as start)
+.TP
+\fBbackground\fR [\-\-detach] [options]
+run the always\-on listener; \-\-detach survives closing the terminal
+.TP
+\fBstop\fR
+stop the background process
+.TP
+\fBsend\fR <name> <message>
+send one message through the background process
+.TP
+\fBlisten\fR
+print incoming messages and events as JSON lines (for scripts and apps)
+.TP
+\fBhistory\fR [\-n N] <name>
+print a chat's recent history
+.TP
+\fBdevices\fR [approve CODE | remove NAME]
+list your devices, add one with its code, or take one off
+.TP
+\fBprotect\fR [passphrase | windows | off]
+show or change how your local data is encrypted
+.TP
+\fBportmap\fR
+ask the router to forward your port again, and explain the result
+.TP
+\fBfirewall\fR [allow | remove]
+check Windows Firewall; allow lets people reach you
+.TP
+\fBoutbox\fR
+list messages waiting to be delivered
+.TP
+\fBdropped\fR [\-n N]
+list messages that were given up on or refused
+.TP
+\fBid\fR
+show your peer ID so contacts can verify you
+.TP
+\fBpeers\fR
+list pinned contacts and their peer IDs
+.TP
+\fBforget\fR <name>
+forget a contact's pinned key (after they reinstall)
+.TP
+\fBpasswd\fR
+change your account password
+.TP
+\fBdelete\-account\fR
+delete your account on the server
+.TP
+\fBhelp\fR [command | topic]
+show help: tarion help devices, tarion help relay, ...
+.SH OPTIONS
+These options are shared by \fBstart\fR, \fBmenu\fR and \fBbackground\fR. Options marked "saved" are written to config.json.
+.TP
+\fB\-accept\fR
+who may message you: anyone or contacts (saved)
+.TP
+\fB\-cp\fR
+local TCP port of the background control socket (default: \-p plus 10000)
+.TP
+\fB\-invite\fR
+one\-time invite code, if the server is invite\-only
+.TP
+\fB\-mailbox\fR
+off (default) or on: let the server hold sealed messages while you or a contact are offline (saved)
+.TP
+\fB\-p\fR
+local UDP port for chat and server traffic (default 63426)
+.TP
+\fB\-pass\fR
+directory password (only needed the first time on this device)
+.TP
+\fB\-port\-mapping\fR
+auto (default: ask the router to forward the port when the relay is off), on, or off (saved)
+.TP
+\fB\-public\-addr\fR
+address peers can reach you at directly, e.g. a forwarded port "203.0.113.7:63426"; "none" clears it (saved)
+.TP
+\fB\-relay\fR
+off (default) or on: allow messages through the server when no direct path exists (saved)
+.TP
+\fB\-server\fR
+directory server host:port (tariond default port 63425)
+.TP
+\fB\-server\-bans\fR
+on (default) or off: refuse keys the server banned (saved)
+.TP
+\fB\-user\fR
+directory username
+.TP
+\fB\-\-detach\fR
+(background) start detached, so it survives closing the terminal.
+.TP
+\fB\-u\fR \fIname\fR \fB\-i\fR \fIip:port\fR
+(start) chat directly with an address, without a server.
+.TP
+\fB\-n\fR \fIN\fR
+(history, dropped) how many recent lines to show; 0 shows all.
+.SH TOPICS
+\fBtarion help\fR \fItopic\fR explains:
+.TP
+\fBaccount\fR
+password, deleting your account
+.TP
+\fBapi\fR
+use Tarion from scripts and apps
+.TP
+\fBbackground\fR
+stay reachable without a window open
+.TP
+\fBconfig\fR
+config.json, files and environment variables
+.TP
+\fBcontacts\fR
+who may message you, and contacts without a server
+.TP
+\fBdevices\fR
+use your account on more than one device
+.TP
+\fBfirewall\fR
+when your computer's firewall keeps people out
+.TP
+\fBkeys\fR
+identity, peer IDs, verifying contacts and key changes
+.TP
+\fBmailbox\fR
+messages for people who are offline
+.TP
+\fBnetwork\fR
+ports, NAT and how a message finds its way
+.TP
+\fBoutbox\fR
+queued, delivered later, and dropped messages
+.TP
+\fBportmap\fR
+let your router forward the chat port
+.TP
+\fBprivacy\fR
+what the server and others can and can't see
+.TP
+\fBprotect\fR
+how your data on this computer is encrypted
+.TP
+\fBrelay\fR
+when no direct path exists
+.TP
+\fBstart\fR
+log in, open the menu and chat
+.TP
+\fBtroubleshooting\fR
+common problems and what to do
+.SH FILES
+Files live in %APPDATA%\etarion on Windows, ~/.config/tarion on Linux and ~/Library/Application Support/tarion on macOS, or in \fB$TARION_HOME\fR.
+.TP
+\fIconfig.json\fR
+settings and contacts
+.TP
+\fIidentity.key\fR
+this device's private key (encrypted)
+.TP
+\fIvault.json\fR
+the data key, protected by the Windows login or a passphrase
+.TP
+\fIpeers.json\fR
+pinned contacts and their verified devices
+.TP
+\fIhistory/\fR
+one chat per file
+.TP
+\fIoutbox.json\fR
+messages waiting to be delivered
+.TP
+\fIdropped.log\fR
+messages given up on or refused
+.TP
+\fIrevoked.json\fR
+keys the server banned
+.TP
+\fIbackground.log\fR
+the background process's log
+.TP
+\fIcontrol.token\fR
+the local API secret, while the background process runs
+.SH ENVIRONMENT
+.TP
+\fBTARION_HOME\fR
+use another folder, e.g. a second identity on one machine
+.TP
+\fBTARION_NO_AUTO_PROTECT\fR
+set to 1 to not encrypt a new Windows install automatically
+.TP
+\fBTARION_SIMULATE_STRICT_NAT\fR
+set to 1 to drop direct packets from peers (testing)
+.SH PORTS
+One UDP port for chat and the server (default 63426, \fB\-p\fR); the background control socket listens on 127.0.0.1, by default that port plus 10000 (\fB\-cp\fR). tariond listens on UDP 63425.
+.SH EXIT STATUS
+0 on success; 1 on an error, which is printed to standard error with what to do about it.
+.SH SEE ALSO
+\fBtariond\fR(8), \fBtarion help\fR, https://github.com/necromancer124/tarion
