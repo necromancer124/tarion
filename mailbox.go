@@ -43,9 +43,11 @@ func mailboxLogin(id *identity.Identity) (key, sig []byte) {
 	return pub[:], mailbox.SignBoxKey(id, pub)
 }
 
-// depositMail seals a message for to and leaves it in their mailbox. The
-// key the server hands out must be signed by to's identity key, and that
-// key must match the one pinned for to, just as a direct message would.
+// depositMail seals a message for each of to's devices and leaves it in
+// their mailbox. Each device's box key must be signed by that device's
+// identity key, and the device must belong to to (their device chain,
+// checked against your pin), just as for a direct message. One device
+// taking it is enough.
 func (n *node) depositMail(id string, sent time.Time, to, body string) error {
 	if !directory.ValidUsername(to) {
 		return errors.New("not a server account name")
@@ -57,30 +59,58 @@ func (n *node) depositMail(id string, sent time.Time, to, body string) error {
 	if err != nil {
 		return err
 	}
-	if len(resp.PubKey) != ed25519.PublicKeySize || !strings.EqualFold(identity.PeerID(resp.PubKey), resp.PeerID) ||
-		!mailbox.VerifyBoxKey(resp.PubKey, resp.BoxKey, resp.BoxSig) {
-		return errors.New("the server sent a mailbox key that doesn't check out")
-	}
-	peerID := resp.PeerID
-	if n.isRevoked(peerID) {
-		return fmt.Errorf("%s is %w", to, errRevoked)
-	}
-	if configured := configuredID(n.cfg, to); configured != "" && !strings.EqualFold(configured, peerID) {
-		return &storage.IdentityMismatchError{Name: to, Expected: configured, Got: peerID}
-	}
-	if err := storage.PinOutgoing(to, peerID, ""); err != nil {
+	verified, err := n.verifiedDevices(to, resp.Certs)
+	if err != nil {
 		return err
 	}
+	var lastErr error = errors.New("the server sent no mailbox key")
+	sent1 := false
+	for _, b := range resp.Boxes {
+		if err := n.sealFor(id, sent, to, body, b, verified); err != nil {
+			lastErr = err
+			continue
+		}
+		sent1 = true
+	}
+	if !sent1 {
+		return lastErr
+	}
+	return nil
+}
+
+// sealFor checks one device's box key and leaves the letter for it.
+func (n *node) sealFor(id string, sent time.Time, to, body string, b directory.Box, verified map[string]bool) error {
+	if len(b.PubKey) != ed25519.PublicKeySize || !strings.EqualFold(identity.PeerID(b.PubKey), b.PeerID) ||
+		!mailbox.VerifyBoxKey(b.PubKey, b.BoxKey, b.BoxSig) {
+		return errors.New("the server sent a mailbox key that doesn't check out")
+	}
+	if n.isRevoked(b.PeerID) {
+		return fmt.Errorf("%s is %w", to, errRevoked)
+	}
+	if verified != nil {
+		if !verified[b.PeerID] {
+			p, _ := storage.PeerByName(to)
+			return &storage.IdentityMismatchError{Name: to, Expected: p.ID, Got: b.PeerID}
+		}
+	} else {
+		// A server without device chains: one key, checked the old way.
+		if configured := configuredID(n.cfg, to); configured != "" && !strings.EqualFold(configured, b.PeerID) {
+			return &storage.IdentityMismatchError{Name: to, Expected: configured, Got: b.PeerID}
+		}
+		if err := storage.PinOutgoing(to, b.PeerID, ""); err != nil {
+			return err
+		}
+	}
 	var boxKey [32]byte
-	copy(boxKey[:], resp.BoxKey)
-	sealed, err := mailbox.Seal(n.nm.Identity(), senderName(n.cfg), peerID, &boxKey, id, sent, body)
+	copy(boxKey[:], b.BoxKey)
+	sealed, err := mailbox.Seal(n.nm.Identity(), senderName(n.cfg), b.PeerID, &boxKey, id, sent, body)
 	if err != nil {
 		return err
 	}
 	if len(sealed) > directory.MaxSealedLetter {
 		return errors.New("message too large for the mailbox")
 	}
-	return n.dir.MailboxPut(to, sealed)
+	return n.dir.MailboxPut(to, b.PeerID, sealed)
 }
 
 // mailWhenOffline moves a queued message to the contact's mailbox if the
@@ -167,7 +197,7 @@ func (n *node) openLetter(sl directory.Letter) error {
 		n.logDrop(storage.DroppedMessage{Dir: "in", Peer: from, Reason: "mailbox letter rejected: " + err.Error()})
 		return nil
 	}
-	if err := n.accept(peerID); err != nil {
+	if err := n.accept(peerID, l.From); err != nil {
 		return nil // accept logged it
 	}
 	err = n.nm.Deliver(network.IncomingMessage{ID: l.ID, PeerID: peerID, Name: l.From, Body: l.Body,

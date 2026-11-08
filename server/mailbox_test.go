@@ -41,24 +41,32 @@ func mailClient(t *testing.T, server, user, pass string, id *identity.Identity, 
 	return c
 }
 
-// seal does what a client does before leaving a letter: check the key the
-// server returned, then seal to it.
-func seal(t *testing.T, from *testClient, fromID *identity.Identity, to, body string) []byte {
+// put does what a client does to leave a letter: check each device's key
+// the server returned, seal the letter to it, and leave it.
+func put(t *testing.T, from *testClient, fromID *identity.Identity, to, body string) error {
 	t.Helper()
 	resp, err := from.dir.MailboxKey(to)
 	if err != nil {
 		t.Fatalf("mailbox key for %s: %v", to, err)
 	}
-	if identity.PeerID(resp.PubKey) != resp.PeerID || !mailbox.VerifyBoxKey(resp.PubKey, resp.BoxKey, resp.BoxSig) {
-		t.Fatal("server returned a box key that doesn't verify")
+	if len(resp.Boxes) == 0 {
+		t.Fatal("no box keys")
 	}
-	var key [32]byte
-	copy(key[:], resp.BoxKey)
-	sealed, err := mailbox.Seal(fromID, "alice", resp.PeerID, &key, "m-"+body, time.Now(), body)
-	if err != nil {
-		t.Fatal(err)
+	for _, b := range resp.Boxes {
+		if identity.PeerID(b.PubKey) != b.PeerID || !mailbox.VerifyBoxKey(b.PubKey, b.BoxKey, b.BoxSig) {
+			t.Fatal("server returned a box key that doesn't verify")
+		}
+		var key [32]byte
+		copy(key[:], b.BoxKey)
+		sealed, err := mailbox.Seal(fromID, "alice", b.PeerID, &key, "m-"+body, time.Now(), body)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := from.dir.MailboxPut(to, b.PeerID, sealed); err != nil {
+			return err
+		}
 	}
-	return sealed
+	return nil
 }
 
 func TestMailboxHoldsSealedLettersUntilFetched(t *testing.T) {
@@ -71,7 +79,7 @@ func TestMailboxHoldsSealedLettersUntilFetched(t *testing.T) {
 	alice := mailClient(t, server, "alice", "correct-horse-1", aliceID, true, nil)
 	waitFor(t, "bob offline", func() bool { _, err := alice.dir.Lookup("bob"); return err != nil })
 
-	if err := alice.dir.MailboxPut("bob", seal(t, alice, aliceID, "bob", "secret plans")); err != nil {
+	if err := put(t, alice, aliceID, "bob", "secret plans"); err != nil {
 		t.Fatal(err)
 	}
 	// The server only holds ciphertext.
@@ -102,7 +110,7 @@ func TestMailboxHoldsSealedLettersUntilFetched(t *testing.T) {
 
 	// While bob is online, a new letter is announced right away.
 	before := mail.Load()
-	if err := alice.dir.MailboxPut("bob", seal(t, alice, aliceID, "bob", "hi again")); err != nil {
+	if err := put(t, alice, aliceID, "bob", "hi again"); err != nil {
 		t.Fatal(err)
 	}
 	waitFor(t, "mail push", func() bool { return mail.Load() > before })
@@ -133,7 +141,7 @@ func TestMailboxIsOptInOnEveryEnd(t *testing.T) {
 	// carol had it on, then turned it off: her letters are deleted with it.
 	carol := mailClient(t, server, "carol", "orange-kite-37", carolID, true, nil)
 	carol.cancel()
-	if err := alice.dir.MailboxPut("carol", seal(t, alice, aliceID, "carol", "one")); err != nil {
+	if err := put(t, alice, aliceID, "carol", "one"); err != nil {
 		t.Fatal(err)
 	}
 	carol = mailClient(t, server, "carol", "", carolID, false, nil)
@@ -158,25 +166,13 @@ func TestMailboxRefusesOversizedAndStaleKeys(t *testing.T) {
 	alice := mailClient(t, server, "alice", "correct-horse-1", aliceID, true, nil)
 	bob := mailClient(t, server, "bob", "battery-staple-2", bobID, true, nil)
 
-	if err := alice.dir.MailboxPut("bob", make([]byte, directory.MaxSealedLetter+1)); err == nil {
+	if err := alice.dir.MailboxPut("bob", bobID.ID, make([]byte, directory.MaxSealedLetter+1)); err == nil {
 		t.Fatal("an oversized letter was accepted")
 	}
-
-	// A letter waits for bob's current device; then he moves to a new one.
-	bob.cancel()
-	waitFor(t, "bob offline", func() bool { _, err := alice.dir.Lookup("bob"); return err != nil })
-	if err := alice.dir.MailboxPut("bob", seal(t, alice, aliceID, "bob", "for the old device")); err != nil {
-		t.Fatal(err)
+	if err := alice.dir.MailboxPut("bob", "notadeviceofbob", []byte("x")); err == nil {
+		t.Fatal("a letter for a device that isn't bob's was accepted")
 	}
-	newID, _ := identity.Generate()
-	bob = mailClient(t, server, "bob", "battery-staple-2", newID, true, nil)
-	resp, err := alice.dir.MailboxKey("bob")
-	if err != nil || resp.PeerID != newID.ID {
-		t.Fatalf("after a key change the new key must be served: %+v %v", resp, err)
-	}
-	if letters, _, _ := bob.dir.MailboxFetch(); len(letters) != 0 {
-		t.Fatalf("the new device got letters it can't open: %d", len(letters))
-	}
+	_ = bob
 
 	// A box key signed by a different identity than the one logging in is
 	// never published.
@@ -193,59 +189,59 @@ func TestMailboxRefusesOversizedAndStaleKeys(t *testing.T) {
 
 func TestMailboxStoreLimitsAndExpiry(t *testing.T) {
 	m := &mailboxStore{dir: t.TempDir(), maxItems: 3, maxBytes: 1000, perPeer: 2, keep: time.Hour}
-	if _, err := m.Put("bob", "alice", "K1", []byte("x"), time.Now()); !errors.Is(err, errNoBox) {
+	if _, err := m.Put("bob", "alice", "kaa", []byte("x"), time.Now()); !errors.Is(err, errNoBox) {
 		t.Fatalf("no key published yet: %v", err)
 	}
-	_ = m.SetKey("Bob", boxRecord{PeerID: "K1"})
+	_ = m.SetKey("Bob", boxRecord{PeerID: "kaa"})
 	now := time.Now()
 	for i, from := range []string{"alice", "alice", "alice"} {
-		_, err := m.Put("bob", from, "K1", []byte("x"), now)
+		_, err := m.Put("bob", from, "kaa", []byte("x"), now)
 		if (i < 2) != (err == nil) {
 			t.Fatalf("letter %d from alice: %v", i, err)
 		}
 	}
-	if _, err := m.Put("bob", "carol", "K1", []byte("x"), now.Add(-2*time.Hour)); err != nil {
+	if _, err := m.Put("bob", "carol", "kaa", []byte("x"), now.Add(-2*time.Hour)); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := m.Put("bob", "dave", "K1", []byte("x"), now); !errors.Is(err, errMailboxFull) {
+	if _, err := m.Put("bob", "dave", "kaa", []byte("x"), now); !errors.Is(err, errMailboxFull) {
 		t.Fatalf("over the item limit: %v", err)
 	}
-	if _, err := m.Put("eve", "alice", "K9", make([]byte, 2000), now); err == nil {
+	if _, err := m.Put("eve", "alice", "kzz", make([]byte, 2000), now); err == nil {
 		t.Fatal("put without a key")
 	}
-	if letters, _ := m.Fetch("bob", "K2"); len(letters) != 0 {
+	if letters, _ := m.Fetch("bob", "kbb"); len(letters) != 0 {
 		t.Fatal("letters sealed to another key were handed out")
 	}
-	if letters, _ := m.Fetch("BOB", "K1"); len(letters) != 3 || letters[0].From != "carol" {
+	if letters, _ := m.Fetch("BOB", "kaa"); len(letters) != 3 || letters[0].From != "carol" {
 		t.Fatalf("fetch oldest first: %+v", letters)
 	}
 	if n := m.Expire(now); n != 1 {
 		t.Fatalf("expired %d, want 1", n)
 	}
 	m.Ack("bob", []string{"../../etc/passwd", "zz"})
-	letters, _ := m.Fetch("bob", "K1")
+	letters, _ := m.Fetch("bob", "kaa")
 	ids := []string{}
 	for _, l := range letters {
 		ids = append(ids, l.ID)
 	}
 	m.Ack("bob", ids)
-	if letters, _ := m.Fetch("bob", "K1"); len(letters) != 0 {
+	if letters, _ := m.Fetch("bob", "kaa"); len(letters) != 0 {
 		t.Fatalf("ack left %d", len(letters))
 	}
 	if err := m.Remove("bob"); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := m.Key("bob"); !errors.Is(err, errNoBox) {
-		t.Fatalf("removed mailbox still has a key: %v", err)
+	if len(m.Keys("bob")) != 0 {
+		t.Fatal("removed mailbox still has a key")
 	}
 }
 
 func TestMailboxFetchFitsOneFrame(t *testing.T) {
 	m := &mailboxStore{dir: t.TempDir(), maxItems: 1000, maxBytes: 1 << 30, perPeer: 1000, keep: time.Hour}
-	_ = m.SetKey("bob", boxRecord{PeerID: "K1"})
+	_ = m.SetKey("bob", boxRecord{PeerID: "kaa"})
 	sender := strings.Repeat("ש", 32) // the longest name, in bytes
 	put := func(size int) {
-		if _, err := m.Put("bob", sender, "K1", make([]byte, size), time.Now()); err != nil {
+		if _, err := m.Put("bob", sender, "kaa", make([]byte, size), time.Now()); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -257,7 +253,7 @@ func TestMailboxFetchFitsOneFrame(t *testing.T) {
 	}
 	got := 0
 	for round := 0; round < 100; round++ {
-		letters, more := m.Fetch("bob", "K1")
+		letters, more := m.Fetch("bob", "kaa")
 		data, _ := json.Marshal(directory.Response{OK: true, Letters: letters, More: more})
 		if len(data) > wire.MaxFrameSize {
 			t.Fatalf("fetch response is %d bytes, over the %d frame limit", len(data), wire.MaxFrameSize)

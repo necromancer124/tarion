@@ -52,6 +52,8 @@ tariond ban bob                     # ban a username...
 tariond ban "x5u5 zbuk qp3a g4dj hpyl ztgg u7z3 siop"   # ...or a device key
 tariond unban bob
 tariond delete bob                  # delete an account (frees the name)
+tariond devices bob                 # list an account's devices
+tariond devices reset bob           # forget them all (bob lost every device)
 tariond id                          # print the server ID
 ```
 
@@ -65,9 +67,9 @@ Operator commands take the same `-data` flag (or `TARIOND_DATA`) as the server.
 ## What it does
 
 - **Accounts.** The first login with a new name creates the account (if registration allows it) and links it to that device's key. Usernames are 1–32 letters or digits plus `. _ -`, not case-sensitive. New passwords need 10+ characters, can't contain the username, and can't be one repeated character. Passwords are stored as argon2id hashes (64 MiB, 3 passes by default); each hash records its own settings and is redone at the next password login if you change them. `users.json` is replaced atomically, so a crash can't corrupt it.
-- **Login.** Logins go over QUIC/TLS 1.3 (ALPN `tarion-dir/1`) with mutual TLS and a post-quantum hybrid key exchange (X25519MLKEM768). A device whose key is linked to the account logs in with the key alone. A password login from a new device links that device instead. A newer login closes the older session.
+- **Login.** Logins go over QUIC/TLS 1.3 (ALPN `tarion-dir/1`) with mutual TLS and a post-quantum hybrid key exchange (X25519MLKEM768). A device on the account logs in with its key alone. A password login from a new device doesn't add it: the server answers `device_not_approved` with a pairing code (valid 15 minutes), and one of the account's devices approves it with a certificate it signs (`device_pending`, `device_approve`); the server checks the signature before adding it. Up to 8 devices per account, each with its own session; a newer login of the same device closes its older session. `device_remove` takes a device off and disconnects it. `tariond devices reset NAME` (operator) forgets all of an account's devices; the next password login becomes the first again.
 - **Presence.** A user is online while their connection is open. Clients send keep-alives every 15 seconds, and the server drops a connection after 45 seconds of silence.
-- **Lookup.** The server returns the target's public chat address and key, and their LAN address only if both users share a public IP. It also tells the target to punch toward the requester, including the requester's LAN address in that case.
+- **Lookup.** The server returns every online device of the target (public chat address and key, and LAN address only if both users share a public IP) plus the account's signed device chain, which clients verify. It also tells each device to punch toward the requester, including the requester's LAN address in that case.
 - **List.** The server returns the names of online users (not their addresses), capped at 500.
 - **Relay (off by default).** With `-relay`, when two peers can't connect directly, one asks for a relay session. The target must have the relay turned on too, otherwise the server answers `relay_refused`. The server forwards packets between the two members' known addresses only, without being able to decrypt them (the peers' TLS runs end to end inside). Sessions close after 2 minutes without traffic.
 - **Mailbox (off by default).** With `-mailbox`, a user who logs in with `-mailbox on` publishes a mailbox key signed by their identity key. Others can then leave letters for them while they're offline (`mailbox_key`, `mailbox_put`). The letters are sealed to that key and signed by the sender, so the server stores only ciphertext and can't forge or redirect them; it does see who wrote to whom, when, and the size. The owner fetches them (`mailbox_fetch`) and they are deleted once acknowledged (`mailbox_ack`). If the recipient is online, the server tells them a letter arrived. A user who logs in with the mailbox off has their letters deleted and gets no new ones (`mailbox_refused`). Deleting an account deletes its mailbox.

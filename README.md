@@ -80,7 +80,23 @@ Start the interactive client, log in, and listen:
 .\tarion.exe start -server SERVER:63425 -user alice -pass "a long passphrase"
 ```
 
-`-pass` is only needed the first time on each device. That login links the device's key to your account, and the password is then removed from `config.json`. After that, `.\tarion.exe start` is enough. The first login with a new name creates the account (10+ characters, not containing your username). If the server is invite-only, add `-invite CODE` the first time; the operator creates codes with `tariond invite`.
+`-pass` is only needed the first time on each device; the password is then removed from `config.json`, and after that `.\tarion.exe start` is enough. The first login with a new name creates the account (10+ characters, not containing your username), and that device becomes the account's first. If the server is invite-only, add `-invite CODE` the first time; the operator creates codes with `tariond invite`.
+
+### Using more than one device
+
+Each device keeps its own key; an account holds up to 8. A new device needs your password **and** approval from a device you already have, so a stolen password alone gets nobody in:
+
+1. On the new device, log in with your password. It waits and shows a code:
+   `this device is waiting to be added to alice. On a device already signed in, run: tarion devices approve 7WMW-26Z2`
+2. On a device that's already signed in:
+
+   ```powershell
+   .\tarion.exe devices approve 7WMW-26Z2   # shows the new device's name and ID, asks to confirm
+   .\tarion.exe devices                     # list your devices
+   .\tarion.exe devices remove laptop       # take one off (it is signed out)
+   ```
+
+All your online devices receive every message, and each keeps its own history. The approving device **signs** the new one into your account, and your contacts check that signature chain back to the key they pinned, so they accept your new device without a "key changed" warning, while the server can't add a device of its own. If you lose every device, your server's operator can run `tariond devices reset NAME`; your next password login starts over, and your contacts see a key change.
 
 Run the listener detached, without keeping the terminal open:
 
@@ -232,6 +248,7 @@ Stop the background process before changing this. Not encrypted: `config.json` (
 ## Security model
 
 - **Identity.** `identity.key` is an Ed25519 key created on first run. Your peer ID is a hash of its public key. Both sides present their key in the QUIC/TLS 1.3 handshake (mutual TLS), so a peer ID cannot be claimed without owning the private key.
+- **Devices.** An account's devices form a chain: each one after the first is signed by the device that approved it. Clients pin a contact's first device and accept another key for that name only if the chain leads to it from the pin, so neither the server nor anyone else can add a device to someone's account.
 - **Encryption.** Every connection is QUIC with TLS 1.3 (AES-GCM) and a post-quantum hybrid key exchange (X25519MLKEM768), so recorded traffic stays private even against a future quantum computer. The Ed25519 identity keys are not post-quantum.
 - **Server login.** The password is only ever sent inside that encrypted connection. It links your account to your device's key; later logins use the key alone, and the password isn't stored on your device. The server stores argon2id hashes (64 MiB, 3 passes), requires 10+ character passwords for new accounts, rate-limits logins and registrations, and checks usernames (1–32 letters/digits plus `. _ -`, not case-sensitive). Operators can make the server invite-only and ban users or keys. Your client also receives the server's list of banned keys and, unless you set `-server-bans off`, refuses to exchange messages with them, even over a direct connection.
 - **Server pinning.** The client pins the server's key (`server_id`), so an impostor server can't collect passwords.
@@ -316,7 +333,7 @@ The directory uses ALPN `tarion-dir/1` with the same framing; see [`internal/dir
 
 - Networks that block UDP entirely can't use Tarion yet; a TCP transport is tracked in #13.
 - Without the mailbox, queued messages wait on the *sender's* device, so both of you need to be online at the same moment eventually. With it (opt-in), the server holds them sealed.
-- One device per account (#15).
+- History isn't synced between your devices: each keeps what it received and sent. A removed device stays in the signed chain (marked removed), so the server could show it again; it can't add a new one.
 - On Linux and macOS, local data is only encrypted if you set a passphrase (`tarion protect passphrase`); the system keychain isn't used yet. History file names show your contacts' names.
 - Trust on first use: on the very first contact you trust the key the server reports. Compare `tarion id` with your contact, or put their `id` in `config.json`, to rule that out.
 

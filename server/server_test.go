@@ -206,7 +206,7 @@ func TestKeyLoginWithoutPassword(t *testing.T) {
 
 	// A different device without the password is refused.
 	other := startClient(t, server, "alice", "", "", nil)
-	waitFor(t, "refusal", func() bool { return strings.Contains(other.dir.Status(), "not linked") })
+	waitFor(t, "refusal", func() bool { return strings.Contains(other.dir.Status(), "not on the account") })
 }
 
 func TestWrongPasswordAndBadNames(t *testing.T) {
@@ -244,7 +244,7 @@ func TestSecondLoginReplacesFirst(t *testing.T) {
 	waitFor(t, "first", a.dir.Connected)
 	b := startClient(t, server, "alice", "", "", id)
 	waitFor(t, "second", b.dir.Connected)
-	waitFor(t, "first closed", func() bool { return strings.Contains(a.dir.Status(), "another device") })
+	waitFor(t, "first closed", func() bool { return strings.Contains(a.dir.Status(), "logged in again") })
 }
 
 func TestAdvertisedPublicAddress(t *testing.T) {

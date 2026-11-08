@@ -36,6 +36,7 @@ type Options struct {
 	Registration string // RegOpen, RegInvite or RegClosed
 	InvitesDir   string // one file per unused invite code
 	DeletionsDir string // operator requests to delete accounts
+	ResetsDir    string // operator requests to reset an account's devices
 	BansPath     string // usernames / peer IDs, re-read when changed
 	MinPassword  int
 
@@ -76,9 +77,11 @@ type Server struct {
 	bans      *banList
 	invites   invites
 	deletions deletions
+	resets    deletions // same mechanism: one request file per name
+	pending   pendingDevices
 
 	mu         sync.Mutex
-	sessions   map[string]*session // account key -> live session
+	sessions   map[string]*session // sessKey(account, device) -> live session
 	connsPerIP map[string]int
 	active     int
 
@@ -120,6 +123,7 @@ type session struct {
 
 	mu          sync.Mutex
 	user        string
+	since       time.Time // when it logged in
 	localAddrs  []string
 	publicAddr  string // advertised by the user (e.g. a forwarded port)
 	acceptRelay bool
@@ -162,6 +166,7 @@ func NewServer(id *identity.Identity, accounts *Accounts, opts Options) *Server 
 		bans:       newBanList(opts.BansPath),
 		invites:    invites{dir: opts.InvitesDir},
 		deletions:  deletions{dir: opts.DeletionsDir},
+		resets:     deletions{dir: opts.ResetsDir},
 		sessions:   map[string]*session{},
 		connsPerIP: map[string]int{},
 		connLimit:  newLimiter(2*time.Second, 20),
@@ -220,6 +225,7 @@ func (s *Server) Serve(ln *quic.Listener) error {
 				s.broadcastRevoked()
 			}
 			s.processDeletions()
+			s.processResets()
 		}
 	}()
 	for {
@@ -302,9 +308,9 @@ func (s *Server) endSession(sess *session) {
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if s.sessions[directory.NameKey(user)] == sess {
-		delete(s.sessions, directory.NameKey(user))
-		log.Printf("offline: %s", user)
+	if s.sessions[sessKey(user, sess.peerID)] == sess {
+		delete(s.sessions, sessKey(user, sess.peerID))
+		log.Printf("offline: %s (%s)", user, identity.Short(sess.peerID))
 	}
 }
 
@@ -354,6 +360,14 @@ func (s *Server) handle(sess *session, req directory.Request) directory.Response
 		return s.mailboxFetch(sess)
 	case directory.OpMailboxAck:
 		return s.mailboxAck(sess, req)
+	case directory.OpDevices:
+		return s.devicesOp(sess, req)
+	case directory.OpDevicePending:
+		return s.devicePending(sess, req)
+	case directory.OpDeviceApprove:
+		return s.deviceApprove(sess, req)
+	case directory.OpDeviceRemove:
+		return s.deviceRemove(sess, req)
 	}
 	return fail(directory.ErrBadRequest)
 }
@@ -389,7 +403,7 @@ func (s *Server) register(sess *session, req directory.Request) directory.Respon
 		}
 	}
 	s.hashing <- struct{}{}
-	name, err := s.accounts.Create(req.User, req.Pass, sess.peerID)
+	name, err := s.accounts.Create(req.User, req.Pass, sess.peerID, sess.pubKey, cleanDeviceName(req.DeviceName))
 	<-s.hashing
 	if err != nil && s.opts.Registration == RegInvite {
 		s.invites.Restore(req.Invite)
@@ -426,15 +440,19 @@ func (s *Server) login(sess *session, req directory.Request) directory.Response 
 		if !s.authLimit.Allow(sess.ip) || !s.userLimit.Allow(directory.NameKey(req.User)) {
 			return fail(directory.ErrRateLimited)
 		}
-		var keyChanged bool
+		var becameRoot bool
 		s.hashing <- struct{}{}
-		name, keyChanged, err = s.accounts.LoginWithPassword(req.User, req.Pass, sess.peerID)
+		name, becameRoot, err = s.accounts.LoginWithPassword(req.User, req.Pass, sess.peerID, sess.pubKey, cleanDeviceName(req.DeviceName))
 		<-s.hashing
-		if keyChanged {
-			log.Printf("key change: %s is now %s", name, identity.Short(sess.peerID))
+		if becameRoot {
+			log.Printf("first device: %s is now %s", name, identity.Short(sess.peerID))
 		}
 	}
 	switch {
+	case errors.Is(err, errNotApproved):
+		code := s.pending.add(name, sess.peerID, sess.pubKey, cleanDeviceName(req.DeviceName))
+		log.Printf("device waiting for approval: %s (%s)", name, identity.Short(sess.peerID))
+		return directory.Response{Error: directory.ErrNotApproved, Detail: code}
 	case errors.Is(err, errNoSuchUser):
 		return fail(directory.ErrNoSuchUser)
 	case errors.Is(err, errPasswordRequired):
@@ -446,11 +464,12 @@ func (s *Server) login(sess *session, req directory.Request) directory.Response 
 		log.Printf("login %q: %v", req.User, err)
 		return fail(directory.ErrServer)
 	}
+	s.accounts.NotePubKey(name, sess.peerID, sess.pubKey)
 	return s.bind(sess, name, req)
 }
 
-// bind makes sess the account's live session. An older session for the same
-// account (another device, or a stale connection) is closed.
+// bind makes sess this device's live session. An older session of the same
+// device (a stale connection) is closed; the account's other devices stay.
 func (s *Server) bind(sess *session, name string, req directory.Request) directory.Response {
 	var clean []string
 	for _, a := range req.LocalAddrs {
@@ -466,19 +485,19 @@ func (s *Server) bind(sess *session, name string, req directory.Request) directo
 		public = req.PublicAddr
 	}
 	sess.mu.Lock()
-	sess.user, sess.localAddrs = name, clean
+	sess.user, sess.localAddrs, sess.since = name, clean, time.Now()
 	sess.publicAddr, sess.acceptRelay = public, req.AcceptRelay
 	sess.mu.Unlock()
 
-	key := directory.NameKey(name)
+	key := sessKey(name, sess.peerID)
 	s.mu.Lock()
 	old := s.sessions[key]
 	s.sessions[key] = sess
 	s.mu.Unlock()
 	if old != nil && old != sess {
-		_ = old.conn.CloseWithError(directory.CodeReplaced, "logged in elsewhere")
+		_ = old.conn.CloseWithError(directory.CodeReplaced, "this device logged in again")
 	}
-	log.Printf("online: %s", name)
+	log.Printf("online: %s (%s)", name, identity.Short(sess.peerID))
 	return directory.Response{OK: true, User: name, YourAddr: sess.addr, Revoked: s.revokedKeys(), Mail: s.updateMailbox(sess, name, req)}
 }
 
@@ -490,7 +509,7 @@ func (s *Server) updateMailbox(sess *session, name string, req directory.Request
 		return 0
 	}
 	if !req.AcceptMailbox {
-		if err := s.mailbox.Remove(name); err != nil {
+		if err := s.mailbox.RemoveDevice(name, sess.peerID); err != nil {
 			log.Printf("mailbox for %s: %v", name, err)
 		}
 		return 0
@@ -512,10 +531,11 @@ func (s *Server) list(sess *session) directory.Response {
 		return fail(directory.ErrNotLoggedIn)
 	}
 	s.mu.Lock()
+	seen := map[string]bool{directory.NameKey(user): true} // your own devices aren't listed
 	names := make([]string, 0, len(s.sessions))
 	for _, o := range s.sessions {
-		if o != sess {
-			n, _ := o.loggedIn()
+		if n, _ := o.loggedIn(); !seen[directory.NameKey(n)] {
+			seen[directory.NameKey(n)] = true
 			names = append(names, n)
 		}
 	}
@@ -536,29 +556,42 @@ func (s *Server) lookup(sess *session, req directory.Request) directory.Response
 	if !directory.ValidUsername(req.Target) {
 		return fail(directory.ErrOffline)
 	}
-	s.mu.Lock()
-	target := s.sessions[directory.NameKey(req.Target)]
-	s.mu.Unlock()
-	if target == nil || target == sess {
+	// Every online device of the target, except the one asking (you can
+	// message your own other devices).
+	var targets []*session
+	for _, t := range s.userSessions(req.Target) {
+		if name, _ := t.loggedIn(); t != sess && !s.bans.Banned(name, t.peerID) {
+			targets = append(targets, t)
+		}
+	}
+	if len(targets) == 0 {
 		return fail(directory.ErrOffline)
 	}
-	targetName, targetLocal := target.loggedIn()
-	if s.bans.Banned(targetName, target.peerID) {
-		return fail(directory.ErrOffline)
-	}
-	resp := directory.Response{OK: true, User: targetName, Addr: target.addr, PeerID: target.peerID}
-	target.mu.Lock()
-	resp.PublicAddr = target.publicAddr
-	target.mu.Unlock()
-	// LAN addresses only help (and are only shared) when both are behind the
-	// same public IP, where dialing the public address needs NAT hairpinning.
-	push := directory.Push{Type: directory.PushPunch, From: user, PeerID: sess.peerID, Addr: sess.addr}
-	if target.ip == sess.ip {
-		resp.LocalAddrs = targetLocal
-		_, push.LocalAddrs = sess.loggedIn()
-	}
-	if s.punchLimit.Allow(sess.id + ">" + target.id) {
-		go s.pushPunch(target, push)
+	targetName, _ := targets[0].loggedIn()
+	certs, _ := s.accounts.Devices(targetName)
+	resp := directory.Response{OK: true, User: targetName, Certs: certs}
+	for i, target := range targets {
+		_, targetLocal := target.loggedIn()
+		d := directory.Device{PeerID: target.peerID, Addr: target.addr}
+		target.mu.Lock()
+		d.PublicAddr = target.publicAddr
+		target.mu.Unlock()
+		// LAN addresses only help (and are only shared) when both are behind
+		// the same public IP, where dialing the public address needs NAT
+		// hairpinning.
+		push := directory.Push{Type: directory.PushPunch, From: user, PeerID: sess.peerID, Addr: sess.addr}
+		if target.ip == sess.ip {
+			d.LocalAddrs = targetLocal
+			_, push.LocalAddrs = sess.loggedIn()
+		}
+		if i == 0 {
+			// The latest login, in the single-device fields older clients read.
+			resp.Addr, resp.PeerID, resp.PublicAddr, resp.LocalAddrs = d.Addr, d.PeerID, d.PublicAddr, d.LocalAddrs
+		}
+		resp.Devices = append(resp.Devices, d)
+		if s.punchLimit.Allow(sess.id + ">" + target.id) {
+			go s.pushPunch(target, push)
+		}
 	}
 	return resp
 }
@@ -572,8 +605,10 @@ func (s *Server) revokedKeys() []string {
 		set[k] = true
 	}
 	for _, n := range names {
-		if u, ok := s.accounts.get(n); ok && u.PeerID != "" {
-			set[strings.ToLower(u.PeerID)] = true
+		if u, ok := s.accounts.get(n); ok {
+			for _, d := range u.Devices {
+				set[strings.ToLower(d.PeerID)] = true
+			}
 		}
 	}
 	out := make([]string, 0, len(set))
@@ -679,10 +714,15 @@ func (s *Server) openRelay(sess *session, req directory.Request) directory.Respo
 	if !s.opts.Relay {
 		return fail(directory.ErrRelayOff)
 	}
-	s.mu.Lock()
-	target := s.sessions[directory.NameKey(req.Target)]
-	s.mu.Unlock()
-	if target == nil || target == sess {
+	// The device asked for (Device), or else the target's latest login.
+	var target *session
+	for _, t := range s.userSessions(req.Target) {
+		if t != sess && (req.Device == "" || t.peerID == req.Device) {
+			target = t
+			break
+		}
+	}
+	if target == nil {
 		return fail(directory.ErrOffline)
 	}
 	targetName, _ := target.loggedIn()
@@ -842,13 +882,12 @@ func (s *Server) processDeletions() {
 	}
 }
 
-// endAccount closes the live session of a deleted account.
+// endAccount closes every live session of a deleted account.
 func (s *Server) endAccount(name string, delay time.Duration) {
-	s.mu.Lock()
-	sess := s.sessions[directory.NameKey(name)]
-	delete(s.sessions, directory.NameKey(name))
-	s.mu.Unlock()
-	if sess != nil {
+	for _, sess := range s.userSessions(name) {
+		s.mu.Lock()
+		delete(s.sessions, sessKey(name, sess.peerID))
+		s.mu.Unlock()
 		go func() {
 			time.Sleep(delay)
 			_ = sess.conn.CloseWithError(directory.CodeDeleted, "account deleted")
@@ -881,44 +920,63 @@ func (s *Server) removeMailbox(name string) {
 	}
 }
 
-// mailboxTarget finds the recipient's account and its published box key.
-// A key published by a device the account no longer uses is refused.
-func (s *Server) mailboxTarget(sess *session, target string) (account, boxRecord, directory.Response) {
+// mailboxTarget finds the recipient's account and the box keys its active
+// devices published. Keys of removed or banned devices are left out.
+func (s *Server) mailboxTarget(sess *session, target string) (account, []boxRecord, directory.Response) {
 	user, _ := sess.loggedIn()
 	switch {
 	case user == "":
-		return account{}, boxRecord{}, fail(directory.ErrNotLoggedIn)
+		return account{}, nil, fail(directory.ErrNotLoggedIn)
 	case s.mailbox == nil:
-		return account{}, boxRecord{}, fail(directory.ErrMailboxOff)
+		return account{}, nil, fail(directory.ErrMailboxOff)
 	case !directory.ValidUsername(target) || directory.NameKey(target) == directory.NameKey(user):
-		return account{}, boxRecord{}, fail(directory.ErrNoSuchUser)
+		return account{}, nil, fail(directory.ErrNoSuchUser)
 	}
 	acct, ok := s.accounts.get(target)
 	if !ok {
-		return account{}, boxRecord{}, fail(directory.ErrNoSuchUser)
+		return account{}, nil, fail(directory.ErrNoSuchUser)
 	}
-	rec, err := s.mailbox.Key(acct.Name)
-	if err != nil || s.bans.Banned(acct.Name, acct.PeerID) || !strings.EqualFold(rec.PeerID, acct.PeerID) {
-		return account{}, boxRecord{}, fail(directory.ErrMailboxRefused)
+	var recs []boxRecord
+	for _, rec := range s.mailbox.Keys(acct.Name) {
+		if acct.active(rec.PeerID) && !s.bans.Banned(acct.Name, rec.PeerID) {
+			recs = append(recs, rec)
+		}
 	}
-	return acct, rec, directory.Response{OK: true}
+	if len(recs) == 0 {
+		return account{}, nil, fail(directory.ErrMailboxRefused)
+	}
+	return acct, recs, directory.Response{OK: true}
 }
 
-// mailboxKey returns what a sender needs to seal a letter to target.
+// mailboxKey returns what a sender needs to seal a letter to each of the
+// target's devices, and the device chain to check them against.
 func (s *Server) mailboxKey(sess *session, req directory.Request) directory.Response {
-	acct, rec, resp := s.mailboxTarget(sess, req.Target)
+	acct, recs, resp := s.mailboxTarget(sess, req.Target)
 	if !resp.OK {
 		return resp
 	}
-	return directory.Response{OK: true, User: acct.Name, PeerID: rec.PeerID, PubKey: rec.PubKey, BoxKey: rec.BoxKey, BoxSig: rec.BoxSig}
+	resp = directory.Response{OK: true, User: acct.Name, Certs: acct.Devices}
+	for _, rec := range recs {
+		resp.Boxes = append(resp.Boxes, directory.Box{PeerID: rec.PeerID, PubKey: rec.PubKey, BoxKey: rec.BoxKey, BoxSig: rec.BoxSig})
+	}
+	return resp
 }
 
-// mailboxPut stores a sealed letter for an offline user and, if they are
-// online after all, tells them to fetch it.
+// mailboxPut stores a sealed letter for one of an offline user's devices
+// (Device) and, if that device is online after all, tells it to fetch it.
 func (s *Server) mailboxPut(sess *session, req directory.Request) directory.Response {
-	acct, rec, resp := s.mailboxTarget(sess, req.Target)
+	acct, recs, resp := s.mailboxTarget(sess, req.Target)
 	if !resp.OK {
 		return resp
+	}
+	var rec boxRecord
+	for _, r := range recs {
+		if r.PeerID == req.Device {
+			rec = r
+		}
+	}
+	if rec.PeerID == "" {
+		return fail(directory.ErrMailboxRefused)
 	}
 	if len(req.Sealed) == 0 {
 		return fail(directory.ErrBadRequest)
@@ -939,9 +997,9 @@ func (s *Server) mailboxPut(sess *session, req directory.Request) directory.Resp
 		return fail(directory.ErrServer)
 	}
 	s.mu.Lock()
-	target := s.sessions[directory.NameKey(acct.Name)]
+	target := s.sessions[sessKey(acct.Name, rec.PeerID)]
 	s.mu.Unlock()
-	if target != nil && target.peerID == rec.PeerID {
+	if target != nil {
 		go s.pushPunch(target, directory.Push{Type: directory.PushMail})
 	}
 	return directory.Response{OK: true, User: acct.Name}
