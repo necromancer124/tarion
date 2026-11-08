@@ -2417,58 +2417,21 @@ func runForget(args []string) error {
 	return nil
 }
 
-func printGeneralHelp() {
-	fmt.Println(strings.Join([]string{
-		"Tarion - secure QUIC P2P terminal chat",
-		"",
-		"Usage:",
-		"  tarion [command] [options]",
-		"",
-		"Commands:",
-		"  start       Open the interactive menu/TUI and listen if no background is running",
-		"  menu        Open the interactive menu/TUI",
-		"  background  Run the always-on listener; use --detach to survive terminal close",
-		"  stop        Stop the detached/background listener",
-		"  send        Send one message through the background process",
-		"  listen      Print incoming messages as JSON lines (for scripts and apps)",
-		"  history     Print a chat's recent history",
-		"  portmap     Ask the router to forward your port again, and explain the result",
-		"  firewall    Check Windows Firewall; 'firewall allow' lets people reach you",
-		"  protect     Show or change how your local data is encrypted (passphrase, windows, off)",
-		"  outbox      List messages waiting to be delivered",
-		"  dropped     List messages that were given up on or refused",
-		"  devices     List your devices; 'devices approve CODE' adds one, 'devices remove' takes one off",
-		"  passwd      Change your account password",
-		"  delete-account  Delete your account on the server",
-		"  id          Show your peer ID so contacts can verify you",
-		"  peers       List pinned contacts and their peer IDs",
-		"  forget      Remove a contact's pinned key (after they reinstall)",
-		"  help        Show this help",
-		"",
-		"Command help:",
-		"  tarion start -h",
-		"  tarion background -h",
-		"  tarion stop -h",
-		"",
-		"Common examples:",
-		"  tarion start -server SERVER:63425 -user alice -pass secret",
-		"  tarion background --detach",
-		"  tarion menu",
-		"  tarion send bob \"hello\"",
-		"  tarion stop",
-		fmt.Sprintf("  tarion start -u Myself -i 127.0.0.1:%d", storage.DefaultPort),
-		"",
-		fmt.Sprintf("Ports: the client uses one UDP port (default %d, -p) for chat and for", storage.DefaultPort),
-		fmt.Sprintf("talking to the server; tariond listens on %d by default.", directory.DefaultServerPort),
-	}, "\n"))
-}
-
 func main() {
 	args := os.Args[1:]
 	if len(args) > 0 {
 		switch args[0] {
-		case "-h", "--help", "help":
+		case "-h", "--help":
 			printGeneralHelp()
+			return
+		case "help":
+			if err := runHelp(args[1:]); err != nil {
+				fmt.Fprintln(os.Stderr, "tarion:", err)
+				os.Exit(1)
+			}
+			return
+		case "man":
+			_ = runMan() // hidden: regenerates docs/man/tarion.1
 			return
 		}
 	}

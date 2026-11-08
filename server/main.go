@@ -76,7 +76,7 @@ func main() {
 	cmd := "serve"
 	if len(args) > 0 {
 		switch args[0] {
-		case "serve", "invite", "accounts", "ban", "unban", "delete", "devices", "id":
+		case "serve", "invite", "accounts", "ban", "unban", "delete", "devices", "id", "man":
 			cmd, args = args[0], args[1:]
 		}
 	}
@@ -94,6 +94,8 @@ func main() {
 		err = runDelete(args)
 	case "devices":
 		err = runDevices(args)
+	case "man":
+		writeManPage(os.Stdout) // hidden: regenerates docs/man/tariond.8
 	case "id":
 		err = runID(args)
 	}
@@ -103,19 +105,34 @@ func main() {
 	}
 }
 
+// serveFlags are tariond's serve options; the man page reads them too.
+type serveFlags struct {
+	port, minPass, argonMem, argonTime, relayKBps, relayTotalKBps, mailboxDays *int
+	reg                                                                        *string
+	relayOn, mailboxOn, showID                                                 *bool
+}
+
+func addServeFlags(fs *flag.FlagSet) serveFlags {
+	return serveFlags{
+		port:           fs.Int("port", directory.DefaultServerPort, "UDP port to listen on"),
+		reg:            fs.String("registration", RegOpen, "who may create accounts: open, invite or closed"),
+		minPass:        fs.Int("min-password", directory.DefaultMinPassword, "minimum password length for new accounts"),
+		argonMem:       fs.Int("argon-memory", int(DefaultArgon.MemoryKiB/1024), "argon2id memory per hash, MiB"),
+		argonTime:      fs.Int("argon-time", int(DefaultArgon.Time), "argon2id passes"),
+		relayOn:        fs.Bool("relay", false, "relay encrypted packets between peers whose NATs block direct connections (both peers must also turn it on)"),
+		relayKBps:      fs.Int("relay-kbps", 256, "relay bandwidth per session, KiB/s"),
+		relayTotalKBps: fs.Int("relay-total-kbps", 8192, "relay bandwidth for all sessions, KiB/s"),
+		mailboxOn:      fs.Bool("mailbox", false, "hold sealed letters for offline users who turn their mailbox on (the server can't read them)"),
+		mailboxDays:    fs.Int("mailbox-days", 7, "delete letters nobody fetched after this many days"),
+		showID:         fs.Bool("id", false, "print the server ID and exit (same as `tariond id`)"),
+	}
+}
+
 func serve(args []string) error {
 	fs := flag.NewFlagSet("serve", flag.ExitOnError)
-	port := fs.Int("port", directory.DefaultServerPort, "UDP port to listen on")
-	reg := fs.String("registration", RegOpen, "who may create accounts: open, invite or closed")
-	minPass := fs.Int("min-password", directory.DefaultMinPassword, "minimum password length for new accounts")
-	argonMem := fs.Int("argon-memory", int(DefaultArgon.MemoryKiB/1024), "argon2id memory per hash, MiB")
-	argonTime := fs.Int("argon-time", int(DefaultArgon.Time), "argon2id passes")
-	relayOn := fs.Bool("relay", false, "relay encrypted packets between peers whose NATs block direct connections (both peers must also turn it on)")
-	relayKBps := fs.Int("relay-kbps", 256, "relay bandwidth per session, KiB/s")
-	relayTotalKBps := fs.Int("relay-total-kbps", 8192, "relay bandwidth for all sessions, KiB/s")
-	mailboxOn := fs.Bool("mailbox", false, "hold sealed letters for offline users who turn their mailbox on (the server can't read them)")
-	mailboxDays := fs.Int("mailbox-days", 7, "delete letters nobody fetched after this many days")
-	showID := fs.Bool("id", false, "print the server ID and exit (same as `tariond id`)")
+	o := addServeFlags(fs)
+	port, reg, minPass, argonMem, argonTime := o.port, o.reg, o.minPass, o.argonMem, o.argonTime
+	relayOn, relayKBps, relayTotalKBps, mailboxOn, mailboxDays, showID := o.relayOn, o.relayKBps, o.relayTotalKBps, o.mailboxOn, o.mailboxDays, o.showID
 	getPaths := addPathFlags(fs)
 	_ = fs.Parse(args)
 	p := getPaths()

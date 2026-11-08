@@ -1,0 +1,125 @@
+.TH TARIOND 8 "" "tariond" "System Administration"
+.SH NAME
+tariond \- Tarion directory server
+.SH SYNOPSIS
+.B tariond
+[\fBserve\fR] [\fIoptions\fR]
+.br
+.B tariond
+\fIcommand\fR [\fIargs\fR] [\fB\-data\fR \fIdir\fR]
+.SH DESCRIPTION
+tariond tells Tarion clients where to find each other and signals NAT hole punching. Chat messages go directly between clients and are end\-to\-end encrypted.
+Two opt\-in features let messages pass through the server without it being able to read them: the relay (\fB\-relay\fR) and the mailbox (\fB\-mailbox\fR).
+Accounts use argon2id password hashes; each device logs in with its own Ed25519 key, and a new device must be approved by one already on the account.
+.SH COMMANDS
+.TP
+\fBserve\fR [options]
+run the server (the default)
+.TP
+\fBinvite\fR [\-n N]
+create one\-time invite codes (safe while the server runs)
+.TP
+\fBaccounts\fR 
+list accounts, their first device, device count and bans
+.TP
+\fBban\fR <name|peer\-id>
+ban a username or a device key (applied within seconds)
+.TP
+\fBunban\fR <name|peer\-id>
+lift a ban
+.TP
+\fBdelete\fR <name>
+delete an account and free the name
+.TP
+\fBdevices\fR <name>
+list an account's devices
+.TP
+\fBdevices reset\fR <name>
+forget all of an account's devices (the user lost them all); their next password login becomes the first
+.TP
+\fBid\fR 
+print the server ID; clients pin it, give it to users as server_id
+Operator commands take the same \fB\-data\fR (or \fBTARIOND_DATA\fR) as the server and write request files a running server picks up.
+.SH OPTIONS
+.TP
+\fB\-argon\-memory\fR (default 64)
+argon2id memory per hash, MiB
+.TP
+\fB\-argon\-time\fR (default 3)
+argon2id passes
+.TP
+\fB\-bans\fR
+ban list (default <data>/bans.txt)
+.TP
+\fB\-data\fR (default \&.)
+folder for all server files (env TARIOND_DATA)
+.TP
+\fB\-id\fR
+print the server ID and exit (same as `tariond id`)
+.TP
+\fB\-invites\fR
+invite code folder (default <data>/invites)
+.TP
+\fB\-key\fR
+server identity key (default <data>/tariond.key)
+.TP
+\fB\-legacy\-users\fR
+old users.db to import once (default <data>/users.db)
+.TP
+\fB\-mailbox\fR
+hold sealed letters for offline users who turn their mailbox on (the server can't read them)
+.TP
+\fB\-mailbox\-days\fR (default 7)
+delete letters nobody fetched after this many days
+.TP
+\fB\-min\-password\fR (default 10)
+minimum password length for new accounts
+.TP
+\fB\-port\fR (default 63425)
+UDP port to listen on
+.TP
+\fB\-registration\fR (default open)
+who may create accounts: open, invite or closed
+.TP
+\fB\-relay\fR
+relay encrypted packets between peers whose NATs block direct connections (both peers must also turn it on)
+.TP
+\fB\-relay\-kbps\fR (default 256)
+relay bandwidth per session, KiB/s
+.TP
+\fB\-relay\-total\-kbps\fR (default 8192)
+relay bandwidth for all sessions, KiB/s
+.TP
+\fB\-users\fR
+account database (default <data>/users.json)
+.SH FILES
+Everything lives in the data folder (\fB\-data\fR, \fBTARIOND_DATA\fR, default the current directory).
+.TP
+\fItariond.key\fR
+the server identity; back it up: losing it makes every client refuse the server
+.TP
+\fIusers.json\fR
+accounts, password hashes and device chains; back it up
+.TP
+\fIinvites/\fR
+one file per unused invite code
+.TP
+\fIbans.txt\fR
+banned usernames and peer IDs, one per line, re\-read when changed
+.TP
+\fIdeletions/, device\-resets/\fR
+operator requests waiting for the server
+.TP
+\fImailbox/\fR
+with \-mailbox: sealed letters and each device's mailbox key
+.SH ENVIRONMENT
+.TP
+\fBTARIOND_DATA\fR
+the data folder, if \fB\-data\fR isn't given
+.SH NETWORK
+Open UDP 63425 (\fB\-port\fR) inbound. Probes for clients' forwarded ports go out from a second, random UDP port.
+quic\-go may warn that it can't raise the UDP buffer size; on Linux raise the limits with sysctl net.core.rmem_max=7500000 net.core.wmem_max=7500000.
+.SH EXIT STATUS
+0 on success; 1 on an error, printed to standard error.
+.SH SEE ALSO
+\fBtarion\fR(1), docs/operator.md, https://github.com/necromancer124/tarion

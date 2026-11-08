@@ -12,7 +12,7 @@ Peer-to-peer, end-to-end encrypted chat for the terminal, over QUIC.
 ![Platforms](https://img.shields.io/badge/platforms-Windows%20%7C%20Linux%20%7C%20macOS-informational)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue)](LICENSE)
 
-[Quick start](#quick-start) · [Features](#features) · [Commands](#commands) · [Security model](#security-model) · [Run a server](server/README.md) · [Local API](docs/local-api.md)
+[Quick start](#quick-start) · [Tutorial](docs/tutorial.md) · [Features](#features) · [Commands](#commands) · [Security model](#security-model) · [Run a server](server/README.md) · [Local API](docs/local-api.md)
 
 </div>
 
@@ -49,6 +49,16 @@ Tarion is a hybrid peer-to-peer CLI chat over QUIC. Chats go directly between pe
    ```
 
    After that, `tarion start` is enough. Pick a contact from the list and type.
+
+## Documentation
+
+- **[Tutorial](docs/tutorial.md):** from nothing to your first message: server, invites, verifying contacts, chatting, devices, NAT trouble.
+- **Built-in help:** `tarion help` lists every command and topic; `tarion help devices`, `tarion help relay`, `tarion help troubleshooting`, ... The topics are the files in [docs/topics](docs/topics).
+- **Man pages:** [tarion(1)](docs/man/tarion.1) and [tariond(8)](docs/man/tariond.8), generated from the code. On Linux: `sudo install -m 644 docs/man/tarion.1 /usr/local/share/man/man1/`.
+- **[Operator guide](docs/operator.md):** deploying `tariond`, invites, bans, backups, upgrades.
+- **[Security model](docs/security.md):** what Tarion protects against, and its limits.
+- **[Protocol](docs/protocol.md):** the wire formats, for other implementations.
+- **[Local API](docs/local-api.md):** building apps and bots on a running Tarion.
 
 ## Why I built Tarion
 
